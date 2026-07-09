@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/mikemoore/revenant"
+repository = "https://github.com/themsquared/revenant"
 
 [workspace.dependencies]
 revenant-core = { path = "crates/revenant-core" }
