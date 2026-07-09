@@ -1,0 +1,13 @@
+[package]
+name = "revenant-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+revenant-core = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

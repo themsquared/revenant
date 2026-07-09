@@ -1,0 +1,21 @@
+[package]
+name = "revenant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "revenant"
+path = "src/main.rs"
+
+[dependencies]
+revenant-core = { workspace = true }
+revenant-store = { workspace = true }
+revenant-llm = { workspace = true }
+revenant-gateway = { workspace = true }
+revenant-agent = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

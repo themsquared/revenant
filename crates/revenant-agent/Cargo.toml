@@ -1,0 +1,12 @@
+[package]
+name = "revenant-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+revenant-core = { workspace = true }
+revenant-store = { workspace = true }
+revenant-llm = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

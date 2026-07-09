@@ -1,0 +1,56 @@
+//! `~/.revenant/` layout helper.
+
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct Home {
+    root: PathBuf,
+}
+
+impl Home {
+    /// Resolve the home dir: `$REVENANT_HOME` override, else `~/.revenant`.
+    pub fn resolve() -> Self {
+        let root = std::env::var_os("REVENANT_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .expect("cannot resolve home directory")
+                    .join(".revenant")
+            });
+        Home { root }
+    }
+
+    pub fn root(&self) -> &PathBuf {
+        &self.root
+    }
+    pub fn config_path(&self) -> PathBuf {
+        self.root.join("config.toml")
+    }
+    pub fn db_path(&self) -> PathBuf {
+        self.root.join("revenant.db")
+    }
+    pub fn secrets_path(&self) -> PathBuf {
+        self.root.join("secrets.env")
+    }
+    pub fn gateway_dir(&self) -> PathBuf {
+        self.root.join("gateway")
+    }
+    pub fn gateway_bin_dir(&self) -> PathBuf {
+        self.gateway_dir().join("bin")
+    }
+    pub fn gateway_config_path(&self) -> PathBuf {
+        self.gateway_dir().join("config.yaml")
+    }
+    pub fn gateway_config_next_path(&self) -> PathBuf {
+        self.gateway_dir().join("config.yaml.next")
+    }
+    pub fn workspace_dir(&self) -> PathBuf {
+        self.root.join("workspace")
+    }
+    pub fn skills_dir(&self) -> PathBuf {
+        self.root.join("skills")
+    }
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+}

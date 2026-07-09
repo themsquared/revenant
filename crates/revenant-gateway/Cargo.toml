@@ -1,0 +1,18 @@
+[package]
+name = "revenant-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+revenant-core = { workspace = true }
+revenant-llm = { workspace = true }
+tokio = { workspace = true }
+tokio-util = "0.7"
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
