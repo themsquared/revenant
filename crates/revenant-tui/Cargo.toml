@@ -1,0 +1,18 @@
+[package]
+name = "revenant-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "revenant-tui"
+path = "src/main.rs"
+
+[dependencies]
+revenant-core = { workspace = true }
+revenant-client = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }

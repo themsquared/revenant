@@ -14,8 +14,17 @@ revenant-store = { workspace = true }
 revenant-llm = { workspace = true }
 revenant-gateway = { workspace = true }
 revenant-agent = { workspace = true }
+revenant-security = { workspace = true }
+revenant-skills = { workspace = true }
+revenant-tools = { workspace = true }
+revenant-control = { workspace = true }
+revenant-client = { workspace = true }
+axum = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

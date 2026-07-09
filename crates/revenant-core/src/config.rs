@@ -51,6 +51,8 @@ pub struct AgentConfig {
     pub max_history_messages: usize,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
 }
 
 impl Default for AgentConfig {
@@ -59,6 +61,7 @@ impl Default for AgentConfig {
             default_tier: default_tier(),
             max_history_messages: default_max_history(),
             max_tokens: default_max_tokens(),
+            max_iterations: default_max_iterations(),
         }
     }
 }
@@ -131,6 +134,9 @@ fn default_max_history() -> usize {
 }
 fn default_max_tokens() -> u32 {
     8192
+}
+fn default_max_iterations() -> u32 {
+    25
 }
 
 impl Config {

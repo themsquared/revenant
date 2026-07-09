@@ -14,6 +14,11 @@ revenant-store = { path = "crates/revenant-store" }
 revenant-llm = { path = "crates/revenant-llm" }
 revenant-gateway = { path = "crates/revenant-gateway" }
 revenant-agent = { path = "crates/revenant-agent" }
+revenant-security = { path = "crates/revenant-security" }
+revenant-tools = { path = "crates/revenant-tools" }
+revenant-skills = { path = "crates/revenant-skills" }
+revenant-control = { path = "crates/revenant-control" }
+revenant-client = { path = "crates/revenant-client" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "sync", "time", "io-util", "io-std", "fs"] }
 tokio-util = "0.7"
@@ -33,6 +38,12 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 sha2 = "0.10"
 hex = "0.4"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 [profile.release]
 lto = "fat"

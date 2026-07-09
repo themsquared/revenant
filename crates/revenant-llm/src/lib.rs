@@ -42,13 +42,17 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     pub messages: Vec<WireMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tools: Vec<revenant_core::ToolSpec>,
     pub stream: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamOutcome {
-    /// Concatenated text of all text blocks.
+    /// Concatenated text of all text blocks (for display/persist shortcuts).
     pub text: String,
+    /// The full assistant content, including tool_use blocks in order.
+    pub content: Vec<ContentBlock>,
     pub stop_reason: Option<String>,
     pub usage: Usage,
     /// The real model the gateway routed to (from message_start), useful for
@@ -102,6 +106,13 @@ impl LlmClient {
         let mut outcome = StreamOutcome::default();
         let mut stream = resp.bytes_stream().eventsource();
 
+        // In-progress content block accumulator.
+        enum Pending {
+            Text(String),
+            ToolUse { id: String, name: String, json: String },
+        }
+        let mut pending: Option<Pending> = None;
+
         while let Some(event) = stream.next().await {
             let event = event.context("reading SSE stream")?;
             let data: serde_json::Value = match serde_json::from_str(&event.data) {
@@ -118,13 +129,65 @@ impl LlmClient {
                         }
                     }
                 }
-                "content_block_delta" => {
-                    if let Some(text) = data
-                        .pointer("/delta/text")
-                        .and_then(|t| t.as_str())
-                    {
-                        outcome.text.push_str(text);
-                        on_delta(text);
+                "content_block_start" => {
+                    let block = data.get("content_block");
+                    match block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) {
+                        Some("tool_use") => {
+                            pending = Some(Pending::ToolUse {
+                                id: block
+                                    .and_then(|b| b.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                name: block
+                                    .and_then(|b| b.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                json: String::new(),
+                            });
+                        }
+                        _ => pending = Some(Pending::Text(String::new())),
+                    }
+                }
+                "content_block_delta" => match data.pointer("/delta/type").and_then(|t| t.as_str())
+                {
+                    Some("text_delta") => {
+                        if let Some(text) = data.pointer("/delta/text").and_then(|t| t.as_str()) {
+                            outcome.text.push_str(text);
+                            if let Some(Pending::Text(buf)) = &mut pending {
+                                buf.push_str(text);
+                            }
+                            on_delta(text);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(part) =
+                            data.pointer("/delta/partial_json").and_then(|t| t.as_str())
+                        {
+                            if let Some(Pending::ToolUse { json, .. }) = &mut pending {
+                                json.push_str(part);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                "content_block_stop" => {
+                    match pending.take() {
+                        Some(Pending::Text(text)) if !text.is_empty() => {
+                            outcome.content.push(ContentBlock::Text { text });
+                        }
+                        Some(Pending::ToolUse { id, name, json }) => {
+                            let input: serde_json::Value = if json.trim().is_empty() {
+                                serde_json::json!({})
+                            } else {
+                                serde_json::from_str(&json).with_context(|| {
+                                    format!("tool_use input for '{name}' is not valid JSON")
+                                })?
+                            };
+                            outcome.content.push(ContentBlock::ToolUse { id, name, input });
+                        }
+                        _ => {}
                     }
                 }
                 "message_delta" => {
@@ -143,7 +206,7 @@ impl LlmClient {
                         .unwrap_or("unknown stream error");
                     bail!("stream error from gateway: {msg}");
                 }
-                _ => {} // message_stop, ping, content_block_start/stop
+                _ => {} // message_stop, ping
             }
         }
         Ok(outcome)

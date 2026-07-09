@@ -1,7 +1,12 @@
 //! revenant-core: domain types and configuration. Zero I/O beyond path resolution.
 
 pub mod config;
+pub mod event;
 pub mod home;
+pub mod tool;
+
+pub use event::{Event, EventBus};
+pub use tool::{PermissionTier, ToolOutput, ToolSpec};
 
 use serde::{Deserialize, Serialize};
 

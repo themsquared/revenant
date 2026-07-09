@@ -25,6 +25,40 @@ pub struct StoredMessage {
     pub content: Vec<ContentBlock>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecallHit {
+    pub snippet: String,
+    pub source: String,
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApprovalRow {
+    pub id: String,
+    pub kind: String,
+    pub payload: String,
+    pub requested_at: i64,
+    pub ttl_s: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionRow {
+    pub id: i64,
+    pub channel: String,
+    pub peer: String,
+    pub kind: String,
+    pub last_active: i64,
+    pub message_count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SpendRow {
+    pub model: String,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub requests: i64,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let mut conn = Connection::open(path)
@@ -89,6 +123,15 @@ impl Store {
         token_estimate: Option<i64>,
     ) -> Result<i64> {
         let content_json = serde_json::to_string(content)?;
+        // Index human-meaningful text for recall (skip tool plumbing).
+        let recall_text: String = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         self.with(move |conn| {
             let now = unix_now();
             conn.execute(
@@ -98,11 +141,163 @@ impl Store {
                          ?2, ?3, ?4, ?5)",
                 (session_id, role.as_str(), &content_json, token_estimate, now),
             )?;
+            let message_id = conn.last_insert_rowid();
             conn.execute(
                 "UPDATE sessions SET last_active = ?2 WHERE id = ?1",
                 (session_id, now),
             )?;
-            Ok(conn.last_insert_rowid())
+            if !recall_text.is_empty() {
+                conn.execute(
+                    "INSERT INTO recall (text, source, ref) VALUES (?1, 'message', ?2)",
+                    (&recall_text, message_id.to_string()),
+                )?;
+            }
+            Ok(message_id)
+        })
+        .await
+    }
+
+    /// FTS5 search across indexed conversation text and memory notes.
+    pub async fn recall_search(&self, query: &str, limit: usize) -> Result<Vec<RecallHit>> {
+        // FTS5 MATCH has its own query syntax; quote each term to keep user
+        // input from being interpreted as operators.
+        let sanitized: String = query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT snippet(recall, 0, '[', ']', '…', 24), source, ref
+                 FROM recall WHERE recall MATCH ?1 ORDER BY rank LIMIT ?2",
+            )?;
+            let rows = stmt.query_map((sanitized, limit as i64), |row| {
+                Ok(RecallHit {
+                    snippet: row.get(0)?,
+                    source: row.get(1)?,
+                    reference: row.get(2)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Index an external document (memory file, note) for recall. Replaces
+    /// prior rows with the same ref.
+    pub async fn recall_index(&self, source: &str, reference: &str, text: &str) -> Result<()> {
+        let (source, reference, text) =
+            (source.to_owned(), reference.to_owned(), text.to_owned());
+        self.with(move |conn| {
+            conn.execute("DELETE FROM recall WHERE ref = ?1 AND source = ?2", (&reference, &source))?;
+            conn.execute(
+                "INSERT INTO recall (text, source, ref) VALUES (?1, ?2, ?3)",
+                (&text, &source, &reference),
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    // ---- approvals ----
+
+    pub async fn approval_insert(
+        &self,
+        id: &str,
+        kind: &str,
+        payload: &str,
+        ttl_s: i64,
+    ) -> Result<()> {
+        let (id, kind, payload) = (id.to_owned(), kind.to_owned(), payload.to_owned());
+        self.with(move |conn| {
+            conn.execute(
+                "INSERT INTO approvals (id, kind, payload, requested_at, ttl_s)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (&id, &kind, &payload, unix_now(), ttl_s),
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Compare-and-swap resolve: returns false if already resolved.
+    pub async fn approval_resolve(&self, id: &str, verdict: &str, resolver: &str) -> Result<bool> {
+        let (id, verdict, resolver) = (id.to_owned(), verdict.to_owned(), resolver.to_owned());
+        self.with(move |conn| {
+            let n = conn.execute(
+                "UPDATE approvals SET resolved_at = ?2, verdict = ?3, resolver = ?4
+                 WHERE id = ?1 AND resolved_at IS NULL",
+                (&id, unix_now(), &verdict, &resolver),
+            )?;
+            Ok(n == 1)
+        })
+        .await
+    }
+
+    pub async fn approvals_pending(&self) -> Result<Vec<ApprovalRow>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, payload, requested_at, ttl_s FROM approvals
+                 WHERE resolved_at IS NULL AND requested_at + ttl_s > ?1
+                 ORDER BY requested_at ASC",
+            )?;
+            let rows = stmt.query_map([unix_now()], |row| {
+                Ok(ApprovalRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    payload: row.get(2)?,
+                    requested_at: row.get(3)?,
+                    ttl_s: row.get(4)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    // ---- sessions / spend for the control plane ----
+
+    pub async fn sessions_list(&self, limit: usize) -> Result<Vec<SessionRow>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.channel, s.peer, s.kind, s.last_active,
+                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                 FROM sessions s WHERE s.archived = 0
+                 ORDER BY s.last_active DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([limit as i64], |row| {
+                Ok(SessionRow {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    peer: row.get(2)?,
+                    kind: row.get(3)?,
+                    last_active: row.get(4)?,
+                    message_count: row.get(5)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Spend grouped by model since `from_ts`.
+    pub async fn spend_since(&self, from_ts: i64) -> Result<Vec<SpendRow>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(model, tier, 'unknown'),
+                        SUM(tokens_in), SUM(tokens_out), COUNT(*)
+                 FROM spend_ledger WHERE at >= ?1
+                 GROUP BY 1 ORDER BY SUM(tokens_in) + SUM(tokens_out) DESC",
+            )?;
+            let rows = stmt.query_map([from_ts], |row| {
+                Ok(SpendRow {
+                    model: row.get(0)?,
+                    tokens_in: row.get(1)?,
+                    tokens_out: row.get(2)?,
+                    requests: row.get(3)?,
+                })
+            })?;
+            rows.collect()
         })
         .await
     }
@@ -246,6 +441,17 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 2 {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE VIRTUAL TABLE recall USING fts5(
+               text, source, ref, tokenize='porter unicode61'
+             );
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -274,6 +480,19 @@ mod tests {
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[0].role, Role::User);
         assert_eq!(hist[1].turn, 2);
+
+        // FTS recall over message text
+        let hits = store.recall_search("hello", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, "message");
+
+        // approvals CAS
+        store.approval_insert("ap1", "exec", "{}", 900).await.unwrap();
+        assert_eq!(store.approvals_pending().await.unwrap().len(), 1);
+        assert!(store.approval_resolve("ap1", "approved", "test").await.unwrap());
+        assert!(!store.approval_resolve("ap1", "denied", "late").await.unwrap());
+        assert_eq!(store.approvals_pending().await.unwrap().len(), 0);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
