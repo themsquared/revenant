@@ -53,4 +53,10 @@ impl Home {
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
+    pub fn memory_dir(&self) -> PathBuf {
+        self.workspace_dir().join("memory")
+    }
+    pub fn models_dir(&self) -> PathBuf {
+        self.root.join("models")
+    }
 }

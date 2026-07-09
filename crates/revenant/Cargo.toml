@@ -19,6 +19,8 @@ revenant-skills = { workspace = true }
 revenant-tools = { workspace = true }
 revenant-control = { workspace = true }
 revenant-client = { workspace = true }
+revenant-memory = { workspace = true }
+serde_json = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

@@ -46,14 +46,16 @@ pub struct AgentRuntime {
     pub events: EventBus,
     pub skills: Arc<SkillIndex>,
     pub home: Home,
+    pub memory: Option<Arc<revenant_memory::MemoryEngine>>,
     pub max_history: usize,
     pub max_tokens: u32,
     pub max_iterations: u32,
 }
 
 impl AgentRuntime {
-    /// Layered system prompt. Layer order = stability order (cache-friendly).
-    fn system_prompt(&self) -> String {
+    /// Layered system prompt. Layer order = stability order (cache-friendly);
+    /// the retrieved block is last because it changes every turn.
+    fn system_prompt(&self, retrieved: Option<&str>) -> String {
         let mut prompt = String::from(IDENTITY);
         let skills_index = self.skills.index_lines();
         if !skills_index.is_empty() {
@@ -66,6 +68,12 @@ impl AgentRuntime {
                 prompt.push_str(memory.trim());
             }
         }
+        if let Some(block) = retrieved {
+            prompt.push_str(
+                "\n\n# Retrieved memories (relevant to this message; verify with recall if load-bearing)\n",
+            );
+            prompt.push_str(block);
+        }
         prompt
     }
 
@@ -76,15 +84,40 @@ impl AgentRuntime {
         user_content: Vec<ContentBlock>,
     ) -> Result<TurnStats> {
         self.events.emit(Event::TurnStarted { session_id });
-        self.store
+        let user_message_id = self
+            .store
             .append_message(session_id, Role::User, &user_content, estimate(&user_content))
             .await?;
 
-        let system = self.system_prompt();
+        let user_text: String = user_content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Pre-turn hybrid retrieval — fail-open, never blocks the turn on
+        // memory trouble.
+        let retrieved = match &self.memory {
+            Some(memory) => memory
+                .recall_block(&user_text, memory.cfg().injection_budget_tokens)
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!("memory retrieval failed (continuing without): {err:#}");
+                    None
+                }),
+            None => None,
+        };
+
+        let system = self.system_prompt(retrieved.as_deref());
         let tool_specs = self.tools.specs();
         let mut total_usage = Usage::default();
         let mut routed_model = None;
         let mut final_text = String::new();
+        #[allow(unused_assignments)]
+        let mut last_assistant_id = 0i64;
 
         for iteration in 1..=self.max_iterations {
             let history = self.store.history(session_id, self.max_history).await?;
@@ -100,6 +133,7 @@ impl AgentRuntime {
                 system: Some(system.clone()),
                 messages,
                 tools: tool_specs.clone(),
+                tool_choice: None,
                 stream: true,
             };
 
@@ -139,7 +173,8 @@ impl AgentRuntime {
             } else {
                 outcome.content.clone()
             };
-            self.store
+            last_assistant_id = self
+                .store
                 .append_message(
                     session_id,
                     Role::Assistant,
@@ -152,6 +187,21 @@ impl AgentRuntime {
                 .await?;
 
             if outcome.stop_reason.as_deref() != Some("tool_use") {
+                // Hand the finished exchange to the memory consolidator —
+                // non-blocking, off the hot path.
+                if let Some(memory) = &self.memory {
+                    memory.observe(revenant_memory::Episode {
+                        session_id,
+                        user_message_id,
+                        assistant_message_id: last_assistant_id,
+                        user_text: user_text.clone(),
+                        assistant_text: final_text.clone(),
+                        at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                    });
+                }
                 self.events.emit(Event::TurnCompleted {
                     session_id,
                     text: final_text.clone(),
@@ -242,6 +292,7 @@ impl AgentRuntime {
             session_id,
             home: self.home.clone(),
             store: self.store.clone(),
+            memory: self.memory.clone(),
         };
         let output = tool.invoke(&cx, input).await;
         self.events.emit(Event::ToolFinished {

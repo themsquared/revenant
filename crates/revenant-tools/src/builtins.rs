@@ -22,6 +22,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(ListDir { jail: read_jail.clone() }),
         Arc::new(Exec { workspace: home.workspace_dir() }),
         Arc::new(Recall),
+        Arc::new(MemorySave),
         Arc::new(MemoryRead { home: home.clone() }),
         Arc::new(MemoryAppend { home: home.clone() }),
         Arc::new(UseSkill { skills: skills.clone() }),
@@ -226,7 +227,7 @@ impl Tool for Recall {
     fn spec(&self) -> ToolSpec {
         spec!(
             "recall",
-            "Full-text search across past conversations and memory notes. Use before asking the user something they may have already told you.",
+            "Hybrid search (keyword + semantic + knowledge graph) across past conversations and the memory vault. Use before asking the user something they may have already told you.",
             json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})
         )
     }
@@ -238,6 +239,23 @@ impl Tool for Recall {
             Ok(q) => q,
             Err(e) => return e,
         };
+        if let Some(memory) = &cx.memory {
+            return match memory.recall(query, 10).await {
+                Ok(memories) if memories.is_empty() => ToolOutput::ok("no matches".to_string()),
+                Ok(memories) => ToolOutput::ok(
+                    memories
+                        .iter()
+                        .map(|m| {
+                            let label = m.note.as_deref().unwrap_or("conversation");
+                            format!("- [{label}] {}", m.text)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Err(err) => ToolOutput::err(format!("recall failed: {err:#}")),
+            };
+        }
+        // Memory disabled: plain FTS fallback.
         match cx.store.recall_search(query, 8).await {
             Ok(hits) if hits.is_empty() => ToolOutput::ok("no matches".to_string()),
             Ok(hits) => ToolOutput::ok(
@@ -247,6 +265,35 @@ impl Tool for Recall {
                     .join("\n"),
             ),
             Err(err) => ToolOutput::err(format!("recall failed: {err:#}")),
+        }
+    }
+}
+
+struct MemorySave;
+
+#[async_trait::async_trait]
+impl Tool for MemorySave {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "memory_save",
+            "Save a durable memory to the vault (events, project facts, decisions, relationships). Use memory_append only for core owner-profile facts.",
+            json!({"type":"object","properties":{"content":{"type":"string"}},"required":["content"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::WriteWorkspace
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        let content = match arg_str(&args, "content") {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        let Some(memory) = &cx.memory else {
+            return ToolOutput::err("memory engine is disabled".to_string());
+        };
+        match memory.save(content, cx.session_id).await {
+            Ok(path) => ToolOutput::ok(format!("saved to {path}")),
+            Err(err) => ToolOutput::err(format!("memory_save failed: {err:#}")),
         }
     }
 }

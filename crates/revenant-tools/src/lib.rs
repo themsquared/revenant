@@ -28,6 +28,7 @@ pub struct ToolCx {
     pub session_id: i64,
     pub home: Home,
     pub store: Store,
+    pub memory: Option<std::sync::Arc<revenant_memory::MemoryEngine>>,
 }
 
 #[derive(Clone)]

@@ -44,6 +44,10 @@ pub struct MessagesRequest {
     pub messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tools: Vec<revenant_core::ToolSpec>,
+    /// e.g. `{"type":"tool","name":"record_memory"}` to force an extraction
+    /// tool call (structured output).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_choice: Option<serde_json::Value>,
     pub stream: bool,
 }
 
@@ -234,6 +238,36 @@ impl LlmClient {
             bail!("count_tokens returned {}", resp.status());
         }
         Ok(resp.json::<CountResponse>().await?.input_tokens)
+    }
+
+    /// OpenAI-shape embeddings via the gateway (`POST /v1/embeddings`).
+    pub async fn embeddings(&self, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        #[derive(Deserialize)]
+        struct EmbeddingItem {
+            embedding: Vec<f32>,
+        }
+        #[derive(Deserialize)]
+        struct EmbeddingsResponse {
+            data: Vec<EmbeddingItem>,
+        }
+        let url = format!("{}/v1/embeddings", self.base_url);
+        let resp = Self::headers(self.http.post(&url))
+            .json(&serde_json::json!({ "model": model, "input": inputs }))
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("embeddings returned {status}: {}", truncate(&body, 300));
+        }
+        Ok(resp
+            .json::<EmbeddingsResponse>()
+            .await?
+            .data
+            .into_iter()
+            .map(|item| item.embedding)
+            .collect())
     }
 
     /// Readiness probe: does the gateway answer on the LLM data path?

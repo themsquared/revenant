@@ -8,6 +8,7 @@ license.workspace = true
 revenant-core = { workspace = true }
 revenant-store = { workspace = true }
 revenant-skills = { workspace = true }
+revenant-memory = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }

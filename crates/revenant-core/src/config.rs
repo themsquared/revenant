@@ -9,8 +9,81 @@ pub struct Config {
     pub gateway: GatewayConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Tier name ("fast"/"balanced"/"deep"/"local") -> targets.
     pub tiers: BTreeMap<String, TierConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// None => ~/.revenant/workspace/memory. Point at a folder inside an
+    /// existing Obsidian vault to get its graph view over agent memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_path: Option<PathBuf>,
+    #[serde(default)]
+    pub embedder: EmbedderKind,
+    /// Gateway mode: model name for POST /v1/embeddings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_model: Option<String>,
+    #[serde(default = "default_consolidate_batch")]
+    pub consolidate_batch: usize,
+    #[serde(default = "default_consolidate_debounce")]
+    pub consolidate_debounce_s: u64,
+    #[serde(default = "default_sweep_interval")]
+    pub sweep_interval_s: u64,
+    #[serde(default = "default_injection_budget")]
+    pub injection_budget_tokens: usize,
+    #[serde(default = "default_retrieval_limit")]
+    pub retrieval_limit: usize,
+    #[serde(default = "default_true")]
+    pub watch_vault: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig {
+            enabled: true,
+            vault_path: None,
+            embedder: EmbedderKind::default(),
+            embed_model: None,
+            consolidate_batch: default_consolidate_batch(),
+            consolidate_debounce_s: default_consolidate_debounce(),
+            sweep_interval_s: default_sweep_interval(),
+            injection_budget_tokens: default_injection_budget(),
+            retrieval_limit: default_retrieval_limit(),
+            watch_vault: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbedderKind {
+    #[default]
+    Builtin,
+    Gateway,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_consolidate_batch() -> usize {
+    8
+}
+fn default_consolidate_debounce() -> u64 {
+    20
+}
+fn default_sweep_interval() -> u64 {
+    900
+}
+fn default_injection_budget() -> usize {
+    800
+}
+fn default_retrieval_limit() -> usize {
+    12
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +258,7 @@ impl Config {
                 endpoint: None,
             },
             agent: AgentConfig::default(),
+            memory: MemoryConfig::default(),
             tiers,
         }
     }

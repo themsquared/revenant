@@ -66,6 +66,27 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     let tools = ToolRegistry::builtin(home, skills.clone());
     let llm = revenant_llm::LlmClient::new(endpoint.clone());
 
+    // Memory engine: fail-open. A missing model or broken vault must not
+    // keep the agent from coming up.
+    let memory = if cfg.memory.enabled {
+        match revenant_memory::MemoryEngine::new(
+            store.clone(),
+            llm.clone(),
+            home,
+            cfg.memory.clone(),
+        )
+        .await
+        {
+            Ok(engine) => Some(engine),
+            Err(err) => {
+                tracing::warn!("memory engine disabled: {err:#} (run `revenant init`?)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let runtime = Arc::new(AgentRuntime {
         store,
         llm,
@@ -74,6 +95,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         events,
         skills,
         home: home.clone(),
+        memory,
         max_history: cfg.agent.max_history_messages,
         max_tokens: cfg.agent.max_tokens,
         max_iterations: cfg.agent.max_iterations,

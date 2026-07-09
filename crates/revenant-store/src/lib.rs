@@ -452,6 +452,75 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 3 {
+        // Memory engine: markdown vault is source of truth; these tables are
+        // the rebuildable derived index. Facts/edges are BI-TEMPORAL —
+        // expired_at is set on supersession, rows are never deleted.
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE mem_entities (
+               id          INTEGER PRIMARY KEY,
+               uid         TEXT NOT NULL UNIQUE,
+               name        TEXT NOT NULL,
+               norm_name   TEXT NOT NULL UNIQUE,
+               kind        TEXT NOT NULL DEFAULT 'concept',
+               note_path   TEXT NOT NULL UNIQUE,
+               summary     TEXT,
+               embedding   BLOB,
+               created_at  INTEGER NOT NULL,
+               updated_at  INTEGER NOT NULL
+             );
+             CREATE TABLE mem_aliases (
+               alias_norm  TEXT PRIMARY KEY,
+               entity_id   INTEGER NOT NULL REFERENCES mem_entities(id)
+             );
+             CREATE TABLE mem_facts (
+               id          INTEGER PRIMARY KEY,
+               uid         TEXT NOT NULL UNIQUE,
+               note_path   TEXT NOT NULL,
+               subject_id  INTEGER REFERENCES mem_entities(id),
+               predicate   TEXT,
+               object      TEXT,
+               text        TEXT NOT NULL,
+               embedding   BLOB,
+               valid_from  INTEGER,
+               invalid_at  INTEGER,
+               recorded_at INTEGER NOT NULL,
+               expired_at  INTEGER,
+               source_session_id INTEGER,
+               source_message_id INTEGER
+             );
+             CREATE INDEX idx_mem_facts_note ON mem_facts(note_path) WHERE expired_at IS NULL;
+             CREATE INDEX idx_mem_facts_subj ON mem_facts(subject_id) WHERE expired_at IS NULL;
+             CREATE TABLE mem_edges (
+               id          INTEGER PRIMARY KEY,
+               src         INTEGER NOT NULL REFERENCES mem_entities(id),
+               dst         INTEGER NOT NULL REFERENCES mem_entities(id),
+               rel         TEXT NOT NULL,
+               weight      REAL NOT NULL DEFAULT 1.0,
+               fact_id     INTEGER REFERENCES mem_facts(id),
+               valid_from  INTEGER,
+               invalid_at  INTEGER,
+               recorded_at INTEGER NOT NULL,
+               expired_at  INTEGER
+             );
+             CREATE INDEX idx_mem_edges_src ON mem_edges(src) WHERE expired_at IS NULL;
+             CREATE INDEX idx_mem_edges_dst ON mem_edges(dst) WHERE expired_at IS NULL;
+             CREATE TABLE mem_meta (
+               k TEXT PRIMARY KEY, v TEXT NOT NULL
+             );
+             CREATE TABLE mem_pending (
+               id         INTEGER PRIMARY KEY,
+               kind       TEXT NOT NULL,
+               payload    TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               attempts   INTEGER NOT NULL DEFAULT 0
+             );
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 

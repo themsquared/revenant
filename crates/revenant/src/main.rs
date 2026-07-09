@@ -44,6 +44,11 @@ enum Command {
     },
     /// Print the rendered agentgateway config (debug).
     Render,
+    /// Memory engine: reindex | status | search <query>
+    Memory {
+        #[arg(num_args = 1..=2)]
+        action: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -65,8 +70,70 @@ fn main() -> Result<()> {
             Command::Status => cmd_status().await,
             Command::Approvals { action } => cmd_approvals(action).await,
             Command::Render => cmd_render(),
+            Command::Memory { action } => cmd_memory(action).await,
         }
     })
+}
+
+/// Local memory engine (no gateway needed for builtin embeddings).
+async fn open_memory() -> Result<std::sync::Arc<revenant_memory::MemoryEngine>> {
+    let home = Home::resolve();
+    let cfg = load_config(&home)?;
+    let store = revenant_store::Store::open(&home.db_path())?;
+    // The LlmClient is only used by the gateway embedder mode.
+    let llm = revenant_llm::LlmClient::new(format!("http://127.0.0.1:{}", cfg.gateway.llm_port));
+    revenant_memory::MemoryEngine::new(store, llm, &home, cfg.memory).await
+}
+
+async fn cmd_memory(action: Vec<String>) -> Result<()> {
+    match action.first().map(String::as_str) {
+        Some("reindex") => {
+            let engine = open_memory().await?;
+            let status = engine.reindex().await?;
+            println!(
+                "reindexed: {} entities, {} facts, {} edges (embedder {})",
+                status.entities, status.facts, status.edges, status.embedder
+            );
+        }
+        Some("status") => {
+            let engine = open_memory().await?;
+            let s = engine.status().await?;
+            println!("vault:    {}", s.vault);
+            println!("embedder: {}", s.embedder);
+            println!("entities: {}", s.entities);
+            println!("facts:    {} (active)", s.facts);
+            println!("edges:    {} (active)", s.edges);
+            println!("pending:  {} consolidation items", s.pending);
+        }
+        Some("search") => {
+            let query = action.get(1).context("usage: revenant memory search <query>")?;
+            let engine = open_memory().await?;
+            let start = std::time::Instant::now();
+            let memories = engine.recall(query, 12).await?;
+            let elapsed = start.elapsed();
+            for memory in &memories {
+                let legs = [
+                    (memory.legs & 1 != 0, "fts"),
+                    (memory.legs & 2 != 0, "vec"),
+                    (memory.legs & 4 != 0, "graph"),
+                ]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>()
+                .join("+");
+                println!(
+                    "{:.4} [{legs:>13}] [{}] {}",
+                    memory.score,
+                    memory.note.as_deref().unwrap_or("conversation"),
+                    memory.text
+                );
+            }
+            println!("({} results in {elapsed:.2?})", memories.len());
+        }
+        _ => bail!("usage: revenant memory reindex|status|search <query>"),
+    }
+    Ok(())
 }
 
 pub fn load_config(home: &Home) -> Result<Config> {
@@ -145,6 +212,12 @@ async fn cmd_init() -> Result<()> {
     if cfg.gateway.mode == GatewayMode::Bundled {
         let bin = revenant_gateway::ensure_binary(&home, &cfg).await?;
         println!("gateway binary ready: {}", bin.display());
+    }
+    if cfg.memory.enabled
+        && cfg.memory.embedder == revenant_core::config::EmbedderKind::Builtin
+    {
+        let dir = revenant_memory::embed::ensure_builtin_model(&home.models_dir()).await?;
+        println!("embedding model ready: {}", dir.display());
     }
     println!("\nrevenant is initialized. Run `revenant up` (daemon) then `revenant chat`,\nor just `revenant chat` for an embedded session.");
     Ok(())

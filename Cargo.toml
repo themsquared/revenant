@@ -19,6 +19,7 @@ revenant-tools = { path = "crates/revenant-tools" }
 revenant-skills = { path = "crates/revenant-skills" }
 revenant-control = { path = "crates/revenant-control" }
 revenant-client = { path = "crates/revenant-client" }
+revenant-memory = { path = "crates/revenant-memory" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "sync", "time", "io-util", "io-std", "fs"] }
 tokio-util = "0.7"
@@ -42,6 +43,12 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+model2vec-rs = "0.2"
+simsimd = "6"
+petgraph = { version = "0.6", default-features = false, features = ["graphmap"] }
+notify = "6"
+notify-debouncer-full = "0.3"
+strsim = "0.11"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
