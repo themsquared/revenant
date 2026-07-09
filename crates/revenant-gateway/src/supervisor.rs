@@ -33,6 +33,18 @@ impl GatewaySupervisor {
     /// Spawn the gateway, wait until the LLM data path answers, then keep
     /// it alive in the background (restart with exponential backoff).
     pub async fn start(self) -> Result<SupervisorHandle> {
+        // Pre-flight: if something already answers on our LLM port, a stale
+        // gateway or second revenant instance is running. Readiness checks
+        // against a foreign process would falsely pass — refuse instead.
+        let probe = revenant_llm::LlmClient::new(format!("http://127.0.0.1:{}", self.llm_port));
+        if probe.models_ready().await {
+            bail!(
+                "port {} is already serving an LLM endpoint — another gateway or revenant \
+                 instance is running (pkill agentgateway / check `revenant up`)",
+                self.llm_port
+            );
+        }
+
         let token = CancellationToken::new();
         let child_token = token.clone();
 

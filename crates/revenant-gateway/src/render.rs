@@ -47,7 +47,20 @@ pub fn render_gateway_yaml(cfg: &Config, available_env: &HashSet<String>) -> Res
             let mut targets = Vec::new();
             for (idx, target) in usable.iter().enumerate() {
                 let internal_name = format!("{tier}/{idx}");
-                models.push(render_model(&internal_name, target, true)?);
+                let mut model = render_model(&internal_name, target, true)?;
+                // Failover members get outlier detection: a target answering
+                // with "I am broken" codes (auth/quota/missing model/5xx) is
+                // evicted so the virtual model routes to the next priority.
+                // The harness retries the turn once to ride the eviction.
+                model.as_object_mut().unwrap().insert(
+                    "health".into(),
+                    json!({
+                        "unhealthyExpression":
+                            "response.code >= 500 || response.code == 429 || response.code == 401 || response.code == 403 || response.code == 404",
+                        "eviction": { "duration": "60s" },
+                    }),
+                );
+                models.push(model);
                 targets.push(json!({ "model": internal_name, "priority": idx }));
             }
             virtual_models.push(json!({

@@ -63,7 +63,26 @@ impl Agent {
             stream: true,
         };
 
-        let outcome = self.llm.stream_message(&request, on_delta).await?;
+        // One retry if the first attempt fails before any output: the
+        // gateway evicts unhealthy failover targets on the failed response,
+        // so the retry rides over to the next-priority model.
+        let mut on_delta = on_delta;
+        let mut streamed = false;
+        let outcome = match self
+            .llm
+            .stream_message(&request, |delta| {
+                streamed = true;
+                on_delta(delta);
+            })
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) if !streamed => {
+                tracing::warn!("first attempt failed ({err:#}); retrying once for failover");
+                self.llm.stream_message(&request, &mut on_delta).await?
+            }
+            Err(err) => return Err(err),
+        };
 
         let reply = vec![ContentBlock::text(outcome.text.clone())];
         self.store

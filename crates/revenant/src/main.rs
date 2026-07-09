@@ -148,12 +148,31 @@ async fn start_gateway(
     }
 }
 
+/// Wait for SIGINT or SIGTERM — both must shut the gateway child down,
+/// otherwise a killed daemon leaks an orphan gateway holding the ports.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 async fn cmd_up() -> Result<()> {
     let home = Home::resolve();
     let cfg = load_config(&home)?;
     let (endpoint, handle) = start_gateway(&home, &cfg).await?;
     println!("revenant up — gateway at {endpoint} (ctrl-c to stop)");
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await;
     if let Some(handle) = handle {
         handle.shutdown().await;
     }
@@ -181,15 +200,39 @@ async fn cmd_chat(tier_arg: Option<String>) -> Result<()> {
     let session_id = store.ensure_session("cli", "local", "chat").await?;
 
     println!("revenant chat — tier: {tier} — /quit to exit, /tier <t> to switch");
-    let stdin = std::io::stdin();
+
+    // stdin on a blocking thread feeding a channel, so the REPL loop can
+    // also react to SIGINT/SIGTERM and always shut the gateway child down.
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(1);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        loop {
+            let mut line = String::new();
+            match stdin.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // EOF
+                Ok(_) => {
+                    if line_tx.blocking_send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     let mut current_tier = tier;
     loop {
         print!("\x1b[1myou>\x1b[0m ");
         std::io::stdout().flush()?;
-        let mut line = String::new();
-        if stdin.read_line(&mut line)? == 0 {
-            break; // EOF
-        }
+        let line = tokio::select! {
+            line = line_rx.recv() => match line {
+                Some(line) => line,
+                None => break, // EOF
+            },
+            _ = shutdown_signal() => {
+                println!("\nshutting down");
+                break;
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
