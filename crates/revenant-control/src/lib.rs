@@ -69,6 +69,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/agents", get(agents_list))
         .route("/v1/agents/:name", get(agent_get).put(agent_put))
         .route("/v1/config", get(config_get))
+        .route("/v1/loops", get(loops_list))
+        .route("/v1/loops/:id/runs", get(loop_runs))
+        .route("/v1/loops/:id", axum::routing::delete(loop_delete).patch(loop_patch))
         .route("/v1/spend", get(spend))
         .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
@@ -158,6 +161,7 @@ async fn events(
                 revenant_core::Event::ApprovalResolved { .. } => "approval_resolved",
                 revenant_core::Event::SubagentSpawned { .. } => "subagent_spawned",
                 revenant_core::Event::SubagentFinished { .. } => "subagent_finished",
+                revenant_core::Event::LoopCompleted { .. } => "loop_completed",
                 revenant_core::Event::GatewayStatus { .. } => "gateway_status",
             };
             Some(Ok(SseEvent::default()
@@ -461,6 +465,41 @@ async fn config_get(State(state): State<AppState>) -> Result<Json<serde_json::Va
         "embedder": format!("{:?}", cfg.memory.embedder).to_lowercase(),
         "keys_present": present.into_iter().collect::<Vec<_>>(),
     })))
+}
+
+async fn loops_list(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let loops = state.manager.runtime().store.loops_list().await?;
+    Ok(Json(json!({ "loops": loops })))
+}
+
+async fn loop_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let runs = state.manager.runtime().store.loop_runs(&id, 20).await?;
+    Ok(Json(json!({ "runs": runs })))
+}
+
+async fn loop_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ok = state.manager.runtime().store.loop_delete(&id).await?;
+    Ok(Json(json!({ "deleted": ok })))
+}
+
+#[derive(Deserialize)]
+struct LoopPatch {
+    enabled: bool,
+}
+
+async fn loop_patch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<LoopPatch>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ok = state.manager.runtime().store.loop_set_enabled(&id, body.enabled).await?;
+    Ok(Json(json!({ "updated": ok })))
 }
 
 async fn tools_list(State(state): State<AppState>) -> Json<serde_json::Value> {

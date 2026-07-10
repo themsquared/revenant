@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api, eventStream, getToken, setToken } from './api.js'
 
-const TABS = ['chat', 'approvals', 'skills', 'tools', 'subagents', 'spend', 'memory', 'settings']
+const TABS = ['chat', 'approvals', 'skills', 'tools', 'subagents', 'loops', 'spend', 'memory', 'settings']
 
 export default function App() {
   const [authed, setAuthed] = useState(false)
@@ -49,6 +49,7 @@ export default function App() {
         {tab === 'skills' && <Skills />}
         {tab === 'tools' && <Tools />}
         {tab === 'subagents' && <Subagents />}
+        {tab === 'loops' && <Loops />}
         {tab === 'spend' && <Spend />}
         {tab === 'memory' && <Memory />}
         {tab === 'settings' && <Settings />}
@@ -606,6 +607,92 @@ function AgentEditor({ agent, setAgent, allTools, onSave, onCancel }) {
         <button className="ok" onClick={onSave}>save</button>
         <button className="no" onClick={onCancel}>cancel</button>
       </div>
+    </div>
+  )
+}
+
+// ---- loops ----
+
+function Loops() {
+  const [loops, setLoops] = useState([])
+  const [runs, setRuns] = useState({})
+  const refresh = () => api.loops().then((r) => setLoops(r.loops))
+  useEffect(() => {
+    refresh()
+    const source = eventStream((type) => {
+      if (type === 'loop_completed') setTimeout(refresh, 400)
+    })
+    const timer = setInterval(refresh, 8000)
+    return () => {
+      source.close()
+      clearInterval(timer)
+    }
+  }, [])
+
+  const showRuns = async (id) => {
+    const r = await api.loopRuns(id)
+    setRuns((prev) => ({ ...prev, [id]: r.runs }))
+  }
+
+  return (
+    <div className="list">
+      <div className="card-meta">
+        recurring jobs the agent runs on a schedule (heartbeats, watches,
+        digests). It creates and tunes these itself via loop_create; you can
+        pause or delete any. Results can push to Telegram.
+      </div>
+      {loops.length === 0 && (
+        <div className="empty">
+          no loops yet — ask the agent to "check X every 10 minutes"
+        </div>
+      )}
+      {loops.map((l) => (
+        <div key={l.id} className="card">
+          <div className="card-title">
+            {l.name}
+            <span
+              className="pill sm"
+              style={{ background: l.enabled ? '#34d399' : '#7a828d', marginLeft: 8 }}
+            >
+              {l.enabled ? 'active' : 'paused'}
+            </span>
+            <small>{l.schedule} · {l.tier}{l.channel_out ? ` → ${l.channel_out}` : ''}</small>
+          </div>
+          <div className="loop-prompt">{l.prompt}</div>
+          <div className="card-meta">
+            {l.last_run ? `last run ${new Date(l.last_run * 1000).toLocaleString()}` : 'not run yet'}
+            {l.next_run ? ` · next ${new Date(l.next_run * 1000).toLocaleTimeString()}` : ''}
+            {' · by '}{l.created_by}
+          </div>
+          <div className="card-actions">
+            <button className="tab" onClick={() => showRuns(l.id)}>runs</button>
+            <button
+              className="tab"
+              onClick={() => api.loopToggle(l.id, !l.enabled).then(refresh)}
+            >
+              {l.enabled ? 'pause' : 'resume'}
+            </button>
+            <button className="no" onClick={() => api.loopDelete(l.id).then(refresh)}>
+              delete
+            </button>
+          </div>
+          {runs[l.id] && (
+            <div className="runs">
+              {runs[l.id].length === 0 && <div className="card-meta">no runs recorded</div>}
+              {runs[l.id].map((run) => (
+                <div key={run.id} className="run-row">
+                  <span className={run.status === 'ok' ? 'good' : 'bad'}>{run.status}</span>
+                  <span className="run-time">
+                    {new Date(run.started_at * 1000).toLocaleString()}
+                  </span>
+                  <span className="run-toks">{run.tokens_in}/{run.tokens_out} tok</span>
+                  <span className="run-outcome">{run.outcome}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
     </div>
   )
 }

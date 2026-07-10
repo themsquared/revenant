@@ -11,3 +11,6 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 tokio = { workspace = true }
+anyhow = { workspace = true }
+croner = { workspace = true }
+chrono = { workspace = true }

@@ -464,6 +464,20 @@ impl OutboundMirror {
                         let _ = summary; // keep the chat clean; tools show in TUI/web
                     }
                 }
+                // Loop results pushed to telegram go to every paired chat.
+                Event::LoopCompleted { name, channel_out, text, .. }
+                    if channel_out.contains("telegram") =>
+                {
+                    let peers = runtime.store.peers_list(CHANNEL).await.unwrap_or_default();
+                    for peer in peers {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let _ = self
+                                .client
+                                .send_message(chat_id, &format!("🔁 {name}\n\n{}", clip(&text, 3800)))
+                                .await;
+                        }
+                    }
+                }
                 // Approvals go to EVERY paired chat, whatever session they
                 // came from — the owner's pocket is the point.
                 Event::ApprovalCreated { id, summary, .. } => {

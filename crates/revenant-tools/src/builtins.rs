@@ -29,6 +29,8 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(FindSkill { skills: skills.clone() }),
         Arc::new(ReadSkillFile { skills: skills.clone() }),
         Arc::new(SkillWrite { skills }),
+        Arc::new(LoopCreate),
+        Arc::new(LoopControl),
     ]
 }
 
@@ -465,6 +467,154 @@ impl Tool for SkillWrite {
             Err(err) => ToolOutput::err(format!("{err:#}")),
         }
     }
+}
+
+struct LoopCreate;
+
+#[async_trait::async_trait]
+impl Tool for LoopCreate {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "loop_create",
+            "Create a recurring job that runs a prompt on a schedule (heartbeat/cron). Use for standing tasks: check something periodically, a daily summary, a watch. Runs off the main thread; results appear in loop history and can be pushed to a channel.",
+            json!({"type":"object","properties":{
+                "name":{"type":"string"},
+                "schedule":{"type":"string","description":"'every:600s' (min 60s) or 'cron:*/10 * * * *'"},
+                "prompt":{"type":"string","description":"what to do each run"},
+                "tier":{"type":"string","enum":["fast","balanced","deep","local"],"description":"default fast"},
+                "channel_out":{"type":"string","description":"optional: 'telegram' to push results to paired chats"}
+            },"required":["name","schedule","prompt"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        // Creating a spending, self-firing job is a capability escalation.
+        PermissionTier::Dangerous
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        let (name, schedule, prompt) = match (
+            arg_str(&args, "name"),
+            arg_str(&args, "schedule"),
+            arg_str(&args, "prompt"),
+        ) {
+            (Ok(n), Ok(s), Ok(p)) => (n, s, p),
+            (Err(e), ..) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+        };
+        let tier = args.get("tier").and_then(|v| v.as_str()).unwrap_or("fast");
+        let channel_out = args.get("channel_out").and_then(|v| v.as_str());
+
+        // Validate schedule + get first fire time (enforces the 60s floor).
+        let now = unix_now();
+        let next_run = match revenant_core::loops::first_next_run(schedule, now) {
+            Ok(n) => n,
+            Err(err) => return ToolOutput::err(format!("{err:#}")),
+        };
+        // Cap total loops.
+        match cx.store.loops_list().await {
+            Ok(loops) if loops.len() >= revenant_core::loops::MAX_LOOPS => {
+                return ToolOutput::err(format!(
+                    "loop limit reached ({}); delete one first",
+                    revenant_core::loops::MAX_LOOPS
+                ));
+            }
+            _ => {}
+        }
+        let id = format!("lp-{}", uuid_short());
+        match cx
+            .store
+            .loop_upsert(&id, name, schedule, prompt, tier, channel_out, 48, "agent", next_run)
+            .await
+        {
+            Ok(()) => ToolOutput::ok(format!("loop '{name}' created ({id}), first run soon")),
+            Err(err) => ToolOutput::err(format!("{err:#}")),
+        }
+    }
+}
+
+struct LoopControl;
+
+#[async_trait::async_trait]
+impl Tool for LoopControl {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "loop_control",
+            "List, pause, resume, or delete your recurring loops. action: list | pause | resume | delete. For pause/resume/delete, pass the loop id.",
+            json!({"type":"object","properties":{
+                "action":{"type":"string","enum":["list","pause","resume","delete"]},
+                "id":{"type":"string"}
+            },"required":["action"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        // Listing/pausing is harmless; the create path is the guarded one.
+        PermissionTier::ReadOnly
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        let action = match arg_str(&args, "action") {
+            Ok(a) => a,
+            Err(e) => return e,
+        };
+        match action {
+            "list" => match cx.store.loops_list().await {
+                Ok(loops) if loops.is_empty() => ToolOutput::ok("no loops defined".to_string()),
+                Ok(loops) => ToolOutput::ok(
+                    loops
+                        .iter()
+                        .map(|l| {
+                            format!(
+                                "- {} [{}] {} · tier {} · {}",
+                                l.id,
+                                if l.enabled { "on" } else { "paused" },
+                                l.schedule,
+                                l.tier,
+                                l.name
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Err(err) => ToolOutput::err(format!("{err:#}")),
+            },
+            "pause" | "resume" => {
+                let id = match arg_str(&args, "id") {
+                    Ok(i) => i,
+                    Err(e) => return e,
+                };
+                match cx.store.loop_set_enabled(id, action == "resume").await {
+                    Ok(true) => ToolOutput::ok(format!("loop {id} {action}d")),
+                    Ok(false) => ToolOutput::err(format!("no loop {id}")),
+                    Err(err) => ToolOutput::err(format!("{err:#}")),
+                }
+            }
+            "delete" => {
+                let id = match arg_str(&args, "id") {
+                    Ok(i) => i,
+                    Err(e) => return e,
+                };
+                match cx.store.loop_delete(id).await {
+                    Ok(true) => ToolOutput::ok(format!("loop {id} deleted")),
+                    Ok(false) => ToolOutput::err(format!("no loop {id}")),
+                    Err(err) => ToolOutput::err(format!("{err:#}")),
+                }
+            }
+            other => ToolOutput::err(format!("unknown action '{other}'")),
+        }
+    }
+}
+
+fn uuid_short() -> String {
+    // Cheap unique-ish id without pulling uuid into this crate's surface.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{now:x}")
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 struct ReadSkillFile {

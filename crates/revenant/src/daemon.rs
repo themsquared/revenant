@@ -115,6 +115,14 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
 
     let manager = SessionManager::new(runtime);
 
+    // Loop scheduler: fires due recurring jobs off the hot path.
+    let default_tier = cfg
+        .agent
+        .default_tier
+        .parse()
+        .unwrap_or(revenant_core::Tier::Fast);
+    Arc::new(revenant_loops::LoopScheduler::new(manager.clone(), default_tier)).start();
+
     // Telegram channel: starts only when enabled AND the bot token exists.
     if cfg.channels.telegram.enabled {
         let token = revenant_gateway::load_secrets(home)?

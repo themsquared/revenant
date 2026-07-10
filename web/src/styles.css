@@ -223,3 +223,11 @@ a { color: var(--accent-2); }
   font-size: 12px;
 }
 .chip.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* loops */
+.loop-prompt { color: var(--dim); margin: 4px 0; font-style: italic; }
+.runs { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.run-row { display: flex; gap: 12px; padding: 3px 0; font-size: 12px; align-items: baseline; }
+.run-time { color: var(--dim); }
+.run-toks { color: var(--dim); }
+.run-outcome { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

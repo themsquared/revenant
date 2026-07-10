@@ -58,6 +58,12 @@ pub enum Event {
         child_session: i64,
         ok: bool,
     },
+    LoopCompleted {
+        loop_id: String,
+        name: String,
+        channel_out: String,
+        text: String,
+    },
     GatewayStatus {
         healthy: bool,
         detail: String,

@@ -1,0 +1,16 @@
+[package]
+name = "revenant-loops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+revenant-core = { workspace = true }
+revenant-store = { workspace = true }
+revenant-agent = { workspace = true }
+tokio = { workspace = true }
+croner = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }

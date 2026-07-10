@@ -52,6 +52,10 @@ export const api = {
   config: () => request('GET', '/v1/config'),
   gateway: () => request('GET', '/v1/gateway/status'),
   memoryStatus: () => request('GET', '/v1/memory/status'),
+  loops: () => request('GET', '/v1/loops'),
+  loopRuns: (id) => request('GET', `/v1/loops/${encodeURIComponent(id)}/runs`),
+  loopToggle: (id, enabled) => request('PATCH', `/v1/loops/${encodeURIComponent(id)}`, { enabled }),
+  loopDelete: (id) => request('DELETE', `/v1/loops/${encodeURIComponent(id)}`),
 }
 
 export function eventStream(onEvent) {
@@ -74,6 +78,7 @@ export function eventStream(onEvent) {
     'approval_resolved',
     'subagent_spawned',
     'subagent_finished',
+    'loop_completed',
     'gateway_status',
   ]) {
     source.addEventListener(name, forward)

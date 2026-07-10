@@ -60,6 +60,33 @@ pub struct SpendRow {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct LoopRow {
+    pub id: String,
+    pub name: String,
+    pub schedule: String,
+    pub prompt: String,
+    pub tier: String,
+    pub channel_out: Option<String>,
+    pub enabled: bool,
+    pub max_per_day: i64,
+    pub created_by: String,
+    pub last_run: Option<i64>,
+    pub next_run: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LoopRunRow {
+    pub id: i64,
+    pub loop_id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub status: String,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SubagentRow {
     pub id: i64,
     pub parent_session: Option<i64>,
@@ -340,6 +367,177 @@ impl Store {
         .await
     }
 
+    // ---- loops ----
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn loop_upsert(
+        &self,
+        id: &str,
+        name: &str,
+        schedule: &str,
+        prompt: &str,
+        tier: &str,
+        channel_out: Option<&str>,
+        max_per_day: i64,
+        created_by: &str,
+        next_run: i64,
+    ) -> Result<()> {
+        let (id, name, schedule, prompt, tier, channel_out, created_by) = (
+            id.to_owned(),
+            name.to_owned(),
+            schedule.to_owned(),
+            prompt.to_owned(),
+            tier.to_owned(),
+            channel_out.map(str::to_owned),
+            created_by.to_owned(),
+        );
+        self.with(move |conn| {
+            let now = unix_now();
+            conn.execute(
+                "INSERT INTO loops (id, name, schedule, prompt, tier, channel_out, max_per_day,
+                                    created_by, next_run, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                   name=excluded.name, schedule=excluded.schedule, prompt=excluded.prompt,
+                   tier=excluded.tier, channel_out=excluded.channel_out,
+                   max_per_day=excluded.max_per_day, next_run=excluded.next_run,
+                   updated_at=excluded.updated_at",
+                rusqlite::params![id, name, schedule, prompt, tier, channel_out, max_per_day, created_by, next_run, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn loop_set_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let id = id.to_owned();
+        self.with(move |conn| {
+            let n = conn.execute(
+                "UPDATE loops SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![id, enabled as i64, unix_now()],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    pub async fn loop_delete(&self, id: &str) -> Result<bool> {
+        let id = id.to_owned();
+        self.with(move |conn| {
+            conn.execute("DELETE FROM loop_runs WHERE loop_id = ?1", [&id])?;
+            let n = conn.execute("DELETE FROM loops WHERE id = ?1", [&id])?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    pub async fn loops_list(&self) -> Result<Vec<LoopRow>> {
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, schedule, prompt, tier, channel_out, enabled, max_per_day,
+                        created_by, last_run, next_run FROM loops ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], map_loop)?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Enabled loops whose next_run is due (<= now).
+    pub async fn loops_due(&self, now: i64) -> Result<Vec<LoopRow>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, schedule, prompt, tier, channel_out, enabled, max_per_day,
+                        created_by, last_run, next_run FROM loops
+                 WHERE enabled = 1 AND next_run IS NOT NULL AND next_run <= ?1",
+            )?;
+            let rows = stmt.query_map([now], map_loop)?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn loop_mark_run(&self, id: &str, next_run: i64) -> Result<()> {
+        let id = id.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE loops SET last_run = ?2, next_run = ?3 WHERE id = ?1",
+                rusqlite::params![id, unix_now(), next_run],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Count runs since a timestamp (for the per-day rail).
+    pub async fn loop_runs_since(&self, id: &str, since: i64) -> Result<i64> {
+        let id = id.to_owned();
+        self.with(move |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM loop_runs WHERE loop_id = ?1 AND started_at >= ?2",
+                rusqlite::params![id, since],
+                |r| r.get(0),
+            )
+        })
+        .await
+    }
+
+    pub async fn loop_run_start(&self, loop_id: &str) -> Result<i64> {
+        let loop_id = loop_id.to_owned();
+        self.with(move |conn| {
+            conn.execute(
+                "INSERT INTO loop_runs (loop_id, started_at, status) VALUES (?1, ?2, 'running')",
+                rusqlite::params![loop_id, unix_now()],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    pub async fn loop_run_finish(
+        &self,
+        run_id: i64,
+        status: &str,
+        tokens_in: i64,
+        tokens_out: i64,
+        outcome: &str,
+    ) -> Result<()> {
+        let (status, outcome) = (status.to_owned(), outcome.to_owned());
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE loop_runs SET finished_at = ?2, status = ?3, tokens_in = ?4,
+                        tokens_out = ?5, outcome = ?6 WHERE id = ?1",
+                rusqlite::params![run_id, unix_now(), status, tokens_in, tokens_out, outcome],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn loop_runs(&self, loop_id: &str, limit: usize) -> Result<Vec<LoopRunRow>> {
+        let loop_id = loop_id.to_owned();
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, loop_id, started_at, finished_at, status, tokens_in, tokens_out, outcome
+                 FROM loop_runs WHERE loop_id = ?1 ORDER BY id DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![loop_id, limit as i64], |r| {
+                Ok(LoopRunRow {
+                    id: r.get(0)?,
+                    loop_id: r.get(1)?,
+                    started_at: r.get(2)?,
+                    finished_at: r.get(3)?,
+                    status: r.get(4)?,
+                    tokens_in: r.get(5)?,
+                    tokens_out: r.get(6)?,
+                    outcome: r.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
     // ---- channel pairing ----
 
     pub async fn pairing_code_create(&self, code: &str, ttl_s: i64) -> Result<()> {
@@ -498,6 +696,22 @@ impl Store {
         })
         .await
     }
+}
+
+fn map_loop(r: &rusqlite::Row<'_>) -> rusqlite::Result<LoopRow> {
+    Ok(LoopRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        schedule: r.get(2)?,
+        prompt: r.get(3)?,
+        tier: r.get(4)?,
+        channel_out: r.get(5)?,
+        enabled: r.get::<_, i64>(6)? != 0,
+        max_per_day: r.get(7)?,
+        created_by: r.get(8)?,
+        last_run: r.get(9)?,
+        next_run: r.get(10)?,
+    })
 }
 
 fn unix_now() -> i64 {
@@ -663,6 +877,41 @@ fn migrate(conn: &mut Connection) -> Result<()> {
                used_by    TEXT
              );
              PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 5 {
+        // Loops: self-managed recurring jobs + their run history.
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE loops (
+               id          TEXT PRIMARY KEY,
+               name        TEXT NOT NULL,
+               schedule    TEXT NOT NULL,      -- 'every:600s' | 'cron:*/10 * * * *'
+               prompt      TEXT NOT NULL,
+               tier        TEXT NOT NULL DEFAULT 'fast',
+               channel_out TEXT,               -- e.g. 'telegram' to push results
+               enabled     INTEGER NOT NULL DEFAULT 1,
+               max_per_day INTEGER NOT NULL DEFAULT 48,
+               created_by  TEXT NOT NULL DEFAULT 'user',
+               last_run    INTEGER,
+               next_run    INTEGER,
+               created_at  INTEGER NOT NULL,
+               updated_at  INTEGER NOT NULL
+             );
+             CREATE TABLE loop_runs (
+               id          INTEGER PRIMARY KEY,
+               loop_id     TEXT NOT NULL REFERENCES loops(id),
+               started_at  INTEGER NOT NULL,
+               finished_at INTEGER,
+               status      TEXT NOT NULL,       -- ok | error | skipped
+               tokens_in   INTEGER NOT NULL DEFAULT 0,
+               tokens_out  INTEGER NOT NULL DEFAULT 0,
+               outcome     TEXT
+             );
+             CREATE INDEX idx_loop_runs ON loop_runs(loop_id, id DESC);
+             PRAGMA user_version = 5;
              COMMIT;",
         )?;
     }
