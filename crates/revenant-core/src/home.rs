@@ -53,6 +53,9 @@ impl Home {
     pub fn agents_dir(&self) -> PathBuf {
         self.root.join("agents")
     }
+    pub fn personalities_dir(&self) -> PathBuf {
+        self.root.join("personalities")
+    }
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }

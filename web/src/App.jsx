@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api, eventStream, getToken, setToken } from './api.js'
 
-const TABS = ['chat', 'approvals', 'skills', 'tools', 'subagents', 'loops', 'spend', 'memory', 'settings']
+const TABS = ['chat', 'approvals', 'skills', 'tools', 'subagents', 'personalities', 'loops', 'spend', 'memory', 'settings']
 
 export default function App() {
   const [authed, setAuthed] = useState(false)
@@ -49,6 +49,7 @@ export default function App() {
         {tab === 'skills' && <Skills />}
         {tab === 'tools' && <Tools />}
         {tab === 'subagents' && <Subagents />}
+        {tab === 'personalities' && <Personalities />}
         {tab === 'loops' && <Loops />}
         {tab === 'spend' && <Spend />}
         {tab === 'memory' && <Memory />}
@@ -97,6 +98,8 @@ function Chat({ onApprovalCount, setBanner }) {
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [approval, setApproval] = useState(null)
+  const [personas, setPersonas] = useState([])
+  const [persona, setPersona] = useState('')
   const bottom = useRef(null)
 
   const refreshSessions = () => api.sessions().then((r) => setSessions(r.sessions))
@@ -104,6 +107,7 @@ function Chat({ onApprovalCount, setBanner }) {
   useEffect(() => {
     refreshSessions()
     api.createSession('web').then((r) => setSessionId(r.id))
+    api.personalities().then((r) => setPersonas(r.personalities))
   }, [])
 
   useEffect(() => {
@@ -206,6 +210,24 @@ function Chat({ onApprovalCount, setBanner }) {
         ))}
       </aside>
       <section>
+        <div className="chat-bar">
+          <select
+            value={persona}
+            onChange={(e) => {
+              const val = e.target.value
+              setPersona(val)
+              if (sessionId) api.setPersona(sessionId, val || null)
+            }}
+            title="personality (voice)"
+          >
+            <option value="">default voice</option>
+            {personas.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.emoji} {p.name}
+              </option>
+            ))}
+          </select>
+        </div>
         <div className="log">
           {messages.map((m, i) => (
             <div key={i} className={`msg ${m.role}`}>
@@ -607,6 +629,37 @@ function AgentEditor({ agent, setAgent, allTools, onSave, onCancel }) {
         <button className="ok" onClick={onSave}>save</button>
         <button className="no" onClick={onCancel}>cancel</button>
       </div>
+    </div>
+  )
+}
+
+// ---- personalities ----
+
+function Personalities() {
+  const [items, setItems] = useState([])
+  useEffect(() => {
+    api.personalities().then((r) => setItems(r.personalities))
+  }, [])
+  return (
+    <div className="list">
+      <div className="card-meta">
+        selectable voices. Pick one per chat with the dropdown above the
+        composer (or /persona in chat/Telegram). Voice only — a personality
+        flavors tone but never changes what the agent can do or its safety
+        rules. Files live in ~/.revenant/personalities/*.md; the agent can
+        draft new ones with persona_create.
+      </div>
+      {items.length === 0 && <div className="empty">no personalities</div>}
+      {items.map((p) => (
+        <div key={p.name} className="card">
+          <div className="card-title">
+            <span style={{ marginRight: 6 }}>{p.emoji}</span>
+            {p.name}
+          </div>
+          <div>{p.description}</div>
+          <div className="loop-prompt">{p.voice}</div>
+        </div>
+      ))}
     </div>
   )
 }

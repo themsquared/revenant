@@ -37,6 +37,17 @@ impl Backend {
         }
     }
 
+    async fn set_persona(&self, persona: Option<&str>) -> Result<()> {
+        match self {
+            Backend::Api { client, session_id } => client.set_persona(*session_id, persona).await,
+            Backend::Embedded { manager, session_id } => manager
+                .runtime()
+                .store
+                .session_set_persona(*session_id, persona)
+                .await,
+        }
+    }
+
     async fn decide(&self, approval_id: &str, approve: bool) -> Result<()> {
         match self {
             Backend::Api { client, .. } => {
@@ -131,7 +142,7 @@ pub async fn cmd_chat(tier_arg: Option<String>) -> Result<()> {
     });
 
     let my_session = backend.session_id();
-    println!("revenant chat — tier: {tier} — /quit to exit, /tier <t> to switch");
+    println!("revenant chat — tier: {tier} — /quit · /tier <t> · /persona <name|off>");
 
     'repl: loop {
         print!("\x1b[1myou>\x1b[0m ");
@@ -154,6 +165,15 @@ pub async fn cmd_chat(tier_arg: Option<String>) -> Result<()> {
                     println!("tier → {tier}");
                 }
                 Err(e) => println!("{e}"),
+            }
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("/persona") {
+            let p = p.trim();
+            let choice = if p.is_empty() || p == "off" || p == "default" { None } else { Some(p) };
+            match backend.set_persona(choice).await {
+                Ok(()) => println!("persona → {}", choice.unwrap_or("default")),
+                Err(e) => println!("error: {e:#}"),
             }
             continue;
         }

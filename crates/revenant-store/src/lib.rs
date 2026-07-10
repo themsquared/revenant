@@ -367,6 +367,31 @@ impl Store {
         .await
     }
 
+    // ---- session personality ----
+
+    pub async fn session_get_persona(&self, session_id: i64) -> Result<Option<String>> {
+        self.with(move |conn| {
+            use rusqlite::OptionalExtension;
+            conn.query_row("SELECT persona FROM sessions WHERE id = ?1", [session_id], |r| r.get(0))
+                .optional()
+                .map(|opt| opt.flatten())
+        })
+        .await
+    }
+
+    /// Set (or clear, with None) a session's personality.
+    pub async fn session_set_persona(&self, session_id: i64, persona: Option<&str>) -> Result<()> {
+        let persona = persona.map(str::to_owned);
+        self.with(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET persona = ?2 WHERE id = ?1",
+                rusqlite::params![session_id, persona],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     // ---- loops ----
 
     #[allow(clippy::too_many_arguments)]
@@ -912,6 +937,16 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              );
              CREATE INDEX idx_loop_runs ON loop_runs(loop_id, id DESC);
              PRAGMA user_version = 5;
+             COMMIT;",
+        )?;
+    }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 6 {
+        // Per-session personality (voice). NULL = default voice.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE sessions ADD COLUMN persona TEXT;
+             PRAGMA user_version = 6;
              COMMIT;",
         )?;
     }

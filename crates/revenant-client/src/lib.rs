@@ -179,6 +179,38 @@ impl Client {
             .by_model)
     }
 
+    /// Set (or clear, with None) a session's personality.
+    pub async fn set_persona(&self, session_id: i64, persona: Option<&str>) -> Result<()> {
+        self.req(reqwest::Method::POST, &format!("/v1/sessions/{session_id}/persona"))
+            .json(&json!({ "persona": persona }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    pub async fn personalities(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct P {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            personalities: Vec<P>,
+        }
+        Ok(self
+            .req(reqwest::Method::GET, "/v1/personalities")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Resp>()
+            .await?
+            .personalities
+            .into_iter()
+            .map(|p| p.name)
+            .collect())
+    }
+
     /// Mint a one-time channel pairing code.
     pub async fn create_pairing(&self) -> Result<String> {
         let resp: serde_json::Value = self

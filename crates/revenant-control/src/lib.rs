@@ -68,6 +68,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/subagents", get(subagents_list))
         .route("/v1/agents", get(agents_list))
         .route("/v1/agents/:name", get(agent_get).put(agent_put))
+        .route("/v1/personalities", get(personalities_list))
+        .route("/v1/sessions/:id/persona", post(session_set_persona))
         .route("/v1/config", get(config_get))
         .route("/v1/loops", get(loops_list))
         .route("/v1/loops/:id/runs", get(loop_runs))
@@ -345,6 +347,38 @@ async fn pairing_create(State(state): State<AppState>) -> Result<Json<serde_json
 fn getrandom_fill(buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")?.read_exact(buf)
+}
+
+async fn personalities_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let items: Vec<_> = state
+        .manager
+        .runtime()
+        .personalities
+        .list()
+        .into_iter()
+        .map(|p| json!({ "name": p.name, "description": p.description, "emoji": p.emoji, "voice": p.voice }))
+        .collect();
+    Json(json!({ "personalities": items }))
+}
+
+#[derive(Deserialize)]
+struct PersonaBody {
+    /// null clears the persona (back to default voice).
+    persona: Option<String>,
+}
+
+async fn session_set_persona(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<PersonaBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .manager
+        .runtime()
+        .store
+        .session_set_persona(id, body.persona.as_deref())
+        .await?;
+    Ok(Json(json!({ "ok": true, "persona": body.persona })))
 }
 
 async fn agents_list(State(state): State<AppState>) -> Json<serde_json::Value> {

@@ -72,6 +72,12 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         Ok(_) => {}
         Err(err) => tracing::warn!("subagent scan failed: {err:#}"),
     }
+    let personalities = Arc::new(revenant_agent::PersonalityRegistry::new(home.personalities_dir()));
+    match personalities.scan() {
+        Ok(n) if n > 0 => tracing::info!("indexed {n} personalities"),
+        Ok(_) => {}
+        Err(err) => tracing::warn!("personality scan failed: {err:#}"),
+    }
     let llm = revenant_llm::LlmClient::new(endpoint.clone());
 
     // Memory engine: fail-open. A missing model or broken vault must not
@@ -106,6 +112,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         events,
         skills,
         agents,
+        personalities,
         home: home.clone(),
         memory,
         max_history: cfg.agent.max_history_messages,

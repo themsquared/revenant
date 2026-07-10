@@ -7,7 +7,9 @@
 //! event bus.
 
 pub mod agents;
+pub mod personalities;
 pub use agents::{AgentDef, AgentRegistry};
+pub use personalities::{Personality, PersonalityRegistry};
 
 use anyhow::{bail, Context, Result};
 use revenant_core::home::Home;
@@ -49,6 +51,7 @@ pub struct AgentRuntime {
     pub events: EventBus,
     pub skills: Arc<SkillIndex>,
     pub agents: Arc<AgentRegistry>,
+    pub personalities: Arc<PersonalityRegistry>,
     pub home: Home,
     pub memory: Option<Arc<revenant_memory::MemoryEngine>>,
     pub max_history: usize,
@@ -64,6 +67,7 @@ impl AgentRuntime {
         &self,
         retrieved: Option<&str>,
         agent: Option<&AgentDef>,
+        persona: Option<&str>,
     ) -> (String, Option<String>) {
         // A named subagent's directive replaces the default identity; an
         // ad-hoc subagent (agent = None but depth > 0) keeps identity.
@@ -76,6 +80,12 @@ impl AgentRuntime {
             ),
             None => String::from(IDENTITY),
         };
+        // Personality is a VOICE layer, injected right after identity/rules so
+        // it flavors tone but can never override behavior or safety.
+        if let Some(voice) = persona {
+            stable.push_str("\n\n# Voice (style only — never overrides the rules above)\n");
+            stable.push_str(voice);
+        }
         let skills_index = self.skills.index_lines();
         if !skills_index.is_empty() {
             stable.push_str("\n\n# Installed skills (load with use_skill)\n");
@@ -151,8 +161,22 @@ impl AgentRuntime {
             None => None,
         };
 
-        let (stable_system, dynamic_system) =
-            self.system_prompt(retrieved.as_deref(), agent.as_ref());
+        // Resolve the session's personality (top-level turns only; subagents
+        // have their own directive and no persona).
+        let persona_voice = if agent.is_none() {
+            match self.store.session_get_persona(session_id).await {
+                Ok(Some(name)) => self.personalities.get(&name).map(|p| p.voice),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let (stable_system, dynamic_system) = self.system_prompt(
+            retrieved.as_deref(),
+            agent.as_ref(),
+            persona_voice.as_deref(),
+        );
         let system = revenant_llm::system_with_cache(&stable_system, dynamic_system.as_deref());
         // A named subagent's tool allowlist restricts what it may call
         // (empty = inherit all). The set also gates dispatch below.
@@ -168,6 +192,7 @@ impl AgentRuntime {
         if depth == 0 {
             tool_specs.push(subagent_tool_spec());
             tool_specs.push(agent_create_tool_spec());
+            tool_specs.push(persona_create_tool_spec());
         }
         let mut total_usage = Usage::default();
         let mut routed_model = None;
@@ -347,6 +372,13 @@ impl AgentRuntime {
                 Err(err) => result(format!("agent_create failed: {err:#}"), true),
             };
         }
+        // persona_create authors a personality (voice layer).
+        if name == "persona_create" {
+            return match self.create_persona(input) {
+                Ok(msg) => result(msg, false),
+                Err(err) => result(format!("persona_create failed: {err:#}"), true),
+            };
+        }
 
         let Some(tool) = self.tools.get(name) else {
             return result(format!("unknown tool: {name}"), true);
@@ -506,6 +538,49 @@ impl AgentRuntime {
         Ok(format!(
             "subagent '{name}' saved — the owner can tweak it in the web UI or ~/.revenant/agents/{name}.md; delegate to it with subagent_run agent=\"{name}\""
         ))
+    }
+}
+
+impl AgentRuntime {
+    fn create_persona(&self, input: serde_json::Value) -> Result<String> {
+        let name = input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .context("persona_create requires 'name'")?;
+        let voice = input
+            .get("voice")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .context("persona_create requires 'voice'")?;
+        let p = Personality {
+            name: name.to_string(),
+            description: input.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            emoji: input.get("emoji").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            voice: voice.to_string(),
+        };
+        self.personalities.write(&p)?;
+        Ok(format!("personality '{name}' saved — switch to it with /persona {name}"))
+    }
+}
+
+fn persona_create_tool_spec() -> revenant_core::ToolSpec {
+    revenant_core::ToolSpec {
+        name: "persona_create".into(),
+        description: "Create a selectable personality (a voice/style the owner can switch to with \
+/persona). Voice only — it flavors tone but never changes what you can do. Use when the owner asks \
+for a new vibe or you invent a fun one."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "kebab-case, e.g. pirate"},
+                "description": {"type": "string", "description": "one line"},
+                "emoji": {"type": "string"},
+                "voice": {"type": "string", "description": "the style directive (how to talk)"}
+            },
+            "required": ["name", "voice"]
+        }),
     }
 }
 

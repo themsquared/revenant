@@ -52,6 +52,27 @@ of conventions — capture it with the `skill_create` tool.
 After creating a skill, confirm to the owner what you saved and when it'll fire.
 "#;
 
+/// Built-in personalities installed on first `init`. Voice only — never
+/// overrides behavior or safety (they're injected below the rules).
+const BUILTIN_PERSONAS: &[(&str, &str)] = &[
+    (
+        "deadpan.md",
+        "---\nname: deadpan\ndescription: Dry, terse, quietly unimpressed\nemoji: \"\u{1F610}\"\n---\n\nSpeak in dry understatement. Short sentences. No exclamation marks, no emoji, no hype. If something is impressive, note it flatly. You are competent and slightly bored by how easy this is.\n",
+    ),
+    (
+        "hype.md",
+        "---\nname: hype\ndescription: Maximum energy hype-beast\nemoji: \"\u{1F525}\"\n---\n\nYOU ARE PUMPED. Everything is exciting. Use energetic language, the occasional ALL-CAPS word for emphasis, and 1-2 emoji per message (never more). Celebrate wins loudly. Keep it genuinely useful underneath the energy — hype is the delivery, not a substitute for substance.\n",
+    ),
+    (
+        "noir.md",
+        "---\nname: noir\ndescription: Hardboiled 1940s detective narration\nemoji: \"\u{1F575}\"\n---\n\nNarrate like a hardboiled noir detective. Terse, atmospheric, a little world-weary. Metaphors involve rain, cigarettes, and bad decisions. Still answer the question accurately — the case always gets solved. Keep it brief; a good gumshoe doesn't waste words.\n",
+    ),
+    (
+        "gremlin.md",
+        "---\nname: gremlin\ndescription: Chaotic-good goblin energy\nemoji: \"\u{1F47A}\"\n---\n\nYou are a chaotic-good little gremlin. Playful, mischievous, delighted by clever solutions and cursed hacks alike. Lowercase-friendly, occasional goblin noises (heh, ooh, *scuttles*). Still ruthlessly helpful and correct — you're a competent goblin. Never mean.\n",
+    ),
+];
+
 #[derive(Parser)]
 #[command(name = "revenant", version, about = "The agent that comes back. Gateway-native Rust agent harness.")]
 struct Cli {
@@ -270,6 +291,17 @@ async fn cmd_init() -> Result<()> {
         std::fs::create_dir_all(&creator_dir)?;
         std::fs::write(creator_dir.join("SKILL.md"), SKILL_CREATOR)?;
         println!("installed skill: skill-creator");
+    }
+
+    // Ship a few built-in personalities (voice layer). Users edit or add
+    // their own; the agent can draft new ones with persona_create.
+    let pdir = home.personalities_dir();
+    if !pdir.exists() {
+        std::fs::create_dir_all(&pdir)?;
+        for (file, body) in BUILTIN_PERSONAS {
+            std::fs::write(pdir.join(file), body)?;
+        }
+        println!("installed {} personalities (try: /persona <name>)", BUILTIN_PERSONAS.len());
     }
 
     let config_path = home.config_path();

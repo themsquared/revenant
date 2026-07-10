@@ -294,6 +294,24 @@ impl TelegramChannel {
         // Paired: route to the session actor.
         match runtime.store.ensure_session(CHANNEL, &peer, "chat").await {
             Ok(session_id) => {
+                // /persona <name|off> — switch the voice for this chat.
+                if let Some(rest) = text.strip_prefix("/persona") {
+                    let choice = rest.trim();
+                    let persona = if choice.is_empty() || choice == "off" || choice == "default" {
+                        None
+                    } else {
+                        Some(choice)
+                    };
+                    let _ = runtime.store.session_set_persona(session_id, persona).await;
+                    let names: Vec<String> =
+                        runtime.personalities.list().into_iter().map(|p| p.name).collect();
+                    let reply = match persona {
+                        Some(p) => format!("voice → {p}"),
+                        None => format!("voice → default\navailable: {}", names.join(", ")),
+                    };
+                    let _ = self.client.send_message(chat_id, &reply).await;
+                    return;
+                }
                 self.client.typing(chat_id).await;
                 if let Err(err) = self
                     .manager
