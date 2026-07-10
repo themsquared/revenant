@@ -326,6 +326,18 @@ h2 {
 }
 .rc:hover { background: rgba(139,92,246,.16); border-color: var(--accent); transform: translateY(-2px); }
 .horde-ctas { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+.creed { margin: 8px auto 46px; }
+.creed span {
+  display: block; font-family: var(--display); font-weight: 800;
+  font-size: clamp(15px, 2.6vw, 22px); letter-spacing: .18em; line-height: 2;
+  color: var(--dim);
+}
+.creed span:nth-child(2) { color: var(--text); }
+.creed span:nth-child(3) { color: var(--accent-2); }
+.creed .final {
+  color: var(--accent); font-size: clamp(18px, 3.2vw, 28px);
+  text-shadow: 0 0 40px rgba(139,92,246,.6);
+}
 
 /* reveal on scroll */
 .rv { opacity: 0; transform: translateY(22px); transition: opacity .7s ease, transform .7s cubic-bezier(.2,.7,.2,1); }
@@ -588,14 +600,27 @@ model    = <span class="st">"qwen3:0.6b"</span>
     <p class="horde-kicker rv">† the call †</p>
     <h2 class="rv">THE NERD HORDE <span class="r">RISES</span></h2>
     <p class="horde-speech rv">
-      This is for the script-kiddies who outgrew the scripts. The basement dwellers with a
-      Raspberry Pi humming under the stairs. The kids who read the docs twice and the adults who
-      never stopped building at midnight. The legends nobody has heard of — <b>yet</b>.
-      You were never too small. <b>You were early.</b> You don't need a platform team.
-      You don't need a seed round. You need one static binary, a $35 board, and the nerve
-      to raise something bigger than yourself.
+      This is for the script-kiddies who outgrew the scripts — <b>and the staff engineers who
+      never lost the itch</b>. The basement dwellers with a Raspberry Pi humming under the
+      stairs, and the SREs with a rack that hums back. The kids who read the docs twice, the
+      adults who never stopped building at midnight, the graybeards who watched every hype
+      cycle die — and come back. The legends nobody has heard of <b>yet</b>, and the ones
+      whose handles you already know. You were never too small. <b>You were early.</b>
+      And you are never too senior to raise something new.
+    </p>
+    <p class="horde-speech rv">
+      There is no enterprise tier. No gated features. No "contact sales."
+      The kid on a $35 board runs the <b>same binary, same capabilities, same lethality</b>
+      as the pro on a 96-core rack. Outstanding performance, delivery, customizability —
+      for everyone, or for no one. <b>We all run on the same plane.</b>
       <span class="vow">The horde isn't hired. It rises.</span>
     </p>
+    <div class="creed rv">
+      <span>WE ARE ONE.</span>
+      <span>WE ARE TOGETHER.</span>
+      <span>WE ARE THE HORDE.</span>
+      <span class="final">WE ARE THE REVENANTS.</span>
+    </div>
     <div class="rollcall rv">
       <span class="rc">THE SCRIPT-KIDDIES</span>
       <span class="rc">THE BASEMENT DWELLERS</span>
@@ -603,6 +628,10 @@ model    = <span class="st">"qwen3:0.6b"</span>
       <span class="rc">THE PI HOARDERS</span>
       <span class="rc">THE DOC READERS</span>
       <span class="rc">THE HOMELAB WARLORDS</span>
+      <span class="rc">THE STAFF ENGINEERS</span>
+      <span class="rc">THE PAGER CARRIERS</span>
+      <span class="rc">THE PROD WHISPERERS</span>
+      <span class="rc">THE GRAYBEARDS</span>
       <span class="rc">THE LEGENDS-IN-WAITING</span>
     </div>
     <div class="horde-ctas rv">

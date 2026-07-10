@@ -171,6 +171,13 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    /// Closed learning loop: after a successful multi-tool turn, distill a
+    /// reusable skill from the trajectory (Hermes-style self-improvement).
+    #[serde(default = "default_true")]
+    pub learn: bool,
+    /// Minimum tool calls in a turn before it's considered worth distilling.
+    #[serde(default = "default_learn_min_tools")]
+    pub learn_min_tools: usize,
 }
 
 impl Default for AgentConfig {
@@ -180,8 +187,14 @@ impl Default for AgentConfig {
             max_history_messages: default_max_history(),
             max_tokens: default_max_tokens(),
             max_iterations: default_max_iterations(),
+            learn: true,
+            learn_min_tools: default_learn_min_tools(),
         }
     }
+}
+
+fn default_learn_min_tools() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

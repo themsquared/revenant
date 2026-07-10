@@ -104,6 +104,11 @@ pub struct AgentRuntime {
     pub max_history: usize,
     pub max_tokens: u32,
     pub max_iterations: u32,
+    /// Closed learning loop (Hermes-style self-improvement).
+    pub learn: bool,
+    pub learn_min_tools: usize,
+    /// Timestamps of recent auto-distilled skills (rolling 1h) — anti-spam.
+    pub learn_budget: Arc<Mutex<Vec<i64>>>,
 }
 
 impl AgentRuntime {
@@ -260,6 +265,8 @@ impl AgentRuntime {
         let mut final_text = String::new();
         #[allow(unused_assignments)]
         let mut last_assistant_id = 0i64;
+        // Tool trajectory for the learning loop.
+        let mut tools_used: Vec<String> = Vec::new();
 
         for iteration in 1..=self.max_iterations {
             let history = self.store.history(session_id, self.max_history).await?;
@@ -358,6 +365,16 @@ impl AgentRuntime {
                         hook.post_turn(&hcx, &final_text).await;
                     }
                 }
+                // Closed learning loop: a successful, substantive turn is a
+                // trajectory worth learning from. Distill off the hot path
+                // (top-level turns only; never a subagent).
+                if depth == 0
+                    && self.learn
+                    && tools_used.len() >= self.learn_min_tools
+                    && self.reserve_learn_budget()
+                {
+                    self.spawn_distill(user_text.clone(), tools_used.clone(), final_text.clone());
+                }
                 self.events.emit(Event::TurnCompleted {
                     session_id,
                     text: final_text.clone(),
@@ -393,6 +410,7 @@ impl AgentRuntime {
                             continue;
                         }
                     }
+                    tools_used.push(name.clone());
                     results.push(self.dispatch(session_id, id, name, input.clone(), depth).await);
                 }
             }
@@ -711,6 +729,125 @@ subagents."
             "required": ["task"]
         }),
     }
+}
+
+impl AgentRuntime {
+    /// Reserve one slot in the rolling 1h learning budget (max 6/hour). Keeps
+    /// auto-distillation from spamming skills on a busy day.
+    fn reserve_learn_budget(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut budget = self.learn_budget.lock().unwrap();
+        budget.retain(|t| now - *t < 3600);
+        if budget.len() >= 6 {
+            return false;
+        }
+        budget.push(now);
+        true
+    }
+
+    /// Fire-and-forget skill distillation from a successful trajectory.
+    fn spawn_distill(&self, goal: String, tools_used: Vec<String>, outcome: String) {
+        let llm = self.llm.clone();
+        let skills = self.skills.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            if let Err(err) = distill_skill(&llm, &skills, &events, &goal, &tools_used, &outcome).await {
+                tracing::debug!("skill distillation skipped: {err:#}");
+            }
+        });
+    }
+}
+
+/// Ask a cheap model whether a completed trajectory is a reusable procedure
+/// worth saving as a skill; if so, author it. The closed learning loop.
+async fn distill_skill(
+    llm: &LlmClient,
+    skills: &Arc<SkillIndex>,
+    events: &EventBus,
+    goal: &str,
+    tools_used: &[String],
+    outcome: &str,
+) -> Result<()> {
+    let existing = skills.index_lines();
+    let system = "You improve an AI agent by distilling reusable skills from tasks it just \
+completed successfully. Given the task, the tools it used, and the outcome, decide whether there \
+is a GENERALIZABLE, reusable procedure worth saving as a skill for next time. Save only genuinely \
+reusable know-how — not one-off facts, not things already covered by an existing skill. Most turns \
+are NOT worth saving; when in doubt, don't. If worth saving, write a crisp kebab-case name, a \
+one-line 'use when …' description, and a body of concrete steps. Return via record_skill.";
+    let user = format!(
+        "TASK: {goal}\nTOOLS USED: {}\nOUTCOME: {}\n\nEXISTING SKILLS (don't duplicate):\n{}",
+        tools_used.join(", "),
+        truncate(outcome, 800),
+        if existing.is_empty() { "(none)" } else { &existing },
+    );
+    let spec = revenant_core::ToolSpec {
+        name: "record_skill".into(),
+        description: "Record whether to save a reusable skill.".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "worth_saving": {"type": "boolean"},
+                "name": {"type": "string", "description": "kebab-case (required if worth_saving)"},
+                "description": {"type": "string", "description": "one line: when to use it"},
+                "body": {"type": "string", "description": "the skill instructions"}
+            },
+            "required": ["worth_saving"]
+        }),
+    };
+    let request = MessagesRequest {
+        model: "fast".to_string(),
+        max_tokens: 1024,
+        system: Some(serde_json::Value::String(system.to_string())),
+        messages: vec![WireMessage::new(Role::User, vec![ContentBlock::text(user)])],
+        tools: vec![spec],
+        tool_choice: Some(serde_json::json!({"type": "tool", "name": "record_skill"})),
+        stream: true,
+    };
+    let outcome = llm.stream_message(&request, |_| {}).await?;
+    let input = outcome
+        .content
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolUse { name, input, .. } if name == "record_skill" => Some(input.clone()),
+            _ => None,
+        })
+        .context("distiller did not call record_skill")?;
+
+    if !input.get("worth_saving").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok(());
+    }
+    let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let description = input.get("description").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let body = input.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if name.is_empty() || description.is_empty() || body.is_empty() {
+        return Ok(());
+    }
+    // Don't clobber an existing skill via auto-learning.
+    if skills.get(name).is_some() {
+        return Ok(());
+    }
+    skills.write_skill(name, description, body)?;
+    tracing::info!("learned skill '{name}' from a completed task");
+    events.emit(Event::SkillLearned {
+        name: name.to_string(),
+        description: description.to_string(),
+    });
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// One-line human summary of a tool call for approval prompts and event logs.

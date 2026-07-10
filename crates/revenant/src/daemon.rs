@@ -139,6 +139,9 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         max_history: cfg.agent.max_history_messages,
         max_tokens: cfg.agent.max_tokens,
         max_iterations: cfg.agent.max_iterations,
+        learn: cfg.agent.learn,
+        learn_min_tools: cfg.agent.learn_min_tools,
+        learn_budget: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
 
     let manager = SessionManager::new(runtime);

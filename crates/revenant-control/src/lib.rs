@@ -164,6 +164,7 @@ async fn events(
                 revenant_core::Event::SubagentSpawned { .. } => "subagent_spawned",
                 revenant_core::Event::SubagentFinished { .. } => "subagent_finished",
                 revenant_core::Event::LoopCompleted { .. } => "loop_completed",
+                revenant_core::Event::SkillLearned { .. } => "skill_learned",
                 revenant_core::Event::GatewayStatus { .. } => "gateway_status",
             };
             Some(Ok(SseEvent::default()

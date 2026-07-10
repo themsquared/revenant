@@ -64,6 +64,11 @@ pub enum Event {
         channel_out: String,
         text: String,
     },
+    /// The agent distilled a reusable skill from a successful task trajectory.
+    SkillLearned {
+        name: String,
+        description: String,
+    },
     GatewayStatus {
         healthy: bool,
         detail: String,
