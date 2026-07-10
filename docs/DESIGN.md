@@ -224,3 +224,48 @@ primitive that bakes produce→check→refine with a mechanical or subagent chec
 and hard termination — worth it only if the declarative pattern proves too
 loose in practice. Also: reflection could propose brand-new loops it infers the
 owner would want (with approval), and score loop value from 👍/👎 reactions.
+
+## Planned (M5, reframed): registry-backed discovery — agentregistry
+
+Adopt an OSS agent/MCP registry (agentregistry-dev/agentregistry, or any
+ARD-v1.0 registry — Solo's Agent Registry, the agentic-community
+mcp-gateway-registry) as revenant's DISCOVERY plane, mirroring how
+agentgateway is its DATA plane. The registry catalogs exactly revenant's three
+artifact types: MCP servers, agents, skills. Bundled+supervised like the
+gateway, or point at an external/shared one. This makes revenant + agentgateway
++ agentregistry a complete personal-scale Agent Mesh — the full Solo stack on
+one box (Pi included).
+
+Non-negotiable guardrails (these are what keep revenant revenant):
+
+1. **Registry = discovery/distribution; local files = runtime source of truth.**
+   Pull skills/agent-defs FROM the registry INTO local editable markdown
+   (git-auditable, offline-first). Never fetch-execute at runtime. Publish the
+   other way to share a locally-authored artifact. The registry augments
+   discovery; it is NEVER a runtime dependency or the source of truth.
+2. **Offline-first is sacred.** Revenant works today with zero registry and must
+   keep doing so. Registry is opt-in. On a Pi, point at a remote registry
+   rather than run one locally.
+3. **Discovery is free; activation is gated.** A (sub)agent may QUERY the
+   registry to discover capabilities and REQUEST one — read-only, safe. Actually
+   installing/activating an MCP server, skill, or tool crosses the approval
+   broker + trust gate (same as self-authored skill scripts). Dynamic capability
+   *acquisition* is the malicious-tool attack surface: discovery ≠ installation,
+   never silent runtime expansion.
+4. **Trust tiers by provenance.** Curated/official registry → higher trust;
+   community/public → stricter gating (scripts always need approval, sandbox by
+   default). Consume the registry's signing/provenance (ARD) into the trust model.
+
+Concrete flows:
+- MCP (strongest fit; this IS the M5 backbone): `revenant mcp search <capability>`
+  → query registry → pick a server → render into the gateway's MCP multiplex →
+  hot-reload. Replaces hand-configuring MCP servers with a curated catalog.
+- Skills/agents: `revenant skill search` / `agent search` → pull into local
+  markdown → user tweaks. The self-authoring loop can now discover prior art
+  before drafting from scratch.
+- Subagents: at depth 0, a subagent that lacks a capability can surface "there's
+  a registry skill/tool for this — approve to add it?" instead of failing.
+
+Target the ARD v1.0 spec, not one vendor's API, so revenant federates with any
+compliant registry. Strategically: revenant becomes the personal-scale
+reference deployment of Solo's agentgateway + kagent + Agent Registry mesh.
