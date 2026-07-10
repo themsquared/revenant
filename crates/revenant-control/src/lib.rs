@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/skills", get(skills_list))
         .route("/v1/spend", get(spend))
         .route("/v1/gateway/status", get(gateway_status))
+        .route("/v1/channels/pairings", post(pairing_create))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }
@@ -275,6 +276,30 @@ async fn spend(
     };
     let rows = state.manager.runtime().store.spend_since(from).await?;
     Ok(Json(json!({ "window": q.window, "by_model": rows })))
+}
+
+async fn pairing_create(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    // 8 chars from an unambiguous alphabet, 10-minute TTL, single use.
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let code: String = (0..8)
+        .map(|_| {
+            let mut byte = [0u8; 1];
+            let _ = getrandom_fill(&mut byte);
+            ALPHABET[byte[0] as usize % ALPHABET.len()] as char
+        })
+        .collect();
+    state
+        .manager
+        .runtime()
+        .store
+        .pairing_code_create(&code, 600)
+        .await?;
+    Ok(Json(json!({ "code": code, "expires_in_s": 600 })))
+}
+
+fn getrandom_fill(buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(buf)
 }
 
 async fn gateway_status(State(state): State<AppState>) -> Json<serde_json::Value> {

@@ -104,8 +104,41 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         max_iterations: cfg.agent.max_iterations,
     });
 
+    let manager = SessionManager::new(runtime);
+
+    // Telegram channel: starts only when enabled AND the bot token exists.
+    if cfg.channels.telegram.enabled {
+        let token = revenant_gateway::load_secrets(home)?
+            .into_iter()
+            .find(|(k, _)| k == &cfg.channels.telegram.token_env)
+            .map(|(_, v)| v);
+        match token {
+            Some(token) if !token.is_empty() => {
+                let default_tier = cfg
+                    .agent
+                    .default_tier
+                    .parse()
+                    .unwrap_or(revenant_core::Tier::Balanced);
+                let channel = revenant_channels::telegram::TelegramChannel {
+                    client: revenant_channels::telegram::TelegramClient::new(&token),
+                    manager: manager.clone(),
+                    default_tier,
+                };
+                tokio::spawn(async move {
+                    if let Err(err) = channel.run().await {
+                        tracing::error!("telegram channel exited: {err:#}");
+                    }
+                });
+            }
+            _ => tracing::info!(
+                "telegram disabled: {} not set in secrets.env",
+                cfg.channels.telegram.token_env
+            ),
+        }
+    }
+
     Ok(Daemon {
-        manager: SessionManager::new(runtime),
+        manager,
         gateway_handle,
         llm_endpoint: endpoint,
     })

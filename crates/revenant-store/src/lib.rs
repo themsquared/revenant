@@ -282,6 +282,68 @@ impl Store {
         .await
     }
 
+    // ---- channel pairing ----
+
+    pub async fn pairing_code_create(&self, code: &str, ttl_s: i64) -> Result<()> {
+        let code = code.to_owned();
+        self.with(move |conn| {
+            let now = unix_now();
+            conn.execute(
+                "INSERT INTO pairing_codes (code, created_at, expires_at) VALUES (?1, ?2, ?3)",
+                (&code, now, now + ttl_s),
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Claim a pairing code (single-use, unexpired). On success the peer is
+    /// added to the channel allowlist.
+    pub async fn pairing_claim(&self, code: &str, channel: &str, peer: &str) -> Result<bool> {
+        let (code, channel, peer) = (code.to_owned(), channel.to_owned(), peer.to_owned());
+        self.with(move |conn| {
+            let now = unix_now();
+            let claimed = conn.execute(
+                "UPDATE pairing_codes SET used_by = ?2
+                 WHERE code = ?1 AND used_by IS NULL AND expires_at > ?3",
+                (&code, format!("{channel}:{peer}"), now),
+            )?;
+            if claimed == 1 {
+                conn.execute(
+                    "INSERT OR REPLACE INTO channel_pairings (channel, peer, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    (&channel, &peer, now),
+                )?;
+            }
+            Ok(claimed == 1)
+        })
+        .await
+    }
+
+    pub async fn peer_allowed(&self, channel: &str, peer: &str) -> Result<bool> {
+        let (channel, peer) = (channel.to_owned(), peer.to_owned());
+        self.with(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM channel_pairings WHERE channel = ?1 AND peer = ?2",
+                (&channel, &peer),
+                |r| r.get(0),
+            )?;
+            Ok(count > 0)
+        })
+        .await
+    }
+
+    pub async fn peers_list(&self, channel: &str) -> Result<Vec<String>> {
+        let channel = channel.to_owned();
+        self.with(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT peer FROM channel_pairings WHERE channel = ?1")?;
+            let rows = stmt.query_map([&channel], |r| r.get(0))?;
+            rows.collect()
+        })
+        .await
+    }
+
     /// Spend grouped by model since `from_ts`.
     pub async fn spend_since(&self, from_ts: i64) -> Result<Vec<SpendRow>> {
         self.with(move |conn| {
@@ -523,6 +585,29 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 4 {
+        // Channel pairing: which chat peers may talk to this agent, and
+        // one-time codes that grant pairing.
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE channel_pairings (
+               channel    TEXT NOT NULL,
+               peer       TEXT NOT NULL,
+               label      TEXT,
+               created_at INTEGER NOT NULL,
+               PRIMARY KEY (channel, peer)
+             );
+             CREATE TABLE pairing_codes (
+               code       TEXT PRIMARY KEY,
+               created_at INTEGER NOT NULL,
+               expires_at INTEGER NOT NULL,
+               used_by    TEXT
+             );
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -563,6 +648,29 @@ mod tests {
         assert!(store.approval_resolve("ap1", "approved", "test").await.unwrap());
         assert!(!store.approval_resolve("ap1", "denied", "late").await.unwrap());
         assert_eq!(store.approvals_pending().await.unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pairing_flow() {
+        let dir = std::env::temp_dir().join(format!("revenant-pair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("t.db")).unwrap();
+
+        store.pairing_code_create("ABCD2345", 600).await.unwrap();
+        assert!(!store.peer_allowed("telegram", "111").await.unwrap());
+        // Claim works once, adds the peer.
+        assert!(store.pairing_claim("ABCD2345", "telegram", "111").await.unwrap());
+        assert!(store.peer_allowed("telegram", "111").await.unwrap());
+        // Single use.
+        assert!(!store.pairing_claim("ABCD2345", "telegram", "222").await.unwrap());
+        // Unknown code.
+        assert!(!store.pairing_claim("NOPE9999", "telegram", "333").await.unwrap());
+        // Expired code.
+        store.pairing_code_create("EXPIRED1", -10).await.unwrap();
+        assert!(!store.pairing_claim("EXPIRED1", "telegram", "444").await.unwrap());
+        assert_eq!(store.peers_list("telegram").await.unwrap(), vec!["111"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

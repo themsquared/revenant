@@ -179,6 +179,22 @@ impl Client {
             .by_model)
     }
 
+    /// Mint a one-time channel pairing code.
+    pub async fn create_pairing(&self) -> Result<String> {
+        let resp: serde_json::Value = self
+            .req(reqwest::Method::POST, "/v1/channels/pairings")
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        resp.get("code")
+            .and_then(|c| c.as_str())
+            .map(String::from)
+            .context("no code in pairing response")
+    }
+
     /// Live event stream. Reconnects are the caller's concern (M1).
     pub async fn events(&self) -> Result<BoxStream<'static, Result<Event>>> {
         let resp = self

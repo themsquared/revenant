@@ -49,6 +49,8 @@ enum Command {
         #[arg(num_args = 1..=2)]
         action: Vec<String>,
     },
+    /// Mint a one-time pairing code for chat channels (Telegram etc).
+    Pair,
 }
 
 fn main() -> Result<()> {
@@ -71,8 +73,22 @@ fn main() -> Result<()> {
             Command::Approvals { action } => cmd_approvals(action).await,
             Command::Render => cmd_render(),
             Command::Memory { action } => cmd_memory(action).await,
+            Command::Pair => cmd_pair().await,
         }
     })
+}
+
+async fn cmd_pair() -> Result<()> {
+    let home = Home::resolve();
+    let client = revenant_client::Client::from_env(&home)?;
+    let resp = client.create_pairing().await.context(
+        "minting a pairing code needs the daemon running (`revenant up`)",
+    )?;
+    println!(
+        "pairing code: {}  (valid 10 minutes, single use)\n\nIn Telegram, message your bot:  /pair {}",
+        resp, resp
+    );
+    Ok(())
 }
 
 /// Local memory engine (no gateway needed for builtin embeddings).

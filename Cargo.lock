@@ -2091,6 +2091,7 @@ dependencies = [
  "hex",
  "rand 0.8.6",
  "revenant-agent",
+ "revenant-channels",
  "revenant-client",
  "revenant-control",
  "revenant-core",
@@ -2119,6 +2120,23 @@ dependencies = [
  "revenant-skills",
  "revenant-store",
  "revenant-tools",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "revenant-channels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "revenant-agent",
+ "revenant-core",
+ "revenant-security",
+ "revenant-store",
+ "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

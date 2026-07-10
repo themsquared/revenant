@@ -20,6 +20,7 @@ revenant-skills = { path = "crates/revenant-skills" }
 revenant-control = { path = "crates/revenant-control" }
 revenant-client = { path = "crates/revenant-client" }
 revenant-memory = { path = "crates/revenant-memory" }
+revenant-channels = { path = "crates/revenant-channels" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "sync", "time", "io-util", "io-std", "fs"] }
 tokio-util = "0.7"

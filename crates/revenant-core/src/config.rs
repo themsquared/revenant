@@ -11,8 +11,35 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub channels: ChannelsConfig,
     /// Tier name ("fast"/"balanced"/"deep"/"local") -> targets.
     pub tiers: BTreeMap<String, TierConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelsConfig {
+    #[serde(default)]
+    pub telegram: TelegramConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    /// Starts when enabled AND the token env var is present in secrets.env.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_telegram_token_env")]
+    pub token_env: String,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        TelegramConfig { enabled: true, token_env: default_telegram_token_env() }
+    }
+}
+
+fn default_telegram_token_env() -> String {
+    "TELEGRAM_BOT_TOKEN".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +286,7 @@ impl Config {
             },
             agent: AgentConfig::default(),
             memory: MemoryConfig::default(),
+            channels: ChannelsConfig::default(),
             tiers,
         }
     }
