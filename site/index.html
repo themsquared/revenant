@@ -282,6 +282,51 @@ h2 {
 .step .kw { color: var(--accent-2); }
 .step .st { color: var(--ok); }
 
+/* lore */
+.lore { padding: 96px 0; position: relative; }
+.lore::before {
+  content: ""; position: absolute; left: 50%; top: 0; transform: translateX(-50%);
+  width: 1px; height: 56px;
+  background: linear-gradient(180deg, transparent, var(--accent));
+}
+.lore-inner { max-width: 760px; margin: 0 auto; text-align: center; }
+.lore-line {
+  font-family: var(--display); font-weight: 600;
+  font-size: clamp(19px, 3.4vw, 30px); line-height: 1.5;
+  color: #e8ebef; letter-spacing: .02em;
+}
+.lore-line em { font-style: normal; color: var(--accent-2); text-shadow: 0 0 30px rgba(139,92,246,.5); }
+.lore-body { margin-top: 30px; color: var(--dim); font-size: 15.5px; line-height: 1.85; }
+.lore-body b { color: var(--text); font-weight: 500; }
+.lore-mark {
+  margin-top: 38px; font-family: var(--display); font-size: 13px; letter-spacing: 4px;
+  color: var(--accent); text-transform: uppercase;
+}
+.lore-mark::before, .lore-mark::after { content: " † "; color: var(--dimmer); }
+
+/* the horde */
+.horde { padding: 110px 0 100px; text-align: center; position: relative; overflow: hidden; }
+.horde .glow { top: auto; bottom: -420px; width: 1100px; height: 1100px; }
+.horde-kicker { font-size: 12px; letter-spacing: 4px; color: var(--accent); text-transform: uppercase; margin-bottom: 22px; }
+.horde h2 {
+  font-family: var(--display); font-weight: 800;
+  font-size: clamp(30px, 5.6vw, 54px); letter-spacing: .06em; line-height: 1.2;
+  color: #edf0f4; text-shadow: 0 0 50px rgba(139,92,246,.4); margin-bottom: 26px;
+}
+.horde h2 .r { color: var(--accent); }
+.horde-speech { max-width: 700px; margin: 0 auto 40px; color: var(--dim); font-size: 15.5px; line-height: 1.85; }
+.horde-speech b { color: var(--text); font-weight: 500; }
+.horde-speech .vow { display: block; margin-top: 18px; color: var(--accent-2); font-family: var(--display); font-size: 14px; letter-spacing: 1px; }
+.rollcall { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; max-width: 780px; margin: 0 auto 44px; }
+.rc {
+  font-family: var(--display); font-size: 11.5px; font-weight: 600; letter-spacing: 1.5px;
+  color: var(--accent-2); border: 1px solid rgba(139,92,246,.35); border-radius: 99px;
+  padding: 8px 16px; background: rgba(139,92,246,.06);
+  transition: background .15s, border-color .15s, transform .15s;
+}
+.rc:hover { background: rgba(139,92,246,.16); border-color: var(--accent); transform: translateY(-2px); }
+.horde-ctas { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+
 /* reveal on scroll */
 .rv { opacity: 0; transform: translateY(22px); transition: opacity .7s ease, transform .7s cubic-bezier(.2,.7,.2,1); }
 .rv.in { opacity: 1; transform: none; }
@@ -330,6 +375,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
     <a class="lnk" href="#features">Features</a>
     <a class="lnk" href="#security">Security</a>
     <a class="lnk" href="#quickstart">Quickstart</a>
+    <a class="lnk" href="#horde">The Horde</a>
     <a class="gh-btn" href="https://github.com/themsquared/revenant">
       <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
       GitHub
@@ -371,9 +417,29 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
   </div>
 </header>
 
+<section class="lore">
+  <div class="wrap">
+    <div class="lore-inner">
+      <p class="lore-line rv">They killed the always-on agent a hundred ways.<br>
+      Leaked keys. Runaway spend. Code you couldn't trust.<br>
+      They buried the dream and called it a lesson.<br>
+      <em>It came back.</em></p>
+      <p class="lore-body rv">
+        A revenant is not summoned by the mighty. It is raised by the stubborn — the ones who
+        looked at the wreckage of every agent that came before and thought, <b>I can bury what
+        killed it deeper than any prompt can dig.</b> So that's what this is: everything that
+        slaughtered the last generation — the keys, the spend, the untrusted code — entombed
+        beneath the harness, in a gateway no jailbreak can reach. Not a chatbot. Not a toy.
+        A thing that does not sleep, does not forget, and <b>does not stop</b>.
+      </p>
+      <p class="lore-mark rv">you don't run a revenant — you raise one</p>
+    </div>
+  </div>
+</section>
+
 <section id="gateway" class="alt">
   <div class="wrap">
-    <p class="kicker rv">one architectural difference</p>
+    <p class="kicker rv">the first law</p>
     <h2 class="rv">The harness never talks to a model provider. Ever.</h2>
     <p class="lede rv">
       Every LLM, MCP, and A2A call flows through a <b>bundled, supervised agentgateway</b> —
@@ -433,7 +499,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
 
 <section id="features">
   <div class="wrap">
-    <p class="kicker rv">what it does</p>
+    <p class="kicker rv">the arsenal</p>
     <h2 class="rv">An OpenClaw-class agent. Without the OpenClaw-class regrets.</h2>
     <p class="lede rv">Chat channels, skills, cron loops, subagents, memory — everything you want
     from an always-on personal agent, rebuilt lean in Rust with security as the first constraint.</p>
@@ -453,10 +519,11 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
 
 <section id="security" class="alt">
   <div class="wrap">
-    <p class="kicker rv">untrusted by default</p>
-    <h2 class="rv">Every capability escalation crosses an approval gate.</h2>
-    <p class="lede rv">Channel input, tool results, and agent-authored code are all treated as hostile.
-    Four permission tiers, a broker that reaches you on any surface, and <b>default-deny on timeout</b>.</p>
+    <p class="kicker rv">the wards</p>
+    <h2 class="rv">A raised thing is kept on a leash. That's the deal.</h2>
+    <p class="lede rv">Every necromancer worth the name knows the wards matter more than the summoning.
+    Channel input, tool results, and agent-authored code are all treated as hostile. Four permission
+    tiers, an approval broker that reaches you on any surface, and <b>default-deny on timeout</b>.</p>
 
     <div class="sec-split">
       <ol class="ladder rv">
@@ -478,23 +545,24 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
 
 <section id="quickstart">
   <div class="wrap">
-    <p class="kicker rv">sixty seconds</p>
+    <p class="kicker rv">the ritual</p>
     <h2 class="rv">Raise your revenant.</h2>
-    <p class="lede rv">One installer, one init, and it's alive — and it stays alive.</p>
+    <p class="lede rv">Four incantations. Sixty seconds. No platform team, no seed round, no permission slip —
+    one static binary and the will to run something that outlives your sleep schedule.</p>
 
     <div class="steps">
       <div class="step rv">
-        <div class="step-head"><span class="n">01</span><h3>Install</h3></div>
+        <div class="step-head"><span class="n">01</span><h3>The Summoning</h3></div>
         <pre><span class="cm"># fetches pinned binaries, checksum-verified, then runs init</span>
 curl -fsSL https://raw.githubusercontent.com/themsquared/revenant/main/installer/install.sh | sh</pre>
       </div>
       <div class="step rv">
-        <div class="step-head"><span class="n">02</span><h3>Chat</h3></div>
+        <div class="step-head"><span class="n">02</span><h3>First Words</h3></div>
         <pre><span class="cm"># supervised gateway + streaming REPL</span>
 revenant chat</pre>
       </div>
       <div class="step rv">
-        <div class="step-head"><span class="n">03</span><h3>Make it permanent</h3></div>
+        <div class="step-head"><span class="n">03</span><h3>Bind It to the Machine</h3></div>
         <pre><span class="cm"># launchd / systemd — always-on</span>
 revenant service install
 
@@ -502,7 +570,7 @@ revenant service install
 revenant open</pre>
       </div>
       <div class="step rv">
-        <div class="step-head"><span class="n">04</span><h3>Or go fully offline</h3></div>
+        <div class="step-head"><span class="n">04</span><h3>Sever the Cord</h3></div>
         <pre><span class="cm"># ~/.revenant/config.toml</span>
 <span class="kw">[[tiers.local.targets]]</span>
 provider = <span class="st">"ollama"</span>
@@ -510,6 +578,37 @@ model    = <span class="st">"qwen3:0.6b"</span>
 
 <span class="cm">$</span> revenant chat --tier local</pre>
       </div>
+    </div>
+  </div>
+</section>
+
+<section id="horde" class="horde alt">
+  <div class="glow"></div>
+  <div class="wrap">
+    <p class="horde-kicker rv">† the call †</p>
+    <h2 class="rv">THE NERD HORDE <span class="r">RISES</span></h2>
+    <p class="horde-speech rv">
+      This is for the script-kiddies who outgrew the scripts. The basement dwellers with a
+      Raspberry Pi humming under the stairs. The kids who read the docs twice and the adults who
+      never stopped building at midnight. The legends nobody has heard of — <b>yet</b>.
+      You were never too small. <b>You were early.</b> You don't need a platform team.
+      You don't need a seed round. You need one static binary, a $35 board, and the nerve
+      to raise something bigger than yourself.
+      <span class="vow">The horde isn't hired. It rises.</span>
+    </p>
+    <div class="rollcall rv">
+      <span class="rc">THE SCRIPT-KIDDIES</span>
+      <span class="rc">THE BASEMENT DWELLERS</span>
+      <span class="rc">THE MIDNIGHT COMMITTERS</span>
+      <span class="rc">THE PI HOARDERS</span>
+      <span class="rc">THE DOC READERS</span>
+      <span class="rc">THE HOMELAB WARLORDS</span>
+      <span class="rc">THE LEGENDS-IN-WAITING</span>
+    </div>
+    <div class="horde-ctas rv">
+      <a class="btn btn-primary" href="https://github.com/themsquared/revenant">★ Star the repo — join the horde</a>
+      <a class="btn btn-ghost" href="https://github.com/themsquared/revenant/fork">Fork it. Make it yours.</a>
+      <a class="btn btn-ghost" href="https://github.com/themsquared/revenant/blob/main/docs/DESIGN.md">Study the grimoire</a>
     </div>
   </div>
 </section>
@@ -525,7 +624,7 @@ model    = <span class="st">"qwen3:0.6b"</span>
       <a href="https://github.com/themsquared/revenant/releases">Releases</a>
       <a href="https://agentgateway.dev">agentgateway</a>
     </div>
-    <p class="foot-note">Apache-2.0 · built natively on <a href="https://agentgateway.dev">agentgateway</a> OSS · it comes back.</p>
+    <p class="foot-note">Apache-2.0 · built natively on <a href="https://agentgateway.dev">agentgateway</a> OSS · it has died a thousand deaths — it is already coming back.</p>
   </div>
 </footer>
 
