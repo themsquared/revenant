@@ -80,13 +80,43 @@ pub fn render_gateway_yaml(cfg: &Config, available_env: &HashSet<String>) -> Res
         llm.insert("virtualModels".into(), Value::Array(virtual_models));
     }
 
-    let doc = json!({
+    let mut doc = json!({
         "config": {
             "readinessAddr": format!("127.0.0.1:{}", cfg.gateway.readiness_port),
             "statsAddr": format!("127.0.0.1:{}", cfg.gateway.stats_port),
         },
         "llm": Value::Object(llm),
     });
+
+    // MCP plugin bus: one gateway endpoint multiplexing every configured MCP
+    // server (stdio-spawned or remote). Namespaced + governable by the gateway.
+    if !cfg.mcp.is_empty() {
+        let targets: Vec<Value> = cfg
+            .mcp
+            .iter()
+            .map(|s| {
+                let mut t = Map::new();
+                t.insert("name".into(), json!(s.name));
+                match (&s.cmd, &s.url) {
+                    (Some(cmd), _) => {
+                        t.insert(
+                            "stdio".into(),
+                            json!({ "cmd": cmd, "args": s.args }),
+                        );
+                    }
+                    (None, Some(url)) => {
+                        t.insert("mcp".into(), json!({ "host": url }));
+                    }
+                    (None, None) => {}
+                }
+                Value::Object(t)
+            })
+            .collect();
+        doc.as_object_mut().unwrap().insert(
+            "mcp".into(),
+            json!({ "port": cfg.gateway.mcp_port, "targets": targets }),
+        );
+    }
 
     let yaml = serde_yaml::to_string(&doc)?;
     Ok(format!(

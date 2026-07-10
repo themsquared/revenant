@@ -13,8 +13,24 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub channels: ChannelsConfig,
+    /// MCP servers multiplexed behind the gateway (the plugin bus).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpServer>,
     /// Tier name ("fast"/"balanced"/"deep"/"local") -> targets.
     pub tiers: BTreeMap<String, TierConfig>,
+}
+
+/// An MCP server the gateway spawns/proxies. `cmd` = stdio server (spawned by
+/// the gateway), or `url` = remote streamable-HTTP MCP endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServer {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -125,6 +141,8 @@ pub struct GatewayConfig {
     pub readiness_port: u16,
     #[serde(default = "default_stats_port")]
     pub stats_port: u16,
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
     /// Explicit path to an agentgateway binary (dev override). When unset,
     /// the pinned release is downloaded into the home dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +241,9 @@ fn default_llm_port() -> u16 {
 fn default_readiness_port() -> u16 {
     19001
 }
+fn default_mcp_port() -> u16 {
+    41002
+}
 fn default_stats_port() -> u16 {
     19002
 }
@@ -281,12 +302,14 @@ impl Config {
                 llm_port: default_llm_port(),
                 readiness_port: default_readiness_port(),
                 stats_port: default_stats_port(),
+                mcp_port: default_mcp_port(),
                 binary: None,
                 endpoint: None,
             },
             agent: AgentConfig::default(),
             memory: MemoryConfig::default(),
             channels: ChannelsConfig::default(),
+            mcp: Vec::new(),
             tiers,
         }
     }

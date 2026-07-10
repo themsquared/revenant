@@ -169,6 +169,11 @@ enum Command {
         #[arg(num_args = 1..=2)]
         action: Vec<String>,
     },
+    /// Manage MCP server plugins: list | add <name> <cmd> [args…] | add-url <name> <url> | remove <name>
+    Mcp {
+        #[arg(num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]
+        action: Vec<String>,
+    },
     /// Mint a one-time pairing code for chat channels (Telegram etc).
     Pair,
     /// Print the web UI URL with an embedded login token.
@@ -200,6 +205,7 @@ fn main() -> Result<()> {
             Command::Approvals { action } => cmd_approvals(action).await,
             Command::Render => cmd_render(),
             Command::Memory { action } => cmd_memory(action).await,
+            Command::Mcp { action } => cmd_mcp(action).await,
             Command::Pair => cmd_pair().await,
             Command::Open => cmd_open(),
             Command::Service { action } => match action.as_str() {
@@ -220,6 +226,71 @@ fn cmd_open() -> Result<()> {
     let url = std::env::var("REVENANT_URL").unwrap_or_else(|_| format!("http://{DEFAULT_BIND}"));
     println!("{url}/#token={token}");
     println!("\nopen that URL in a browser (the token pre-fills the login).");
+    Ok(())
+}
+
+async fn cmd_mcp(action: Vec<String>) -> Result<()> {
+    use revenant_core::config::McpServer;
+    let home = Home::resolve();
+    let mut cfg = load_config(&home)?;
+    let verb = action.first().map(String::as_str).unwrap_or("list");
+
+    match verb {
+        "list" => {
+            if cfg.mcp.is_empty() {
+                println!("no MCP servers configured");
+            }
+            for s in &cfg.mcp {
+                let how = match (&s.cmd, &s.url) {
+                    (Some(cmd), _) => format!("{cmd} {}", s.args.join(" ")),
+                    (_, Some(url)) => url.clone(),
+                    _ => "(invalid)".into(),
+                };
+                println!("- {:16} {}", s.name, how.trim());
+            }
+            return Ok(());
+        }
+        "add" => {
+            // add <name> <cmd> [args…]
+            let name = action.get(1).context("usage: mcp add <name> <cmd> [args…]")?.clone();
+            let cmd = action.get(2).context("usage: mcp add <name> <cmd> [args…]")?.clone();
+            let args = action.iter().skip(3).cloned().collect();
+            if cfg.mcp.iter().any(|s| s.name == name) {
+                bail!("an MCP server named '{name}' already exists");
+            }
+            cfg.mcp.push(McpServer { name: name.clone(), cmd: Some(cmd), args, url: None });
+            println!("added MCP server '{name}'");
+        }
+        "add-url" => {
+            let name = action.get(1).context("usage: mcp add-url <name> <url>")?.clone();
+            let url = action.get(2).context("usage: mcp add-url <name> <url>")?.clone();
+            if cfg.mcp.iter().any(|s| s.name == name) {
+                bail!("an MCP server named '{name}' already exists");
+            }
+            cfg.mcp.push(McpServer { name: name.clone(), cmd: None, args: vec![], url: Some(url) });
+            println!("added MCP server '{name}'");
+        }
+        "remove" => {
+            let name = action.get(1).context("usage: mcp remove <name>")?.clone();
+            let before = cfg.mcp.len();
+            cfg.mcp.retain(|s| s.name != name);
+            if cfg.mcp.len() == before {
+                bail!("no MCP server named '{name}'");
+            }
+            println!("removed MCP server '{name}'");
+        }
+        other => bail!("unknown mcp action '{other}' (list|add|add-url|remove)"),
+    }
+
+    // Persist config.toml, then re-render the gateway config so a running
+    // gateway hot-reloads the new MCP targets.
+    std::fs::write(home.config_path(), cfg.to_toml())?;
+    if cfg.gateway.mode == GatewayMode::Bundled {
+        let binary = revenant_gateway::ensure_binary(&home, &cfg).await?;
+        let env = revenant_gateway::load_secrets(&home)?;
+        revenant_gateway::write_gateway_config(&home, &cfg, &binary, &env).await?;
+        println!("gateway config re-rendered (running gateway hot-reloads; MCP on port {})", cfg.gateway.mcp_port);
+    }
     Ok(())
 }
 
