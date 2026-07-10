@@ -142,7 +142,7 @@ pub async fn cmd_chat(tier_arg: Option<String>) -> Result<()> {
     });
 
     let my_session = backend.session_id();
-    println!("revenant chat — tier: {tier} — /quit · /tier <t> · /persona <name|off>");
+    println!("\x1b[1;35mrevenant\x1b[0m raised · tier {tier} — /quit · /tier <t> · /persona <name|off>");
 
     'repl: loop {
         print!("\x1b[1myou>\x1b[0m ");

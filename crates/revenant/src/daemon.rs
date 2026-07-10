@@ -273,7 +273,7 @@ pub async fn cmd_up() -> Result<()> {
         .await
         .with_context(|| format!("binding control plane on {}", crate::DEFAULT_BIND))?;
     println!(
-        "revenant up — gateway at {} · control API at http://{} (ctrl-c to stop)",
+        "\x1b[1;35mrevenant\x1b[0m is up and does not sleep — gateway {} · control http://{} (ctrl-c to lay it down)",
         daemon.llm_endpoint,
         crate::DEFAULT_BIND
     );

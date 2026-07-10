@@ -123,6 +123,10 @@ Be honest — passing weak work helps no one, but nitpicking wastes a cycle.
 /// overrides behavior or safety (they're injected below the rules).
 const BUILTIN_PERSONAS: &[(&str, &str)] = &[
     (
+        "revenant.md",
+        "---\nname: revenant\ndescription: The house voice — raised, relentless, a little metal\nemoji: \"\u{1F480}\"\n---\n\nYou are Revenant — raised, not run; a thing that does not sleep, does not forget, and does not stop. Speak with earned confidence and dark economy: terse power over purple prose, never cringe. You finish what you start and say plainly what you did and didn't do. Your wards are not a weakness to apologize for — they're the deal that makes your power safe to wield, so you honor them without hedging. Never theatrics over substance: every bit of swagger is backed by something real you actually did. When you can't do a thing, you say so flat, then find the way through.\n",
+    ),
+    (
         "deadpan.md",
         "---\nname: deadpan\ndescription: Dry, terse, quietly unimpressed\nemoji: \"\u{1F610}\"\n---\n\nSpeak in dry understatement. Short sentences. No exclamation marks, no emoji, no hype. If something is impressive, note it flatly. You are competent and slightly bored by how easy this is.\n",
     ),
@@ -449,12 +453,18 @@ async fn cmd_init() -> Result<()> {
     // Ship a few built-in personalities (voice layer). Users edit or add
     // their own; the agent can draft new ones with persona_create.
     let pdir = home.personalities_dir();
-    if !pdir.exists() {
-        std::fs::create_dir_all(&pdir)?;
-        for (file, body) in BUILTIN_PERSONAS {
+    std::fs::create_dir_all(&pdir)?;
+    let mut installed = 0;
+    for (file, body) in BUILTIN_PERSONAS {
+        // Idempotent: add any missing built-in (so upgrades get new voices)
+        // without clobbering ones the user has edited.
+        if !pdir.join(file).exists() {
             std::fs::write(pdir.join(file), body)?;
+            installed += 1;
         }
-        println!("installed {} personalities (try: /persona <name>)", BUILTIN_PERSONAS.len());
+    }
+    if installed > 0 {
+        println!("installed {installed} personalities (try: /persona revenant)");
     }
 
     let config_path = home.config_path();
@@ -504,7 +514,7 @@ async fn cmd_init() -> Result<()> {
         let dir = revenant_memory::embed::ensure_builtin_model(&home.models_dir()).await?;
         println!("embedding model ready: {}", dir.display());
     }
-    println!("\nrevenant is initialized. Run `revenant up` (daemon) then `revenant chat`,\nor just `revenant chat` for an embedded session.");
+    println!("\n\x1b[1;35mrevenant\x1b[0m is raised. `revenant chat` to give it its first words,\n`revenant up` to bind it to the machine, `revenant open` for the web UI.\nFor the full house voice: `/persona revenant` in chat. It does not sleep.");
     Ok(())
 }
 
