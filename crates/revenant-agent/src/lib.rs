@@ -23,6 +23,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+/// Max tool calls dispatched concurrently within a single turn.
+const CONCURRENT_TOOLS: usize = 8;
+
 /// Layer 0: identity + rules. Byte-stable for future prompt caching.
 const IDENTITY: &str = "You are Revenant — a lean personal agent that runs anywhere and comes \
 back from anything. You do not sleep, you do not forget, and you do not stop until the task is \
@@ -392,33 +395,52 @@ impl AgentRuntime {
                 });
             }
 
-            // Dispatch every tool_use block (sequentially — approvals
-            // serialize anyway; concurrent dispatch lands in M2).
-            let mut results = Vec::new();
-            for block in &assistant_content {
-                if let ContentBlock::ToolUse { id, name, input } = block {
-                    // Enforce the child's allowlist even if the model calls a
-                    // tool outside its advertised set.
-                    if let Some(allow) = &allowlist {
-                        if name != "subagent_run" && !allow.contains(name) {
-                            results.push(ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
+            // Dispatch tool_use blocks CONCURRENTLY. Models emit multiple
+            // tool calls in one message to fan out — a turn finishes in the
+            // time of the slowest call, not the sum, and parallel subagents
+            // (each a tool call) come for free. Provider matches results by
+            // tool_use_id, so completion order doesn't matter. Capped so a
+            // pathological fan-out can't storm the runtime.
+            use futures::stream::StreamExt;
+            let calls: Vec<(String, String, serde_json::Value)> = assistant_content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, name, input } => {
+                        Some((id.clone(), name.clone(), input.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if calls.is_empty() {
+                bail!("model signalled tool_use but no tool_use blocks were parsed");
+            }
+            for (_, name, _) in &calls {
+                tools_used.push(name.clone());
+            }
+            // Copy handle so each concurrent closure can read the allowlist.
+            let allow_ref = allowlist.as_ref();
+            let results: Vec<ContentBlock> = futures::stream::iter(calls.into_iter().map(
+                |(id, name, input)| async move {
+                    // Enforce a subagent's allowlist even if it hallucinates a
+                    // tool outside its set.
+                    if let Some(allow) = allow_ref {
+                        if name != "subagent_run" && !allow.contains(&name) {
+                            return ContentBlock::ToolResult {
+                                tool_use_id: id,
                                 content: serde_json::Value::String(format!(
                                     "tool '{name}' is not available to this subagent"
                                 )),
                                 is_error: true,
                                 cache_control: None,
-                            });
-                            continue;
+                            };
                         }
                     }
-                    tools_used.push(name.clone());
-                    results.push(self.dispatch(session_id, id, name, input.clone(), depth).await);
-                }
-            }
-            if results.is_empty() {
-                bail!("model signalled tool_use but no tool_use blocks were parsed");
-            }
+                    self.dispatch(session_id, &id, &name, input, depth).await
+                },
+            ))
+            .buffer_unordered(CONCURRENT_TOOLS)
+            .collect()
+            .await;
             self.store
                 .append_message(session_id, Role::User, &results, estimate(&results))
                 .await?;
