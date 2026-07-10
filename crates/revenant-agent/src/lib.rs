@@ -53,28 +53,28 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
-    /// Layered system prompt. Layer order = stability order (cache-friendly);
-    /// the retrieved block is last because it changes every turn.
-    fn system_prompt(&self, retrieved: Option<&str>) -> String {
-        let mut prompt = String::from(IDENTITY);
+    /// Layered system prompt, split for prompt caching: the STABLE prefix
+    /// (identity, skills index, profile card) gets a cache breakpoint; the
+    /// DYNAMIC tail (per-turn retrieved memories) stays uncached.
+    fn system_prompt(&self, retrieved: Option<&str>) -> (String, Option<String>) {
+        let mut stable = String::from(IDENTITY);
         let skills_index = self.skills.index_lines();
         if !skills_index.is_empty() {
-            prompt.push_str("\n\n# Installed skills (load with use_skill)\n");
-            prompt.push_str(&skills_index);
+            stable.push_str("\n\n# Installed skills (load with use_skill)\n");
+            stable.push_str(&skills_index);
         }
         if let Ok(memory) = std::fs::read_to_string(self.home.workspace_dir().join("MEMORY.md")) {
             if !memory.trim().is_empty() {
-                prompt.push_str("\n\n# Memory (durable facts about the owner)\n");
-                prompt.push_str(memory.trim());
+                stable.push_str("\n\n# Memory (durable facts about the owner)\n");
+                stable.push_str(memory.trim());
             }
         }
-        if let Some(block) = retrieved {
-            prompt.push_str(
-                "\n\n# Retrieved memories (relevant to this message; verify with recall if load-bearing)\n",
-            );
-            prompt.push_str(block);
-        }
-        prompt
+        let dynamic = retrieved.map(|block| {
+            format!(
+                "# Retrieved memories (relevant to this message; verify with recall if load-bearing)\n{block}"
+            )
+        });
+        (stable, dynamic)
     }
 
     pub async fn run_turn(
@@ -92,7 +92,7 @@ impl AgentRuntime {
         let user_text: String = user_content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -111,7 +111,8 @@ impl AgentRuntime {
             None => None,
         };
 
-        let system = self.system_prompt(retrieved.as_deref());
+        let (stable_system, dynamic_system) = self.system_prompt(retrieved.as_deref());
+        let system = revenant_llm::system_with_cache(&stable_system, dynamic_system.as_deref());
         let tool_specs = self.tools.specs();
         let mut total_usage = Usage::default();
         let mut routed_model = None;
@@ -121,11 +122,19 @@ impl AgentRuntime {
 
         for iteration in 1..=self.max_iterations {
             let history = self.store.history(session_id, self.max_history).await?;
-            let messages: Vec<WireMessage> = history
+            let mut messages: Vec<WireMessage> = history
                 .into_iter()
                 .filter(|m| !m.content.is_empty())
                 .map(|m| WireMessage::new(m.role, m.content))
                 .collect();
+            // Moving breakpoint on the newest message: each iteration/turn
+            // extends the prefix, so the provider re-reads history from
+            // cache. Applied at request build only — never persisted.
+            if let Some(last) = messages.last_mut() {
+                if let Some(block) = last.content.last_mut() {
+                    block.mark_cache_breakpoint();
+                }
+            }
 
             let request = MessagesRequest {
                 model: tier.as_str().to_string(),
@@ -249,6 +258,7 @@ impl AgentRuntime {
             tool_use_id: tool_use_id.to_string(),
             content: serde_json::Value::String(content),
             is_error,
+            cache_control: None,
         };
 
         let Some(tool) = self.tools.get(name) else {
@@ -329,7 +339,7 @@ fn estimate(content: &[ContentBlock]) -> Option<i64> {
     let bytes: usize = content
         .iter()
         .map(|block| match block {
-            ContentBlock::Text { text } => text.len(),
+            ContentBlock::Text { text, .. } => text.len(),
             other => serde_json::to_string(other).map(|s| s.len()).unwrap_or(64),
         })
         .sum();

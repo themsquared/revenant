@@ -39,8 +39,10 @@ impl RoleExt for Role {
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: u32,
+    /// Plain string, or an array of system blocks carrying `cache_control`
+    /// breakpoints (see `system_with_cache`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<serde_json::Value>,
     pub messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tools: Vec<revenant_core::ToolSpec>,
@@ -49,6 +51,21 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_choice: Option<serde_json::Value>,
     pub stream: bool,
+}
+
+/// Build a system value with a cache breakpoint after the stable prefix.
+/// The provider caches tools + the stable block; the dynamic tail (per-turn
+/// retrieved memories etc.) stays uncached by design.
+pub fn system_with_cache(stable: &str, dynamic: Option<&str>) -> serde_json::Value {
+    let mut blocks = vec![serde_json::json!({
+        "type": "text",
+        "text": stable,
+        "cache_control": { "type": "ephemeral" },
+    })];
+    if let Some(dynamic) = dynamic.filter(|d| !d.is_empty()) {
+        blocks.push(serde_json::json!({ "type": "text", "text": dynamic }));
+    }
+    serde_json::Value::Array(blocks)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,7 +196,7 @@ impl LlmClient {
                 "content_block_stop" => {
                     match pending.take() {
                         Some(Pending::Text(text)) if !text.is_empty() => {
-                            outcome.content.push(ContentBlock::Text { text });
+                            outcome.content.push(ContentBlock::Text { text, cache_control: None });
                         }
                         Some(Pending::ToolUse { id, name, json }) => {
                             let input: serde_json::Value = if json.trim().is_empty() {

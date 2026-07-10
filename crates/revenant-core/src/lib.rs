@@ -74,6 +74,11 @@ impl Role {
 pub enum ContentBlock {
     Text {
         text: String,
+        /// Prompt-cache breakpoint marker. Set at REQUEST BUILD time only —
+        /// never persisted (a marker on every stored message would blow the
+        /// 4-breakpoint API limit).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     ToolUse {
         id: String,
@@ -85,6 +90,8 @@ pub enum ContentBlock {
         content: serde_json::Value,
         #[serde(default, skip_serializing_if = "is_false")]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
 }
 
@@ -94,7 +101,19 @@ fn is_false(b: &bool) -> bool {
 
 impl ContentBlock {
     pub fn text(s: impl Into<String>) -> Self {
-        ContentBlock::Text { text: s.into() }
+        ContentBlock::Text { text: s.into(), cache_control: None }
+    }
+
+    /// Attach a prompt-cache breakpoint to this block (request-build only).
+    pub fn mark_cache_breakpoint(&mut self) {
+        let marker = serde_json::json!({ "type": "ephemeral" });
+        match self {
+            ContentBlock::Text { cache_control, .. }
+            | ContentBlock::ToolResult { cache_control, .. } => {
+                *cache_control = Some(marker);
+            }
+            ContentBlock::ToolUse { .. } => {}
+        }
     }
 }
 

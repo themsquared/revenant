@@ -270,7 +270,7 @@ impl MemoryEngine {
                         blocks
                             .into_iter()
                             .filter_map(|block| match block {
-                                revenant_core::ContentBlock::Text { text } => Some(text),
+                                revenant_core::ContentBlock::Text { text, .. } => Some(text),
                                 _ => None,
                             })
                             .collect::<Vec<_>>()

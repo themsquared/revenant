@@ -115,6 +115,18 @@ fn render_model(
     if internal {
         model.insert("visibility".into(), json!("internal"));
     }
+    // Provider prompt caching: the gateway inserts cache markers on the
+    // system prompt / tools / message prefix. The harness keeps its prompt
+    // layers byte-stable in stability order precisely so these hit.
+    if matches!(
+        target.provider,
+        revenant_core::config::Provider::Anthropic | revenant_core::config::Provider::Bedrock
+    ) {
+        model.insert(
+            "promptCaching".into(),
+            json!({ "cacheSystem": true, "cacheTools": true, "cacheMessages": true }),
+        );
+    }
     Ok(Value::Object(model))
 }
 

@@ -190,7 +190,7 @@ impl MemoryEngine {
         let request = MessagesRequest {
             model: EXTRACTION_TIER.to_string(),
             max_tokens: 2048,
-            system: Some(EXTRACTOR_SYSTEM.to_string()),
+            system: Some(serde_json::Value::String(EXTRACTOR_SYSTEM.to_string())),
             messages: vec![WireMessage::new(
                 revenant_core::Role::User,
                 vec![revenant_core::ContentBlock::text(user_content)],
