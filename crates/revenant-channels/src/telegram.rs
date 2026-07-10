@@ -380,6 +380,18 @@ impl OutboundMirror {
             };
 
             match event {
+                // A new turn NEVER inherits the previous turn's message.
+                // Belt-and-suspenders against missed TurnCompleted events
+                // (e.g. broadcast lag): drop any stale stream state; the old
+                // message keeps whatever it last showed.
+                Event::TurnStarted { session_id } => {
+                    if streams.remove(&session_id).is_some() {
+                        tracing::debug!(
+                            session_id,
+                            "dropped stale stream state at turn start"
+                        );
+                    }
+                }
                 Event::TurnDelta { session_id, text } => {
                     let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await
                     else {

@@ -54,7 +54,9 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     let (endpoint, gateway_handle) = start_gateway(home, cfg).await?;
 
     let store = Store::open(&home.db_path())?;
-    let events = EventBus::new(1024);
+    // Generous buffer: the telegram mirror blocks on HTTP edits while
+    // high-frequency turn deltas queue behind it.
+    let events = EventBus::new(8192);
     let approvals =
         ApprovalBroker::new(store.clone(), events.clone(), Duration::from_secs(900));
     let skills = Arc::new(SkillIndex::new(home.skills_dir()));
