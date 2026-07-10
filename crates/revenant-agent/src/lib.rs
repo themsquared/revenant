@@ -6,7 +6,7 @@
 //! are actors with serialized mailboxes; all surfaces observe via the
 //! event bus.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use revenant_core::home::Home;
 use revenant_core::{ContentBlock, Event, EventBus, PermissionTier, Role, Tier, Usage};
 use revenant_llm::{LlmClient, MessagesRequest, WireMessage};
@@ -83,6 +83,18 @@ impl AgentRuntime {
         tier: Tier,
         user_content: Vec<ContentBlock>,
     ) -> Result<TurnStats> {
+        self.run_turn_inner(session_id, tier, user_content, 0).await
+    }
+
+    /// `depth` bounds subagent recursion: subagents run at depth 1 and are
+    /// not offered the `subagent_run` tool, so the tree is at most one level.
+    async fn run_turn_inner(
+        &self,
+        session_id: i64,
+        tier: Tier,
+        user_content: Vec<ContentBlock>,
+        depth: u8,
+    ) -> Result<TurnStats> {
         self.events.emit(Event::TurnStarted { session_id });
         let user_message_id = self
             .store
@@ -113,7 +125,12 @@ impl AgentRuntime {
 
         let (stable_system, dynamic_system) = self.system_prompt(retrieved.as_deref());
         let system = revenant_llm::system_with_cache(&stable_system, dynamic_system.as_deref());
-        let tool_specs = self.tools.specs();
+        let mut tool_specs = self.tools.specs();
+        // Offer subagent spawning only at the top level (depth 0) — keeps the
+        // tree one level deep and recursion bounded.
+        if depth == 0 {
+            tool_specs.push(subagent_tool_spec());
+        }
         let mut total_usage = Usage::default();
         let mut routed_model = None;
         let mut final_text = String::new();
@@ -231,7 +248,7 @@ impl AgentRuntime {
             let mut results = Vec::new();
             for block in &assistant_content {
                 if let ContentBlock::ToolUse { id, name, input } = block {
-                    results.push(self.dispatch(session_id, id, name, input.clone()).await);
+                    results.push(self.dispatch(session_id, id, name, input.clone(), depth).await);
                 }
             }
             if results.is_empty() {
@@ -253,6 +270,7 @@ impl AgentRuntime {
         tool_use_id: &str,
         name: &str,
         input: serde_json::Value,
+        depth: u8,
     ) -> ContentBlock {
         let result = |content: String, is_error: bool| ContentBlock::ToolResult {
             tool_use_id: tool_use_id.to_string(),
@@ -260,6 +278,15 @@ impl AgentRuntime {
             is_error,
             cache_control: None,
         };
+
+        // subagent_run is a virtual tool: intercepted here so it can drive the
+        // runtime (a real Tool can't, without a circular crate dependency).
+        if name == "subagent_run" {
+            return match self.run_subagent(session_id, input, depth).await {
+                Ok(text) => result(text, false),
+                Err(err) => result(format!("subagent failed: {err:#}"), true),
+            };
+        }
 
         let Some(tool) = self.tools.get(name) else {
             return result(format!("unknown tool: {name}"), true);
@@ -311,6 +338,77 @@ impl AgentRuntime {
             ok: !output.is_error,
         });
         result(output.content, output.is_error)
+    }
+
+    /// Spawn a child session, run the task to completion at one tier down,
+    /// and return its final text to the parent as a tool result. Depth-1
+    /// children are not offered `subagent_run`, so trees stay one level deep.
+    async fn run_subagent(
+        &self,
+        parent_session: i64,
+        input: serde_json::Value,
+        depth: u8,
+    ) -> Result<String> {
+        if depth >= 1 {
+            bail!("subagents cannot spawn their own subagents");
+        }
+        let task = input
+            .get("task")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .context("subagent_run requires a non-empty 'task'")?
+            .to_string();
+        // Default to one tier below the parent's current work; explicit
+        // override honored.
+        let tier = match input.get("tier").and_then(|t| t.as_str()) {
+            Some(t) => t.parse().unwrap_or(Tier::Fast),
+            None => Tier::Fast,
+        };
+
+        let child = self.store.create_child_session(parent_session, &task).await?;
+        self.events.emit(Event::SubagentSpawned {
+            parent_session,
+            child_session: child,
+            task: task.clone(),
+            tier: tier.to_string(),
+        });
+
+        // Box the recursive turn: run_turn_inner -> dispatch -> run_subagent
+        // -> run_turn_inner would otherwise be an infinitely-sized future.
+        let stats = Box::pin(self.run_turn_inner(
+            child,
+            tier,
+            vec![ContentBlock::text(task)],
+            depth + 1,
+        ))
+        .await;
+
+        let ok = stats.is_ok();
+        self.events.emit(Event::SubagentFinished {
+            parent_session,
+            child_session: child,
+            ok,
+        });
+        Ok(stats?.final_text)
+    }
+}
+
+/// Spec for the virtual subagent_run tool (advertised only at depth 0).
+fn subagent_tool_spec() -> revenant_core::ToolSpec {
+    revenant_core::ToolSpec {
+        name: "subagent_run".into(),
+        description: "Delegate a self-contained subtask to a focused child agent (runs on a \
+cheaper tier, returns its result). Use for parallel research, bounded exploration, or work \
+that would clutter the main thread. The child cannot spawn further subagents."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "Complete, self-contained instructions for the child"},
+                "tier": {"type": "string", "enum": ["fast", "balanced", "deep", "local"], "description": "Model tier (default fast)"}
+            },
+            "required": ["task"]
+        }),
     }
 }
 

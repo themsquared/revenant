@@ -61,6 +61,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/approvals", get(approvals_pending))
         .route("/v1/approvals/:id/decision", post(approval_decide))
         .route("/v1/skills", get(skills_list))
+        .route("/v1/tools", get(tools_list))
+        .route("/v1/subagents", get(subagents_list))
         .route("/v1/spend", get(spend))
         .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
@@ -148,6 +150,8 @@ async fn events(
                 revenant_core::Event::ToolFinished { .. } => "tool_finished",
                 revenant_core::Event::ApprovalCreated { .. } => "approval_created",
                 revenant_core::Event::ApprovalResolved { .. } => "approval_resolved",
+                revenant_core::Event::SubagentSpawned { .. } => "subagent_spawned",
+                revenant_core::Event::SubagentFinished { .. } => "subagent_finished",
                 revenant_core::Event::GatewayStatus { .. } => "gateway_status",
             };
             Some(Ok(SseEvent::default()
@@ -331,6 +335,59 @@ async fn pairing_create(State(state): State<AppState>) -> Result<Json<serde_json
 fn getrandom_fill(buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")?.read_exact(buf)
+}
+
+async fn tools_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let tools: Vec<_> = state
+        .manager
+        .runtime()
+        .tools
+        .describe()
+        .into_iter()
+        .map(|(name, description, tier)| {
+            json!({
+                "name": name,
+                "description": description,
+                "permission": format!("{tier:?}"),
+            })
+        })
+        .collect();
+    // subagent_run is virtual (not in the registry) — surface it too.
+    let mut all = tools;
+    all.push(json!({
+        "name": "subagent_run",
+        "description": "Delegate a self-contained subtask to a focused child agent.",
+        "permission": "ReadOnly",
+    }));
+    Json(json!({ "tools": all }))
+}
+
+async fn subagents_list(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let rows = state.manager.runtime().store.subagents_list(50).await?;
+    let out: Vec<_> = rows
+        .into_iter()
+        .map(|r| {
+            // Pull the task text out of the stored first-user-message JSON.
+            let task = r
+                .first_user
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+                .and_then(|blocks| {
+                    blocks
+                        .into_iter()
+                        .find_map(|b| b.get("text").and_then(|t| t.as_str()).map(String::from))
+                })
+                .unwrap_or_default();
+            json!({
+                "id": r.id,
+                "parent_session": r.parent_session,
+                "created_at": r.created_at,
+                "messages": r.message_count,
+                "task": task,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "subagents": out })))
 }
 
 async fn memory_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {

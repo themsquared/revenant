@@ -47,6 +47,17 @@ pub enum Event {
         verdict: String,
         resolver: String,
     },
+    SubagentSpawned {
+        parent_session: i64,
+        child_session: i64,
+        task: String,
+        tier: String,
+    },
+    SubagentFinished {
+        parent_session: i64,
+        child_session: i64,
+        ok: bool,
+    },
     GatewayStatus {
         healthy: bool,
         detail: String,
@@ -63,6 +74,8 @@ impl Event {
             | Event::TurnCompleted { session_id, .. }
             | Event::TurnFailed { session_id, .. }
             | Event::ApprovalCreated { session_id, .. } => Some(*session_id),
+            Event::SubagentSpawned { parent_session, .. }
+            | Event::SubagentFinished { parent_session, .. } => Some(*parent_session),
             _ => None,
         }
     }

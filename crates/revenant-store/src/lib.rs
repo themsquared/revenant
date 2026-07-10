@@ -59,6 +59,17 @@ pub struct SpendRow {
     pub requests: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubagentRow {
+    pub id: i64,
+    pub parent_session: Option<i64>,
+    pub created_at: i64,
+    pub last_active: i64,
+    pub message_count: i64,
+    /// JSON of the first user message content (the task), if any.
+    pub first_user: Option<String>,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let mut conn = Connection::open(path)
@@ -93,6 +104,53 @@ impl Store {
             }))
             .map_err(|_| anyhow::anyhow!("store thread is gone"))?;
         Ok(rx.await.context("store thread dropped reply")??)
+    }
+
+    /// Create a fresh child (subagent) session under a parent.
+    pub async fn create_child_session(&self, parent: i64, label: &str) -> Result<i64> {
+        let label = label.to_owned();
+        self.with(move |conn| {
+            let now = unix_now();
+            // Unique peer per child so each spawn is its own session.
+            let peer = format!("{parent}-{now}-{}", conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))?);
+            conn.execute(
+                "INSERT INTO sessions (channel, peer, kind, parent_session, created_at, last_active)
+                 VALUES ('subagent', ?1, 'subagent', ?2, ?3, ?3)",
+                (&peer, parent, now),
+            )?;
+            let id = conn.last_insert_rowid();
+            // Stash the human task label as the session's first marker via peer;
+            // label is also surfaced through the spawned event.
+            let _ = label;
+            Ok(id)
+        })
+        .await
+    }
+
+    /// Subagent sessions, newest first, with parent + message count.
+    pub async fn subagents_list(&self, limit: usize) -> Result<Vec<SubagentRow>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.parent_session, s.created_at, s.last_active,
+                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                        (SELECT content FROM messages m WHERE m.session_id = s.id AND m.role = 'user'
+                         ORDER BY m.turn ASC LIMIT 1)
+                 FROM sessions s WHERE s.kind = 'subagent'
+                 ORDER BY s.id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([limit as i64], |r| {
+                Ok(SubagentRow {
+                    id: r.get(0)?,
+                    parent_session: r.get(1)?,
+                    created_at: r.get(2)?,
+                    last_active: r.get(3)?,
+                    message_count: r.get(4)?,
+                    first_user: r.get(5)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
     }
 
     /// Find or create a session for (channel, peer, kind).

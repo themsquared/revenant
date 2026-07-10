@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api, eventStream, getToken, setToken } from './api.js'
 
-const TABS = ['chat', 'approvals', 'spend', 'memory', 'status']
+const TABS = ['chat', 'approvals', 'skills', 'tools', 'subagents', 'spend', 'memory', 'status']
 
 export default function App() {
   const [authed, setAuthed] = useState(false)
@@ -46,6 +46,9 @@ export default function App() {
       <main>
         {tab === 'chat' && <Chat onApprovalCount={setPendingCount} setBanner={setBanner} />}
         {tab === 'approvals' && <Approvals onCount={setPendingCount} />}
+        {tab === 'skills' && <Skills />}
+        {tab === 'tools' && <Tools />}
+        {tab === 'subagents' && <Subagents />}
         {tab === 'spend' && <Spend />}
         {tab === 'memory' && <Memory />}
         {tab === 'status' && <Status />}
@@ -337,43 +340,167 @@ function Spend() {
   )
 }
 
-// ---- memory ----
+// ---- skills ----
 
-function Memory() {
-  const [status, setStatus] = useState(null)
+function Skills() {
   const [skills, setSkills] = useState([])
   useEffect(() => {
-    api.memoryStatus().then(setStatus).catch(() => setStatus(null))
     api.skills().then((r) => setSkills(r.skills))
   }, [])
   return (
     <div className="list">
-      {status ? (
-        <div className="card">
-          <div className="card-title">memory engine</div>
-          <table>
-            <tbody>
-              <tr><td>vault</td><td>{status.vault}</td></tr>
-              <tr><td>embedder</td><td>{status.embedder}</td></tr>
-              <tr><td>entities</td><td>{status.entities}</td></tr>
-              <tr><td>facts (active)</td><td>{status.facts}</td></tr>
-              <tr><td>edges (active)</td><td>{status.edges}</td></tr>
-              <tr><td>pending consolidation</td><td>{status.pending}</td></tr>
-            </tbody>
-          </table>
-          <div className="card-meta">open the vault folder in Obsidian for the graph view</div>
+      <div className="card-meta">
+        agentskills.io SKILL.md folders under ~/.revenant/skills — the agent
+        loads a skill's full instructions on demand, and can author its own.
+      </div>
+      {skills.length === 0 && <div className="empty">no skills installed</div>}
+      {skills.map((s) => (
+        <div key={s.name} className="card">
+          <div className="card-title">{s.name}</div>
+          <div>{s.description}</div>
         </div>
-      ) : (
-        <div className="empty">memory engine disabled</div>
-      )}
-      <div className="card">
-        <div className="card-title">skills</div>
-        {skills.length === 0 && <div className="card-meta">none installed</div>}
-        {skills.map((s) => (
-          <div key={s.name} className="skill">
-            <b>{s.name}</b> — {s.description}
+      ))}
+    </div>
+  )
+}
+
+// ---- tools ----
+
+const TIER_COLOR = {
+  ReadOnly: '#34d399',
+  WriteWorkspace: '#a78bfa',
+  Network: '#60a5fa',
+  Dangerous: '#f87171',
+}
+
+function Tools() {
+  const [tools, setTools] = useState([])
+  useEffect(() => {
+    api.tools().then((r) => setTools(r.tools))
+  }, [])
+  // Group by permission tier, ordered least→most privileged.
+  const order = ['ReadOnly', 'WriteWorkspace', 'Network', 'Dangerous']
+  const groups = order
+    .map((tier) => ({ tier, items: tools.filter((t) => t.permission === tier) }))
+    .filter((g) => g.items.length > 0)
+  return (
+    <div className="list">
+      <div className="card-meta">
+        built-in tools by permission tier. Dangerous tools require owner
+        approval on every call; MCP-server tools join this list in a later
+        milestone.
+      </div>
+      {groups.map((g) => (
+        <div key={g.tier} className="card">
+          <div className="card-title">
+            <span className="pill" style={{ background: TIER_COLOR[g.tier] }}>
+              {g.tier}
+            </span>
+          </div>
+          {g.items.map((t) => (
+            <div key={t.name} className="tool-row">
+              <b>{t.name}</b>
+              <span>{t.description}</span>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ---- subagents ----
+
+function Subagents() {
+  const [subs, setSubs] = useState([])
+  const [live, setLive] = useState([])
+  const refresh = () => api.subagents().then((r) => setSubs(r.subagents))
+  useEffect(() => {
+    refresh()
+    const source = eventStream((type, event) => {
+      if (type === 'subagent_spawned') {
+        setLive((prev) => [
+          { ...event, at: Date.now() },
+          ...prev.filter((s) => s.child_session !== event.child_session),
+        ])
+      }
+      if (type === 'subagent_finished') {
+        setLive((prev) =>
+          prev.map((s) =>
+            s.child_session === event.child_session ? { ...s, done: true, ok: event.ok } : s
+          )
+        )
+        setTimeout(refresh, 500)
+      }
+    })
+    const timer = setInterval(refresh, 6000)
+    return () => {
+      source.close()
+      clearInterval(timer)
+    }
+  }, [])
+
+  return (
+    <div className="list">
+      <div className="card-meta">
+        the agent delegates self-contained subtasks to focused child agents
+        (cheaper tier, one level deep). Live spawns appear here.
+      </div>
+      {live
+        .filter((s) => !s.done)
+        .map((s) => (
+          <div key={s.child_session} className="card running">
+            <div className="card-title">
+              <span className="spinner">◍</span> #{s.child_session} · {s.tier}
+              <small> from #{s.parent_session}</small>
+            </div>
+            <div>{s.task}</div>
           </div>
         ))}
+      {subs.length === 0 && live.length === 0 && (
+        <div className="empty">
+          no subagents yet — ask the agent to "use a subagent to research X"
+        </div>
+      )}
+      {subs.map((s) => (
+        <div key={s.id} className="card">
+          <div className="card-title">
+            #{s.id}
+            <small> from #{s.parent_session} · {s.messages} msgs</small>
+          </div>
+          <div>{s.task}</div>
+          <div className="card-meta">
+            {new Date(s.created_at * 1000).toLocaleString()}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ---- memory ----
+
+function Memory() {
+  const [status, setStatus] = useState(null)
+  useEffect(() => {
+    api.memoryStatus().then(setStatus).catch(() => setStatus(null))
+  }, [])
+  if (!status) return <div className="empty">memory engine disabled</div>
+  return (
+    <div className="list">
+      <div className="card">
+        <div className="card-title">memory engine</div>
+        <table>
+          <tbody>
+            <tr><td>vault</td><td>{status.vault}</td></tr>
+            <tr><td>embedder</td><td>{status.embedder}</td></tr>
+            <tr><td>entities</td><td>{status.entities}</td></tr>
+            <tr><td>facts (active)</td><td>{status.facts}</td></tr>
+            <tr><td>edges (active)</td><td>{status.edges}</td></tr>
+            <tr><td>pending consolidation</td><td>{status.pending}</td></tr>
+          </tbody>
+        </table>
+        <div className="card-meta">open the vault folder in Obsidian for the graph view</div>
       </div>
     </div>
   )

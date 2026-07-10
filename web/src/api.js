@@ -44,6 +44,8 @@ export const api = {
     request('POST', `/v1/approvals/${id}/decision`, { approve, resolver: 'web' }),
   spend: (window) => request('GET', `/v1/spend?window=${window}`),
   skills: () => request('GET', '/v1/skills'),
+  tools: () => request('GET', '/v1/tools'),
+  subagents: () => request('GET', '/v1/subagents'),
   gateway: () => request('GET', '/v1/gateway/status'),
   memoryStatus: () => request('GET', '/v1/memory/status'),
 }
@@ -66,6 +68,8 @@ export function eventStream(onEvent) {
     'tool_finished',
     'approval_created',
     'approval_resolved',
+    'subagent_spawned',
+    'subagent_finished',
     'gateway_status',
   ]) {
     source.addEventListener(name, forward)

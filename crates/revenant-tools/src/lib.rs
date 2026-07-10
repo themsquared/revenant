@@ -52,4 +52,15 @@ impl ToolRegistry {
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
     }
+
+    /// (name, description, permission tier) for every built-in — for the UI.
+    pub fn describe(&self) -> Vec<(String, String, PermissionTier)> {
+        self.tools
+            .values()
+            .map(|t| {
+                let spec = t.spec();
+                (spec.name, spec.description, t.permission())
+            })
+            .collect()
+    }
 }
