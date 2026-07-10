@@ -35,7 +35,8 @@ jobs:
       - name: Resolve version
         id: v
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME:-${{ github.event.inputs.version }}}" >> "$GITHUB_OUTPUT"
+        # On a tag push ref_name IS the tag; on manual dispatch use the input.
+        run: echo "version=${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
@@ -85,7 +86,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.version }}}"
+          VERSION="${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}"
           gh release create "$VERSION" dist/* \
             --repo "${{ github.repository }}" \
             --title "$VERSION" \
