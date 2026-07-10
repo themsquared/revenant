@@ -303,6 +303,60 @@ pub async fn meta_set(store: &Store, key: &str, value: &str) -> Result<()> {
         .await
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingRow {
+    pub id: i64,
+    pub kind: String,
+    pub payload: String,
+    pub attempts: i64,
+}
+
+pub async fn pending_list(store: &Store, kind: &str, limit: usize) -> Result<Vec<PendingRow>> {
+    let kind = kind.to_owned();
+    store
+        .with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, payload, attempts FROM mem_pending
+                 WHERE kind = ?1 AND attempts < 5 ORDER BY id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![kind, limit as i64], |r| {
+                Ok(PendingRow {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    payload: r.get(2)?,
+                    attempts: r.get(3)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+}
+
+pub async fn pending_delete(store: &Store, ids: Vec<i64>) -> Result<()> {
+    store
+        .with(move |conn| {
+            for id in ids {
+                conn.execute("DELETE FROM mem_pending WHERE id = ?1", [id])?;
+            }
+            Ok(())
+        })
+        .await
+}
+
+pub async fn pending_bump_attempts(store: &Store, ids: Vec<i64>) -> Result<()> {
+    store
+        .with(move |conn| {
+            for id in ids {
+                conn.execute(
+                    "UPDATE mem_pending SET attempts = attempts + 1 WHERE id = ?1",
+                    [id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+}
+
 pub async fn pending_push(store: &Store, kind: &str, payload: &str) -> Result<()> {
     let (kind, payload) = (kind.to_owned(), payload.to_owned());
     store

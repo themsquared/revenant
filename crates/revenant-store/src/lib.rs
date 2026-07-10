@@ -160,12 +160,14 @@ impl Store {
     /// FTS5 search across indexed conversation text and memory notes.
     pub async fn recall_search(&self, query: &str, limit: usize) -> Result<Vec<RecallHit>> {
         // FTS5 MATCH has its own query syntax; quote each term to keep user
-        // input from being interpreted as operators.
+        // input from being interpreted as operators. OR-join: natural-language
+        // queries rarely contain every document term, and BM25 ranking plus
+        // downstream RRF fusion handle the extra recall.
         let sanitized: String = query
             .split_whitespace()
             .map(|term| format!("\"{}\"", term.replace('"', "")))
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" OR ");
         self.with(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT snippet(recall, 0, '[', ']', '…', 24), source, ref

@@ -6,11 +6,15 @@
 //! with zero LLM calls. Consolidation (LLM extraction) runs off the hot
 //! path and lands in M1.5b.
 
+pub mod consolidate;
 pub mod embed;
 pub mod graph;
 pub mod index;
 mod retrieve;
 pub mod vault;
+mod watch;
+
+pub use consolidate::ConsolidateReport;
 
 use anyhow::{Context, Result};
 use embed::{BuiltinEmbedder, Embedder, GatewayEmbedder};
@@ -48,7 +52,7 @@ pub struct Provenance {
     pub invalid_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Episode {
     pub session_id: i64,
     pub user_message_id: i64,
@@ -75,6 +79,7 @@ pub struct MemoryStatus {
 
 pub struct MemoryEngine {
     pub(crate) store: Store,
+    pub(crate) llm: revenant_llm::LlmClient,
     pub(crate) cfg: MemoryConfig,
     pub(crate) vault: Vault,
     pub(crate) embedder: Arc<dyn Embedder>,
@@ -85,6 +90,11 @@ pub struct MemoryEngine {
     pub(crate) fact_subjects: RwLock<HashMap<String, Option<i64>>>,
     /// note_path -> display title.
     pub(crate) note_titles: RwLock<HashMap<String, String>>,
+    /// Wakes the background consolidator when an episode arrives.
+    pub(crate) wakeup: Arc<tokio::sync::Notify>,
+    /// Self-event suppression for the vault watcher: rel path -> content hash
+    /// of our own most recent write.
+    pub(crate) suppress: std::sync::Mutex<HashMap<String, [u8; 32]>>,
 }
 
 impl MemoryEngine {
@@ -111,12 +121,13 @@ impl MemoryEngine {
                     .embed_model
                     .clone()
                     .context("[memory] embedder = 'gateway' requires embed_model")?;
-                Arc::new(GatewayEmbedder::new(llm, model))
+                Arc::new(GatewayEmbedder::new(llm.clone(), model))
             }
         };
 
         let engine = Arc::new(MemoryEngine {
             store,
+            llm,
             cfg,
             vault: Vault::new(vault_root),
             embedder,
@@ -124,6 +135,8 @@ impl MemoryEngine {
             entity_names: RwLock::new(Vec::new()),
             fact_subjects: RwLock::new(HashMap::new()),
             note_titles: RwLock::new(HashMap::new()),
+            wakeup: Arc::new(tokio::sync::Notify::new()),
+            suppress: std::sync::Mutex::new(HashMap::new()),
         });
 
         // Embedding-model versioning: on mismatch, rebuild the index rather
@@ -311,7 +324,7 @@ impl MemoryEngine {
         // One-time rewrite of notes that gained fact uids.
         for (path, note, dirty) in &parsed {
             if *dirty {
-                self.vault.write_atomic(path, &note.render())?;
+                self.write_note(path, &note.render())?;
             }
         }
 
@@ -378,7 +391,7 @@ impl MemoryEngine {
         note.front
             .extra
             .insert("session".into(), serde_yaml::Value::from(session_id));
-        self.vault.write_atomic(&rel, &note.render())?;
+        self.write_note(&rel, &note.render())?;
 
         // Index immediately (entity node + FTS + embedding).
         let embedding = self
@@ -423,16 +436,66 @@ impl MemoryEngine {
         Ok(rel)
     }
 
-    /// Non-blocking: queue a finished turn for consolidation (M1.5b drains
-    /// the queue with the extraction pass; queuing now preserves episodes).
+    /// Non-blocking: queue a finished turn for consolidation and wake the
+    /// background pass (debounced).
     pub fn observe(&self, episode: Episode) {
         let store = self.store.clone();
+        let wakeup = self.wakeup.clone();
         let payload = serde_json::to_string(&episode).unwrap_or_default();
         tokio::spawn(async move {
             if let Err(err) = index::pending_push(&store, "episode", &payload).await {
                 tracing::warn!("failed to queue episode for consolidation: {err:#}");
+            } else {
+                wakeup.notify_one();
             }
         });
+    }
+
+    /// Suppression-aware atomic note write: the vault watcher will ignore
+    /// the event our own write generates.
+    pub(crate) fn write_note(&self, rel: &str, content: &str) -> Result<()> {
+        let hash = self.vault.write_atomic(rel, content)?;
+        self.suppress.lock().unwrap().insert(rel.to_string(), hash);
+        Ok(())
+    }
+
+    pub(crate) async fn warm_caches_public(&self) -> Result<()> {
+        self.warm_caches().await
+    }
+
+    /// Background work: debounced consolidation on new episodes + periodic
+    /// sweep + vault watcher. Call once from the daemon.
+    pub fn start_background(self: &Arc<Self>) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let sweep = std::time::Duration::from_secs(engine.cfg.sweep_interval_s.max(60));
+            let debounce = std::time::Duration::from_secs(engine.cfg.consolidate_debounce_s);
+            loop {
+                tokio::select! {
+                    _ = engine.wakeup.notified() => {
+                        // Debounce: let a burst of turns settle into one batch.
+                        tokio::time::sleep(debounce).await;
+                    }
+                    _ = tokio::time::sleep(sweep) => {}
+                }
+                match engine.consolidate_now().await {
+                    Ok(report) if report.episodes_processed > 0 => {
+                        tracing::info!(
+                            "memory consolidated: {} episodes -> {} facts (+{} entities, {} invalidated)",
+                            report.episodes_processed,
+                            report.facts_added,
+                            report.entities_created,
+                            report.facts_invalidated
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!("consolidation pass failed: {err:#}"),
+                }
+            }
+        });
+        if self.cfg.watch_vault {
+            watch::start(self.clone());
+        }
     }
 
     pub async fn status(&self) -> Result<MemoryStatus> {

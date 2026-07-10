@@ -105,6 +105,19 @@ async fn cmd_memory(action: Vec<String>) -> Result<()> {
             println!("edges:    {} (active)", s.edges);
             println!("pending:  {} consolidation items", s.pending);
         }
+        Some("consolidate") => {
+            let engine = open_memory().await?;
+            let report = engine.consolidate_now().await?;
+            println!(
+                "consolidated {} episodes: +{} facts, +{} entities, {} merged, {} invalidated, {} gray-band queued",
+                report.episodes_processed,
+                report.facts_added,
+                report.entities_created,
+                report.entities_merged,
+                report.facts_invalidated,
+                report.gray_band_queued
+            );
+        }
         Some("search") => {
             let query = action.get(1).context("usage: revenant memory search <query>")?;
             let engine = open_memory().await?;
@@ -131,7 +144,7 @@ async fn cmd_memory(action: Vec<String>) -> Result<()> {
             }
             println!("({} results in {elapsed:.2?})", memories.len());
         }
-        _ => bail!("usage: revenant memory reindex|status|search <query>"),
+        _ => bail!("usage: revenant memory reindex|status|consolidate|search <query>"),
     }
     Ok(())
 }

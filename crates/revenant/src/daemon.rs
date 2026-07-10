@@ -77,7 +77,10 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         )
         .await
         {
-            Ok(engine) => Some(engine),
+            Ok(engine) => {
+                engine.start_background();
+                Some(engine)
+            }
             Err(err) => {
                 tracing::warn!("memory engine disabled: {err:#} (run `revenant init`?)");
                 None
