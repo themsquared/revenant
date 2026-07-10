@@ -2202,6 +2202,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "dirs 5.0.1",
  "futures",
  "hex",
  "rand 0.8.6",

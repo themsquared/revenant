@@ -6,6 +6,7 @@
 
 mod daemon;
 mod repl;
+mod service;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -89,6 +90,11 @@ enum Command {
     Pair,
     /// Print the web UI URL with an embedded login token.
     Open,
+    /// Install/uninstall the always-on background service (launchd/systemd).
+    Service {
+        /// install | uninstall
+        action: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -113,6 +119,11 @@ fn main() -> Result<()> {
             Command::Memory { action } => cmd_memory(action).await,
             Command::Pair => cmd_pair().await,
             Command::Open => cmd_open(),
+            Command::Service { action } => match action.as_str() {
+                "install" => service::install(),
+                "uninstall" => service::uninstall(),
+                other => bail!("usage: revenant service install|uninstall (got '{other}')"),
+            },
         }
     })
 }
