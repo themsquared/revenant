@@ -22,6 +22,7 @@ export default function App() {
   return (
     <div className="shell">
       <header>
+        <img className="brand-logo" src="/logo.png" alt="" />
         <span className="brand">revenant</span>
         <nav>
           {TABS.map((name) => (
@@ -73,6 +74,7 @@ function Login({ onAuthed }) {
   }
   return (
     <div className="login">
+      <img className="login-logo" src="/logo.png" alt="revenant" />
       <h1>revenant</h1>
       <p>paste the control token from ~/.revenant/token</p>
       <input
