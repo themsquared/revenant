@@ -148,3 +148,45 @@ Design sketch:
   subagent = capability.
 - Bonus fun: pair with peon-ping-style sound packs, an avatar per personality
   in the web UI, and a `surprise me` that rotates.
+
+## Planned: intelligent spending across providers
+
+Goal: balance quality / capability / speed / cost by using multiple providers
+(e.g. an OpenAI key alongside Anthropic) and switching where it makes sense.
+
+Architectural anchor: **the gateway is the router.** A tier is an alias → an
+ordered list of provider models. So most of this is richer gateway config/policy
+rendered from revenant, NOT harness routing logic. Keep routing declarative and
+enforced below the agent (injection-proof, visible in the gateway UI).
+
+Three tiers of capability, in build order:
+
+**Tier 1 — mostly config (fold into M4 spend work):**
+- Multi-provider failover tiers: list cross-provider targets per tier
+  (`balanced = [sonnet, gpt-5, gemini-pro]`). Already renders + works today;
+  just needs the keys in secrets.env. Gives automatic cross-provider resilience.
+- Weighted routing: render `routing.weighted` (gateway supports it; render.rs
+  only emits `failover` today) to split a tier, e.g. 80% cheap / 20% frontier.
+- Budget caps rendered to the gateway: global daily $ + per-tier + per-loop
+  (`x-revenant-loop-id`). Gateway has budget.rs (COST/TOKEN descriptors) + a
+  cost catalog + gen_ai_client_cost already. This is the anti-$200/day lever.
+
+**Tier 2 — capability-aware routing (own milestone):**
+- Route by what the task NEEDS, using signals we already have (no classifier):
+  huge context → Gemini; heartbeat/loop → cheapest; escalate() → deep; tool-heavy
+  → a strong tool-use model. Revenant sets a header; gateway CEL `matches` routes
+  on it. Keeps the decision declarative.
+- Needs a small provider-capability table (context window, tool-use quality,
+  $/1k, latency) — partly derivable from the gateway cost catalog.
+
+**Tier 3 — difficulty-based auto-routing (research-y, defer + measure):**
+- Classify each request's difficulty, send to the cheapest CAPABLE model
+  (RouteLLM / NotDiamond / Martian territory). Trades accuracy for cost — needs a
+  classifier, calibration, and a LongMemEval-style eval gate before it ships
+  (principle #2: accuracy). Two viable homes: (a) harness-side pre-classifier
+  that sets a routing header the gateway acts on, or (b) contribute a semantic
+  router to agentgateway OSS (Solo angle — the gateway lacks one today).
+
+Non-negotiables: never route in a way that silently degrades a correctness-
+critical turn; the owner can always pin a tier (`!deep`, config default); every
+routing decision is attributable in the spend ledger (which model actually ran).
