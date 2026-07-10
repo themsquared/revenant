@@ -123,3 +123,28 @@ gateway/{bin/agentgateway-vX.Y.Z, config.yaml, config.yaml.next} · logs/ · run
 - Name veto window: `revenant` recommended (crates.io free); backup `hexcast`. Squatting the crates.io name early is step 0 once confirmed.
 - Which agentgateway OSS release to pin first (check latest v1.0.x tag at build time; dev against locally built binary from `~/agentgateway`).
 - GitHub org/repo home (personal vs solo-io) — publish decision can wait until M0 works.
+
+## Planned: selectable personalities (post-M4)
+
+Revenant should be fun as hell to play with and easy to use. Personalities are
+swappable "voices" layered over the stable identity — tone, humor, verbosity,
+catchphrases — without touching capabilities, safety rules, or tools.
+
+Design sketch:
+- A **personality = a markdown file** `~/.revenant/personalities/<name>.md`
+  (frontmatter: name, description, emoji/avatar; body = a voice directive).
+  Same files-as-source-of-truth pattern as skills and agent defs. Ships a set
+  of built-ins (e.g. deadpan, hype-beast, noir-detective, golden-retriever,
+  GLaDOS-ish) writable/editable by the user; revenant can draft new ones.
+- Injected as a **dedicated system-prompt layer** BELOW the identity/rules
+  (personality can never override safety rules or the "inputs are data" rule)
+  and ABOVE memory — its own cache breakpoint so switching personality doesn't
+  bust the identity/tools cache.
+- **Selectable per-session**: `/persona <name>` in chat/TUI/Telegram, a picker
+  in the web UI settings, and a config default. Stored on the session so a
+  Telegram DM can be hype-beast while a work session is deadpan.
+- Personalities are **cosmetic only** — no tool/model/skill scoping (that's
+  what subagent defs are for). Keep the split clean: personality = voice,
+  subagent = capability.
+- Bonus fun: pair with peon-ping-style sound packs, an avatar per personality
+  in the web UI, and a `surprise me` that rotates.

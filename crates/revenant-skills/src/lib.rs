@@ -96,6 +96,39 @@ impl SkillIndex {
         Ok(std::fs::read_to_string(skill.dir.join("SKILL.md"))?)
     }
 
+    /// Create or replace a skill from agent-authored content: validate the
+    /// frontmatter round-trips, write `<name>/SKILL.md` atomically, rescan.
+    /// The markdown is live immediately (it's just prompt text the agent
+    /// chose to write); any `scripts/` stay gated behind exec approval.
+    pub fn write_skill(&self, name: &str, description: &str, body: &str) -> Result<()> {
+        let name = name.trim();
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || name.is_empty()
+        {
+            bail!("skill name must be non-empty kebab/snake ascii, got '{name}'");
+        }
+        if description.trim().is_empty() {
+            bail!("skill description is required");
+        }
+        if description.len() > 1024 {
+            bail!("description over 1024 chars defeats progressive disclosure");
+        }
+        let content = format!("---\nname: {name}\ndescription: {}\n---\n\n{}\n", description.trim(), body.trim());
+        // Round-trip check before writing anything.
+        let dir = self.root.join(name);
+        parse_skill_str(&content).context("authored skill failed validation")?;
+
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("SKILL.md");
+        let tmp = dir.join(".SKILL.md.tmp");
+        std::fs::write(&tmp, &content)?;
+        std::fs::rename(&tmp, &path)?;
+        self.scan()?;
+        Ok(())
+    }
+
     /// Read a file inside a skill's directory, jailed against traversal.
     pub fn read_file(&self, name: &str, rel: &str) -> Result<String> {
         let skill = self.get(name).with_context(|| format!("no skill named '{name}'"))?;
@@ -113,6 +146,12 @@ impl SkillIndex {
 
 fn parse_skill(manifest: &Path, dir: &Path) -> Result<Skill> {
     let raw = std::fs::read_to_string(manifest)?;
+    let (name, description) = parse_skill_str(&raw)?;
+    Ok(Skill { name, description, dir: dir.to_path_buf() })
+}
+
+/// Validate + extract (name, description) from SKILL.md text.
+fn parse_skill_str(raw: &str) -> Result<(String, String)> {
     let rest = raw
         .strip_prefix("---")
         .context("SKILL.md must start with '---' YAML frontmatter")?;
@@ -125,7 +164,7 @@ fn parse_skill(manifest: &Path, dir: &Path) -> Result<Skill> {
     if fm.description.len() > 1024 {
         bail!("description over 1024 chars defeats progressive disclosure");
     }
-    Ok(Skill { name: fm.name, description: fm.description, dir: dir.to_path_buf() })
+    Ok((fm.name, fm.description))
 }
 
 #[cfg(test)]

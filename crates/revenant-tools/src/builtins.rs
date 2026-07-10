@@ -27,7 +27,8 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(MemoryAppend { home: home.clone() }),
         Arc::new(UseSkill { skills: skills.clone() }),
         Arc::new(FindSkill { skills: skills.clone() }),
-        Arc::new(ReadSkillFile { skills }),
+        Arc::new(ReadSkillFile { skills: skills.clone() }),
+        Arc::new(SkillWrite { skills }),
     ]
 }
 
@@ -424,6 +425,44 @@ impl Tool for FindSkill {
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
+        }
+    }
+}
+
+struct SkillWrite {
+    skills: Arc<SkillIndex>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SkillWrite {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "skill_create",
+            "Author or update a skill so you can reuse a capability later. Provide a kebab-case name, a one-line description (this is what future-you sees to decide when to load it), and the full instructions as the body. The skill is available immediately.",
+            json!({"type":"object","properties":{
+                "name":{"type":"string","description":"kebab-case, e.g. draft-standup-update"},
+                "description":{"type":"string","description":"one line: when should this skill be used"},
+                "body":{"type":"string","description":"the full skill instructions (markdown)"}
+            },"required":["name","description","body"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::WriteWorkspace
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let (name, description, body) = match (
+            arg_str(&args, "name"),
+            arg_str(&args, "description"),
+            arg_str(&args, "body"),
+        ) {
+            (Ok(n), Ok(d), Ok(b)) => (n, d, b),
+            (Err(e), ..) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+        };
+        match self.skills.write_skill(name, description, body) {
+            Ok(()) => ToolOutput::ok(format!(
+                "skill '{name}' saved and indexed — you can use_skill it now"
+            )),
+            Err(err) => ToolOutput::err(format!("{err:#}")),
         }
     }
 }

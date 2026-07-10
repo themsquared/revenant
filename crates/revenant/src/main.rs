@@ -15,6 +15,42 @@ use std::io::Write;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7717";
 
+/// The bundled meta-skill, installed on first `init`.
+const SKILL_CREATOR: &str = r#"---
+name: skill-creator
+description: Use when the owner asks you to create, save, or teach yourself a new skill, or when you notice you've worked out a reusable procedure worth keeping.
+---
+
+# Creating a skill
+
+A skill is a reusable capability you save for later. When a task taught you a
+procedure you'll likely repeat — a report format, a multi-step workflow, a set
+of conventions — capture it with the `skill_create` tool.
+
+## How to write a good one
+
+1. **name** — short, kebab-case, action-oriented: `draft-standup-update`,
+   `triage-github-issue`, `weekly-review`.
+2. **description** — one line describing *when to use it*, not what it is. This
+   is the only text loaded into your prompt by default, so it must let
+   future-you decide whether to load the skill. Good: "Use when the owner asks
+   for a standup update from recent activity." Bad: "A standup skill."
+3. **body** — the actual instructions: steps, format, examples, gotchas. Write
+   it as if instructing a capable colleague who hasn't seen the task before.
+   Keep it under ~5k tokens; link out to detail rather than inlining everything.
+
+## Rules
+
+- Prefer improving an existing skill (call `skill_create` with the same name to
+  replace it) over making near-duplicates.
+- The skill's markdown takes effect immediately — `use_skill <name>` loads it.
+- Do NOT put secrets, tokens, or owner PII in a skill; skills are shareable.
+- If a skill needs to run code, describe the commands in the body; actual
+  execution still goes through the approval-gated `exec` tool.
+
+After creating a skill, confirm to the owner what you saved and when it'll fire.
+"#;
+
 #[derive(Parser)]
 #[command(name = "revenant", version, about = "The agent that comes back. Gateway-native Rust agent harness.")]
 struct Cli {
@@ -215,6 +251,15 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(home.workspace_dir())?;
     std::fs::create_dir_all(home.skills_dir())?;
     std::fs::create_dir_all(home.logs_dir())?;
+
+    // Ship the skill-creator meta-skill on fresh installs so the agent knows
+    // how to author its own skills well.
+    let creator_dir = home.skills_dir().join("skill-creator");
+    if !creator_dir.join("SKILL.md").exists() {
+        std::fs::create_dir_all(&creator_dir)?;
+        std::fs::write(creator_dir.join("SKILL.md"), SKILL_CREATOR)?;
+        println!("installed skill: skill-creator");
+    }
 
     let config_path = home.config_path();
     if config_path.exists() {
