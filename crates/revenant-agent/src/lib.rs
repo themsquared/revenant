@@ -259,6 +259,7 @@ impl AgentRuntime {
             tool_specs.push(subagent_tool_spec());
             tool_specs.push(agent_create_tool_spec());
             tool_specs.push(persona_create_tool_spec());
+            tool_specs.push(plan_execute_tool_spec());
         }
         // MCP tools (from the gateway multiplex) join the tool list unless an
         // agent allowlist restricts this turn.
@@ -489,6 +490,15 @@ impl AgentRuntime {
             };
         }
 
+        // plan_execute runs a dependency DAG at max parallelism (boxed — it
+        // recurses back through dispatch for each task).
+        if name == "plan_execute" {
+            return match Box::pin(self.run_plan(session_id, input, depth)).await {
+                Ok(text) => result(text, false),
+                Err(err) => result(format!("plan_execute failed: {err:#}"), true),
+            };
+        }
+
         // MCP tools (multiplexed by the gateway) route through the MCP client.
         if let Some(mcp) = &self.mcp {
             if self.mcp_tools.iter().any(|s| s.name == name) {
@@ -707,6 +717,157 @@ for a new vibe or you invent a fun one."
                 "voice": {"type": "string", "description": "the style directive (how to talk)"}
             },
             "required": ["name", "voice"]
+        }),
+    }
+}
+
+impl AgentRuntime {
+    /// Execute a dependency DAG of tool calls at maximum parallelism.
+    /// Independent tasks run concurrently; a task waits only for the tasks in
+    /// its `needs`; `${id}` in a task's args is replaced by that task's output.
+    /// One planning round-trip replaces N ReAct round-trips.
+    async fn run_plan(
+        &self,
+        session_id: i64,
+        input: serde_json::Value,
+        depth: u8,
+    ) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct Task {
+            id: String,
+            tool: String,
+            #[serde(default)]
+            args: serde_json::Value,
+            #[serde(default)]
+            needs: Vec<String>,
+        }
+        let tasks: Vec<Task> = serde_json::from_value(
+            input.get("tasks").cloned().context("plan_execute requires 'tasks'")?,
+        )
+        .context("invalid tasks (expected [{id, tool, args, needs}])")?;
+
+        if tasks.is_empty() {
+            bail!("plan has no tasks");
+        }
+        if tasks.len() > 20 {
+            bail!("plan exceeds the 20-task cap");
+        }
+        let ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        if ids.len() != tasks.len() {
+            bail!("duplicate task ids in plan");
+        }
+        for t in &tasks {
+            if t.tool == "plan_execute" {
+                bail!("plans cannot nest plan_execute");
+            }
+            for need in &t.needs {
+                if !ids.contains(need.as_str()) {
+                    bail!("task '{}' needs unknown task '{need}'", t.id);
+                }
+            }
+        }
+
+        let mut done: HashMap<String, String> = HashMap::new();
+        let mut remaining: Vec<Task> = tasks;
+
+        // Run in dependency layers until everything completes.
+        while !remaining.is_empty() {
+            let (ready, not_ready): (Vec<Task>, Vec<Task>) = remaining
+                .into_iter()
+                .partition(|t| t.needs.iter().all(|d| done.contains_key(d)));
+            if ready.is_empty() {
+                let stuck: Vec<String> = not_ready.into_iter().map(|t| t.id).collect();
+                bail!("unsatisfiable dependencies (cycle or missing) among: {stuck:?}");
+            }
+            use futures::stream::StreamExt;
+            let done_ref = &done;
+            let layer: Vec<(String, String)> = futures::stream::iter(ready.into_iter().map(
+                |t| async move {
+                    let args = substitute_refs(&t.args, done_ref);
+                    let out = Box::pin(self.dispatch(
+                        session_id,
+                        &format!("plan:{}", t.id),
+                        &t.tool,
+                        args,
+                        depth,
+                    ))
+                    .await;
+                    let text = match out {
+                        ContentBlock::ToolResult { content, .. } => {
+                            content.as_str().unwrap_or_default().to_string()
+                        }
+                        _ => String::new(),
+                    };
+                    (t.id, text)
+                },
+            ))
+            .buffer_unordered(CONCURRENT_TOOLS)
+            .collect()
+            .await;
+            for (id, text) in layer {
+                done.insert(id, text);
+            }
+            remaining = not_ready;
+        }
+
+        Ok(done
+            .iter()
+            .map(|(id, out)| format!("[{id}]\n{out}"))
+            .collect::<Vec<_>>()
+            .join("\n\n"))
+    }
+}
+
+/// Replace `${id}` occurrences in a plan task's args with completed outputs.
+fn substitute_refs(
+    value: &serde_json::Value,
+    done: &HashMap<String, String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            let mut out = s.clone();
+            for (id, text) in done {
+                out = out.replace(&format!("${{{id}}}"), text);
+            }
+            serde_json::Value::String(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(|v| substitute_refs(v, done)).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter().map(|(k, v)| (k.clone(), substitute_refs(v, done))).collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn plan_execute_tool_spec() -> revenant_core::ToolSpec {
+    revenant_core::ToolSpec {
+        name: "plan_execute".into(),
+        description: "Run several tool calls as a dependency graph in ONE step, at maximum \
+parallelism — instead of calling tools one at a time across multiple turns. Give each task an id, \
+the tool to run, its args, and `needs` (ids it depends on). Independent tasks run concurrently; \
+dependent ones wait. Reference a prior task's output inside args with `${id}`. Use this whenever a \
+task has multiple steps where some are independent — it is much faster than sequential calls."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "tool": {"type": "string", "description": "any available tool (not plan_execute)"},
+                            "args": {"type": "object"},
+                            "needs": {"type": "array", "items": {"type": "string"}, "description": "task ids this one depends on"}
+                        },
+                        "required": ["id", "tool"]
+                    }
+                }
+            },
+            "required": ["tasks"]
         }),
     }
 }
