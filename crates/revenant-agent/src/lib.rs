@@ -164,10 +164,10 @@ impl AgentRuntime {
         if let Some(allow) = &allowlist {
             tool_specs.retain(|spec| allow.contains(&spec.name));
         }
-        // Offer subagent spawning only at the top level (depth 0) — keeps the
-        // tree one level deep and recursion bounded.
+        // Offer subagent spawning + authoring only at the top level.
         if depth == 0 {
             tool_specs.push(subagent_tool_spec());
+            tool_specs.push(agent_create_tool_spec());
         }
         let mut total_usage = Usage::default();
         let mut routed_model = None;
@@ -340,6 +340,13 @@ impl AgentRuntime {
                 Err(err) => result(format!("subagent failed: {err:#}"), true),
             };
         }
+        // agent_create authors a subagent definition (needs the registry).
+        if name == "agent_create" {
+            return match self.create_agent_def(input) {
+                Ok(msg) => result(msg, false),
+                Err(err) => result(format!("agent_create failed: {err:#}"), true),
+            };
+        }
 
         let Some(tool) = self.tools.get(name) else {
             return result(format!("unknown tool: {name}"), true);
@@ -459,6 +466,69 @@ impl AgentRuntime {
             ok,
         });
         Ok(stats?.final_text)
+    }
+}
+
+/// Draft/update a subagent definition. The user owns and can tweak the file
+/// afterward (in an editor or the web UI).
+impl AgentRuntime {
+    fn create_agent_def(&self, input: serde_json::Value) -> Result<String> {
+        let name = input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .context("agent_create requires 'name'")?;
+        let directive = input
+            .get("directive")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .context("agent_create requires 'directive'")?;
+        let str_list = |key: &str| -> Vec<String> {
+            input
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        let def = AgentDef {
+            name: name.to_string(),
+            description: input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            tier: input.get("tier").and_then(|v| v.as_str()).map(String::from),
+            tools: str_list("tools"),
+            skills: str_list("skills"),
+            directive: directive.to_string(),
+        };
+        self.agents.write(&def)?;
+        Ok(format!(
+            "subagent '{name}' saved — the owner can tweak it in the web UI or ~/.revenant/agents/{name}.md; delegate to it with subagent_run agent=\"{name}\""
+        ))
+    }
+}
+
+/// Spec for the virtual agent_create tool (advertised only at depth 0).
+fn agent_create_tool_spec() -> revenant_core::ToolSpec {
+    revenant_core::ToolSpec {
+        name: "agent_create".into(),
+        description: "Define a reusable subagent (a focused persona with its own directive, tool \
+allowlist, and tier) that you can later delegate to via subagent_run. The owner can edit it \
+afterward. Use when you notice a recurring kind of subtask worth a dedicated agent."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "kebab-case, e.g. researcher"},
+                "description": {"type": "string", "description": "one line: when to use this agent"},
+                "directive": {"type": "string", "description": "the agent's instructions/persona"},
+                "tier": {"type": "string", "enum": ["fast", "balanced", "deep", "local"]},
+                "tools": {"type": "array", "items": {"type": "string"}, "description": "tool allowlist; omit to inherit all"},
+                "skills": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["name", "directive"]
+        }),
     }
 }
 

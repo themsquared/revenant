@@ -524,6 +524,11 @@ async fn tools_list(State(state): State<AppState>) -> Json<serde_json::Value> {
         "description": "Delegate a self-contained subtask to a focused child agent.",
         "permission": "ReadOnly",
     }));
+    all.push(json!({
+        "name": "agent_create",
+        "description": "Define a reusable subagent (directive, tools, tier) to delegate to later.",
+        "permission": "WriteWorkspace",
+    }));
     Json(json!({ "tools": all }))
 }
 
