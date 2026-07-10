@@ -7,3 +7,6 @@ web/node_modules
 secrets.env
 *.env
 !*.example.env
+
+# release artifacts
+dist/
