@@ -116,6 +116,8 @@ header.hero { position: relative; padding: 90px 0 70px; text-align: center; over
 }
 .badge b { color: var(--ok); font-weight: 500; }
 .badge .sep { color: var(--dimmer); }
+.badge { flex-wrap: wrap; justify-content: center; row-gap: 2px; }
+.badge .bi { white-space: nowrap; }
 h1 {
   font-family: var(--display); font-weight: 800;
   font-size: clamp(40px, 7.5vw, 76px); letter-spacing: .12em;
@@ -305,6 +307,12 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
   .flow-arrow { transform: rotate(90deg); align-self: center; padding: 2px 0; }
   nav .lnk { display: none; }
 }
+@media (max-width: 560px) {
+  .grid { grid-template-columns: 1fr; }
+  .hero-logo { width: 160px; }
+  .ladder li { flex-direction: column; gap: 4px; }
+  .term-body { font-size: 12px; }
+}
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
   .rv { opacity: 1; transform: none; }
@@ -334,7 +342,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
   <div class="gridlines"></div>
   <div class="wrap">
     <img class="hero-logo" src="/logo.png" alt="Revenant — skull R mark">
-    <div class="badge"><b>●</b> v0.1.0 <span class="sep">|</span> Apache-2.0 <span class="sep">|</span> 100% Rust <span class="sep">|</span> single static binary</div>
+    <div class="badge"><span class="bi"><b>●</b> v0.1.0</span><span class="sep">|</span><span class="bi">Apache-2.0</span><span class="sep">|</span><span class="bi">100% Rust</span><span class="sep">|</span><span class="bi">single static binary</span></div>
     <h1>REVENANT</h1>
     <p class="tagline">the agent that comes back<span class="cursor"></span></p>
     <p class="hero-sub">
@@ -522,11 +530,24 @@ model    = <span class="st">"qwen3:0.6b"</span>
 </footer>
 
 <script>
-document.getElementById('copy-install').addEventListener('click', function () {
-  navigator.clipboard.writeText(document.getElementById('install-cmd').textContent).then(() => {
+document.getElementById('copy-install').addEventListener('click', async function () {
+  const text = document.getElementById('install-cmd').textContent;
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; } catch (_) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand('copy'); } catch (_) {}
+    ta.remove();
+  }
+  if (ok) {
     this.textContent = 'COPIED ✓'; this.classList.add('done');
     setTimeout(() => { this.textContent = 'COPY'; this.classList.remove('done'); }, 1800);
-  });
+  } else {
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById('install-cmd'));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  }
 });
 const io = new IntersectionObserver(es => es.forEach(e => {
   if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }

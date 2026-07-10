@@ -8,6 +8,11 @@ mod daemon;
 mod repl;
 mod service;
 
+// Force-link bundled native plugins so their inventory registrations run
+// (an unreferenced dependency would be elided). Add your plugin crates here.
+#[cfg(feature = "plugins")]
+extern crate revenant_plugin_example as _;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use revenant_core::config::{Config, GatewayMode};

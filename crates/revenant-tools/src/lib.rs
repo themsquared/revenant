@@ -22,6 +22,28 @@ pub trait Tool: Send + Sync {
     async fn invoke(&self, cx: &ToolCx, args: serde_json::Value) -> ToolOutput;
 }
 
+// Re-export so plugin crates and the `register_tool!` macro can reach it.
+pub use inventory;
+
+/// A tool contributed by a plugin, collected at startup via `inventory`. A
+/// plugin crate registers with `register_tool!` and gets compiled in; the
+/// runtime folds these into the ToolRegistry alongside built-ins.
+pub struct ToolPlugin {
+    pub make: fn() -> Arc<dyn Tool>,
+}
+inventory::collect!(ToolPlugin);
+
+/// Register a tool from a plugin crate. `register_tool!(MyTool)` for a unit
+/// struct, or `register_tool!(MyTool::new())` for a constructor expression.
+#[macro_export]
+macro_rules! register_tool {
+    ($ctor:expr) => {
+        $crate::inventory::submit! {
+            $crate::ToolPlugin { make: || ::std::sync::Arc::new($ctor) as ::std::sync::Arc<dyn $crate::Tool> }
+        }
+    };
+}
+
 /// Capability handle passed to tools — deliberately narrow.
 #[derive(Clone)]
 pub struct ToolCx {
@@ -39,8 +61,18 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn builtin(home: &Home, skills: Arc<SkillIndex>) -> Self {
         let mut tools: BTreeMap<String, Arc<dyn Tool>> = BTreeMap::new();
+        // Plugin-contributed tools first; built-ins win any name clash so a
+        // plugin extends rather than silently overrides core capabilities.
+        for plugin in inventory::iter::<ToolPlugin> {
+            let tool = (plugin.make)();
+            tools.insert(tool.spec().name.clone(), tool);
+        }
+        let plugin_count = tools.len();
         for tool in builtins::all(home, skills) {
             tools.insert(tool.spec().name.clone(), tool);
+        }
+        if plugin_count > 0 {
+            tracing::info!("loaded {plugin_count} plugin tool(s)");
         }
         ToolRegistry { tools: Arc::new(tools) }
     }

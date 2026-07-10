@@ -1,0 +1,14 @@
+[package]
+name = "revenant-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The one dependency a native plugin author adds. Re-exports the extension
+# API (Tool + Hook), the register_*! macros, and the bits plugins need.
+[dependencies]
+revenant-core = { workspace = true }
+revenant-tools = { workspace = true }
+revenant-agent = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }

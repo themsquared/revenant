@@ -22,6 +22,8 @@ revenant-client = { workspace = true }
 revenant-memory = { workspace = true }
 revenant-channels = { workspace = true }
 revenant-loops = { workspace = true }
+# Bundled reference plugin, compiled in via the default `plugins` feature.
+revenant-plugin-example = { workspace = true, optional = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -33,3 +35,9 @@ hex = { workspace = true }
 dirs = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[features]
+default = ["plugins"]
+# Native plugins compiled into the binary. Add your own plugin crate to
+# plugins/, alias it, add it here, and `extern crate` it in main.rs.
+plugins = ["dep:revenant-plugin-example"]

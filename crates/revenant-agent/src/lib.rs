@@ -48,6 +48,44 @@ pub struct TurnStats {
     pub final_text: String,
 }
 
+/// Context passed to turn hooks. A hook observes/annotates a turn; it never
+/// blocks or mutates the transcript (that path stays in the core loop).
+pub struct HookCx {
+    pub session_id: i64,
+    pub user_text: String,
+}
+
+/// A core-extension hook that fires around every top-level turn. Plugins
+/// implement this for guardrails, logging, metrics, notifications, etc.
+#[async_trait::async_trait]
+pub trait Hook: Send + Sync {
+    fn name(&self) -> &str;
+    async fn pre_turn(&self, _cx: &HookCx) {}
+    async fn post_turn(&self, _cx: &HookCx, _final_text: &str) {}
+}
+
+/// A hook contributed by a plugin, collected at startup via `inventory`.
+pub struct HookPlugin {
+    pub make: fn() -> std::sync::Arc<dyn Hook>,
+}
+inventory::collect!(HookPlugin);
+
+pub use inventory;
+
+/// Register a turn hook from a plugin crate.
+#[macro_export]
+macro_rules! register_hook {
+    ($ctor:expr) => {
+        $crate::inventory::submit! {
+            $crate::HookPlugin { make: || ::std::sync::Arc::new($ctor) as ::std::sync::Arc<dyn $crate::Hook> }
+        }
+    };
+}
+
+fn hooks() -> Vec<std::sync::Arc<dyn Hook>> {
+    inventory::iter::<HookPlugin>.into_iter().map(|p| (p.make)()).collect()
+}
+
 pub struct AgentRuntime {
     pub store: Store,
     pub llm: LlmClient,
@@ -177,6 +215,15 @@ impl AgentRuntime {
             None
         };
 
+        // Plugin pre-turn hooks (top-level turns only).
+        let active_hooks = if depth == 0 { hooks() } else { Vec::new() };
+        if !active_hooks.is_empty() {
+            let hcx = HookCx { session_id, user_text: user_text.clone() };
+            for hook in &active_hooks {
+                hook.pre_turn(&hcx).await;
+            }
+        }
+
         let (stable_system, dynamic_system) = self.system_prompt(
             retrieved.as_deref(),
             agent.as_ref(),
@@ -295,6 +342,12 @@ impl AgentRuntime {
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0),
                     });
+                }
+                if !active_hooks.is_empty() {
+                    let hcx = HookCx { session_id, user_text: user_text.clone() };
+                    for hook in &active_hooks {
+                        hook.post_turn(&hcx, &final_text).await;
+                    }
                 }
                 self.events.emit(Event::TurnCompleted {
                     session_id,

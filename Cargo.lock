@@ -1363,6 +1363,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2215,6 +2224,7 @@ dependencies = [
  "revenant-llm",
  "revenant-loops",
  "revenant-memory",
+ "revenant-plugin-example",
  "revenant-security",
  "revenant-skills",
  "revenant-store",
@@ -2230,6 +2240,8 @@ name = "revenant-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "inventory",
  "revenant-core",
  "revenant-llm",
  "revenant-memory",
@@ -2388,6 +2400,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "revenant-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "revenant-agent",
+ "revenant-core",
+ "revenant-tools",
+ "serde_json",
+]
+
+[[package]]
+name = "revenant-plugin-example"
+version = "0.1.0"
+dependencies = [
+ "revenant-plugin",
+]
+
+[[package]]
 name = "revenant-security"
 version = "0.1.0"
 dependencies = [
@@ -2430,6 +2460,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "inventory",
  "revenant-core",
  "revenant-memory",
  "revenant-skills",

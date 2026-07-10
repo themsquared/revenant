@@ -1,0 +1,10 @@
+[package]
+name = "revenant-plugin-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A reference native plugin: one Tool (roll_dice) + one Hook (turn logger).
+# Compiled into the agent via the `revenant` binary's `plugins` feature.
+[dependencies]
+revenant-plugin = { workspace = true }
