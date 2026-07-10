@@ -12,6 +12,7 @@ revenant-tools = { workspace = true }
 revenant-skills = { workspace = true }
 revenant-security = { workspace = true }
 revenant-memory = { workspace = true }
+revenant-mcp = { workspace = true }
 tokio = { workspace = true }
 inventory = { workspace = true }
 async-trait = { workspace = true }

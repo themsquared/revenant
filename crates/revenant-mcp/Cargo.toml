@@ -1,0 +1,16 @@
+[package]
+name = "revenant-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Thin hand-rolled MCP client (streamable-HTTP) to the gateway's MCP
+# multiplex — no heavy SDK, matching the codebase's other wire clients.
+[dependencies]
+revenant-core = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

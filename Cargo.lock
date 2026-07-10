@@ -2223,6 +2223,7 @@ dependencies = [
  "revenant-gateway",
  "revenant-llm",
  "revenant-loops",
+ "revenant-mcp",
  "revenant-memory",
  "revenant-plugin-example",
  "revenant-security",
@@ -2244,6 +2245,7 @@ dependencies = [
  "inventory",
  "revenant-core",
  "revenant-llm",
+ "revenant-mcp",
  "revenant-memory",
  "revenant-security",
  "revenant-skills",
@@ -2370,6 +2372,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "revenant-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "revenant-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

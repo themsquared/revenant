@@ -95,6 +95,10 @@ pub struct AgentRuntime {
     pub skills: Arc<SkillIndex>,
     pub agents: Arc<AgentRegistry>,
     pub personalities: Arc<PersonalityRegistry>,
+    /// MCP client to the gateway multiplex, plus the tool specs discovered at
+    /// startup. None when no MCP servers are configured.
+    pub mcp: Option<Arc<revenant_mcp::McpClient>>,
+    pub mcp_tools: Vec<revenant_core::ToolSpec>,
     pub home: Home,
     pub memory: Option<Arc<revenant_memory::MemoryEngine>>,
     pub max_history: usize,
@@ -245,6 +249,11 @@ impl AgentRuntime {
             tool_specs.push(subagent_tool_spec());
             tool_specs.push(agent_create_tool_spec());
             tool_specs.push(persona_create_tool_spec());
+        }
+        // MCP tools (from the gateway multiplex) join the tool list unless an
+        // agent allowlist restricts this turn.
+        if allowlist.is_none() {
+            tool_specs.extend(self.mcp_tools.iter().cloned());
         }
         let mut total_usage = Usage::default();
         let mut routed_model = None;
@@ -436,6 +445,24 @@ impl AgentRuntime {
                 Ok(msg) => result(msg, false),
                 Err(err) => result(format!("persona_create failed: {err:#}"), true),
             };
+        }
+
+        // MCP tools (multiplexed by the gateway) route through the MCP client.
+        if let Some(mcp) = &self.mcp {
+            if self.mcp_tools.iter().any(|s| s.name == name) {
+                self.events.emit(Event::ToolStarted {
+                    session_id,
+                    tool: name.to_string(),
+                    summary: summarize_args(name, &input),
+                });
+                let out = match mcp.call_tool(name, input).await {
+                    Ok(text) => result(text, false),
+                    Err(err) => result(format!("mcp tool failed: {err:#}"), true),
+                };
+                let ok = matches!(&out, ContentBlock::ToolResult { is_error, .. } if !is_error);
+                self.events.emit(Event::ToolFinished { session_id, tool: name.to_string(), ok });
+                return out;
+            }
         }
 
         let Some(tool) = self.tools.get(name) else {

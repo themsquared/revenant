@@ -21,6 +21,7 @@ revenant-control = { path = "crates/revenant-control" }
 revenant-client = { path = "crates/revenant-client" }
 revenant-memory = { path = "crates/revenant-memory" }
 revenant-channels = { path = "crates/revenant-channels" }
+revenant-mcp = { path = "crates/revenant-mcp" }
 revenant-plugin = { path = "crates/revenant-plugin" }
 revenant-plugin-example = { path = "plugins/revenant-plugin-example" }
 revenant-loops = { path = "crates/revenant-loops" }

@@ -80,6 +80,25 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     }
     let llm = revenant_llm::LlmClient::new(endpoint.clone());
 
+    // MCP client: discover the gateway multiplex's tools once at startup so
+    // the agent can call every configured MCP server. Fail-open.
+    let (mcp, mcp_tools) = if cfg.mcp.is_empty() || cfg.gateway.mode != GatewayMode::Bundled {
+        (None, Vec::new())
+    } else {
+        let client = revenant_mcp::McpClient::new(format!("http://127.0.0.1:{}/", cfg.gateway.mcp_port));
+        match client.list_tools().await {
+            Ok(tools) => {
+                tracing::info!("discovered {} MCP tool(s) across {} server(s)", tools.len(), cfg.mcp.len());
+                let specs = tools.iter().map(|t| t.spec()).collect();
+                (Some(client), specs)
+            }
+            Err(err) => {
+                tracing::warn!("MCP tool discovery failed (continuing without): {err:#}");
+                (None, Vec::new())
+            }
+        }
+    };
+
     // Memory engine: fail-open. A missing model or broken vault must not
     // keep the agent from coming up.
     let memory = if cfg.memory.enabled {
@@ -113,6 +132,8 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         skills,
         agents,
         personalities,
+        mcp,
+        mcp_tools,
         home: home.clone(),
         memory,
         max_history: cfg.agent.max_history_messages,
