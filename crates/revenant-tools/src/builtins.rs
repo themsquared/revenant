@@ -31,6 +31,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(SkillWrite { skills }),
         Arc::new(LoopCreate),
         Arc::new(LoopControl),
+        Arc::new(LoopUpdate),
     ]
 }
 
@@ -537,9 +538,9 @@ impl Tool for LoopControl {
     fn spec(&self) -> ToolSpec {
         spec!(
             "loop_control",
-            "List, pause, resume, or delete your recurring loops. action: list | pause | resume | delete. For pause/resume/delete, pass the loop id.",
+            "Inspect and control loops. action: list | runs | pause | resume | delete. 'runs' shows a loop's recent outcomes (use it to decide how to tune). All but 'list' need the loop id.",
             json!({"type":"object","properties":{
-                "action":{"type":"string","enum":["list","pause","resume","delete"]},
+                "action":{"type":"string","enum":["list","runs","pause","resume","delete"]},
                 "id":{"type":"string"}
             },"required":["action"]})
         )
@@ -596,7 +597,77 @@ impl Tool for LoopControl {
                     Err(err) => ToolOutput::err(format!("{err:#}")),
                 }
             }
+            "runs" => {
+                let id = match arg_str(&args, "id") {
+                    Ok(i) => i,
+                    Err(e) => return e,
+                };
+                match cx.store.loop_runs(id, 15).await {
+                    Ok(runs) if runs.is_empty() => ToolOutput::ok("no runs yet".to_string()),
+                    Ok(runs) => ToolOutput::ok(
+                        runs.iter()
+                            .map(|r| {
+                                format!(
+                                    "{} · {}in/{}out tok · {}",
+                                    r.status,
+                                    r.tokens_in,
+                                    r.tokens_out,
+                                    r.outcome.as_deref().unwrap_or("")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    Err(err) => ToolOutput::err(format!("{err:#}")),
+                }
+            }
             other => ToolOutput::err(format!("unknown action '{other}'")),
+        }
+    }
+}
+
+struct LoopUpdate;
+
+#[async_trait::async_trait]
+impl Tool for LoopUpdate {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "loop_update",
+            "Tune an existing loop: change its schedule, prompt, or tier. Use this to self-tune — e.g. slow down a loop that keeps finding nothing, or make a valuable one cheaper. Only omitted fields are kept.",
+            json!({"type":"object","properties":{
+                "id":{"type":"string"},
+                "schedule":{"type":"string","description":"new 'every:<n>s' or 'cron:...' (optional)"},
+                "prompt":{"type":"string","description":"new prompt (optional)"},
+                "tier":{"type":"string","enum":["fast","balanced","deep","local"]}
+            },"required":["id"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        // Tuning an existing loop (not spawning a new spender) — WriteWorkspace.
+        PermissionTier::WriteWorkspace
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        let id = match arg_str(&args, "id") {
+            Ok(i) => i,
+            Err(e) => return e,
+        };
+        let current = match cx.store.loop_get(id).await {
+            Ok(Some(l)) => l,
+            Ok(None) => return ToolOutput::err(format!("no loop {id}")),
+            Err(err) => return ToolOutput::err(format!("{err:#}")),
+        };
+        let schedule = args.get("schedule").and_then(|v| v.as_str()).unwrap_or(&current.schedule);
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or(&current.prompt);
+        let tier = args.get("tier").and_then(|v| v.as_str()).unwrap_or(&current.tier);
+        // Validate + recompute next fire (enforces the interval floor).
+        let next_run = match revenant_core::loops::first_next_run(schedule, unix_now()) {
+            Ok(n) => n,
+            Err(err) => return ToolOutput::err(format!("{err:#}")),
+        };
+        match cx.store.loop_retune(id, schedule, prompt, tier, next_run).await {
+            Ok(true) => ToolOutput::ok(format!("loop {id} retuned: {schedule} · {tier}")),
+            Ok(false) => ToolOutput::err(format!("no loop {id}")),
+            Err(err) => ToolOutput::err(format!("{err:#}")),
         }
     }
 }

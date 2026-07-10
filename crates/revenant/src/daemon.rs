@@ -122,6 +122,11 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
 
     let manager = SessionManager::new(runtime);
 
+    // Ensure the built-in self-tuning reflection loop exists (weekly). It
+    // reviews other loops' run history and tunes them — the "self-managing"
+    // half of loop engineering.
+    ensure_reflection_loop(&manager.runtime().store).await;
+
     // Loop scheduler: fires due recurring jobs off the hot path.
     let default_tier = cfg
         .agent
@@ -166,6 +171,56 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         gateway_handle,
         llm_endpoint: endpoint,
     })
+}
+
+const REFLECTION_ID: &str = "lp-reflection";
+const REFLECTION_PROMPT: &str = "Self-tuning pass. Review your recurring loops and keep them \
+healthy and cheap. Steps: call loop_control action=list; for each loop that isn't 'lp-reflection', \
+call loop_control action=runs to see recent outcomes. Then act:\n\
+- AGENT-created loops (created_by=agent): auto-apply SAFE tunings yourself — pause any that have \
+produced nothing useful for many runs (loop_control pause), slow down low-value ones (loop_update \
+to a longer interval), or switch a wasteful one to a cheaper tier. Do NOT speed loops up or raise \
+cost without asking.\n\
+- USER-created loops (created_by=user): do NOT change them. If you have a suggestion, state it \
+briefly for the owner instead.\n\
+Never modify or pause lp-reflection itself. End with a one-line summary of what you changed or \
+'no changes needed'.";
+
+/// Idempotently install the weekly self-tuning reflection loop.
+async fn ensure_reflection_loop(store: &revenant_store::Store) {
+    match store.loop_get(REFLECTION_ID).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let next = revenant_core::loops::first_next_run("every:604800s", now_secs())
+                .unwrap_or(now_secs() + 604_800);
+            if let Err(err) = store
+                .loop_upsert(
+                    REFLECTION_ID,
+                    "reflection (self-tuning)",
+                    "every:604800s",
+                    REFLECTION_PROMPT,
+                    "fast",
+                    None,
+                    2,
+                    "system",
+                    next,
+                )
+                .await
+            {
+                tracing::warn!("could not install reflection loop: {err:#}");
+            } else {
+                tracing::info!("installed self-tuning reflection loop (weekly)");
+            }
+        }
+        Err(err) => tracing::warn!("reflection loop check failed: {err:#}"),
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 pub async fn cmd_up() -> Result<()> {

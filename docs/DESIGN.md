@@ -190,3 +190,37 @@ Three tiers of capability, in build order:
 Non-negotiables: never route in a way that silently degrades a correctness-
 critical turn; the owner can always pin a tier (`!deep`, config default); every
 routing decision is attributable in the spend ledger (which model actually ran).
+
+## Loop engineering (three kinds of loops)
+
+Prompted by the "loop engineering" framing. Revenant has three distinct loop
+constructs; keep them separate.
+
+1. **Turn loop** (engine) — act → observe tool results → decide → repeat until
+   end_turn, bounded by max_iterations. The base iteration; already has
+   termination + adaptation.
+
+2. **Scheduled loops** (engine + self-managing) — recurring jobs (cron/heartbeat)
+   in the DB. Now self-creating and self-tuning:
+   - *Self-creating*: the agent proposes loops (loop_create) when it notices a
+     standing need — not only when asked (IDENTITY nudge). Approval-gated.
+   - *Self-tuning*: a built-in weekly `reflection` system loop reviews every
+     loop's run history (loop_control runs) and tunes via loop_update /
+     loop_control. Policy by `created_by`: AGENT loops get safe changes applied
+     autonomously (pause dead ones, slow low-value ones, cheaper tier); USER
+     loops are never changed, only suggested on; the reflection loop never
+     touches itself. Verified: a dead agent loop was auto-paused.
+
+3. **Nested quality loops** (declarative — NOT engine) — "loops inside loops":
+   produce → critique → refine until a bar is met. Expressed with existing
+   primitives, not new engine code:
+   - the `critic` subagent (rubric-based, fresh-eyes critique on a cheaper tier)
+   - the `quality-loop` skill (the pattern: define the bar, produce, delegate
+     critique, refine, repeat ≤3, prefer mechanical validation via exec/tests
+     first). The base turn loop does the orchestration.
+
+Future (deferred): a first-class `run_validated(task, check, max_iters)` engine
+primitive that bakes produce→check→refine with a mechanical or subagent check
+and hard termination — worth it only if the declarative pattern proves too
+loose in practice. Also: reflection could propose brand-new loops it infers the
+owner would want (with approval), and score loop value from 👍/👎 reactions.

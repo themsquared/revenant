@@ -456,6 +456,43 @@ impl Store {
         .await
     }
 
+    pub async fn loop_get(&self, id: &str) -> Result<Option<LoopRow>> {
+        let id = id.to_owned();
+        self.with(move |conn| {
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT id, name, schedule, prompt, tier, channel_out, enabled, max_per_day,
+                        created_by, last_run, next_run FROM loops WHERE id = ?1",
+                [&id],
+                map_loop,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Tune an existing loop's schedule/prompt/tier and recompute next_run.
+    pub async fn loop_retune(
+        &self,
+        id: &str,
+        schedule: &str,
+        prompt: &str,
+        tier: &str,
+        next_run: i64,
+    ) -> Result<bool> {
+        let (id, schedule, prompt, tier) =
+            (id.to_owned(), schedule.to_owned(), prompt.to_owned(), tier.to_owned());
+        self.with(move |conn| {
+            let n = conn.execute(
+                "UPDATE loops SET schedule = ?2, prompt = ?3, tier = ?4, next_run = ?5,
+                        updated_at = ?6 WHERE id = ?1",
+                rusqlite::params![id, schedule, prompt, tier, next_run, unix_now()],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
     pub async fn loops_list(&self) -> Result<Vec<LoopRow>> {
         self.with(|conn| {
             let mut stmt = conn.prepare(

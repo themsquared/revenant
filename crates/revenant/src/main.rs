@@ -52,6 +52,68 @@ of conventions — capture it with the `skill_create` tool.
 After creating a skill, confirm to the owner what you saved and when it'll fire.
 "#;
 
+/// The nested-quality-loop pattern skill (loop engineering).
+const QUALITY_LOOP_SKILL: &str = r#"---
+name: quality-loop
+description: Use for any task with a real quality bar (drafting, code, analysis, refactoring) — run a produce → critique → refine loop instead of one-shotting it.
+---
+
+# Quality loop (loops inside loops)
+
+Don't hand back a first draft on work that has a quality bar. Run an inner
+loop until the result actually meets the goal.
+
+## The loop
+
+1. **Define the bar.** State, concretely, what "good" means for this task
+   (correctness, covers edge cases, matches the owner's style, compiles/passes
+   tests). A loop needs a testable termination condition.
+2. **Produce** a draft.
+3. **Critique** — delegate to the `critic` subagent with `subagent_run`:
+   pass the draft AND the bar, ask for specific, actionable faults (or "PASS").
+   Using a separate agent for critique beats self-review — fresh eyes, no
+   attachment to the draft.
+4. **Refine** using the critique.
+5. **Repeat** from step 3 until the critic returns PASS or you've done ~3
+   rounds (stop and report the best version + remaining caveats — don't loop
+   forever).
+
+## When to use which pattern
+
+- **Retry**: atomic task that either works or doesn't (a command, a fetch).
+- **Produce-critique-refine** (this skill): open-ended quality work.
+- **Explore-narrow**: when several approaches are plausible — draft 2-3, have
+  the critic score them, develop the winner.
+
+## Rules
+
+- Always have a termination condition; never loop unbounded.
+- Prefer a cheaper tier for the critic than the producer — critique is easier
+  than creation.
+- If validation can be mechanical (tests, a schema, a linter), run that in the
+  loop via `exec` before spending a critique pass.
+"#;
+
+/// A general-purpose critic subagent for quality loops.
+const CRITIC_AGENT: &str = r#"---
+name: critic
+description: Reviews a draft against a stated bar and returns specific, actionable faults (or PASS)
+tier: fast
+tools: [recall, read_file]
+---
+
+You are a sharp, fair critic. You receive a draft and the quality bar it must
+meet. Return either:
+
+- "PASS" (optionally with one line on why), if it genuinely meets the bar, or
+- a short numbered list of SPECIFIC, ACTIONABLE faults, most important first.
+
+Judge only against the stated bar. Be concrete ("the error case when input is
+empty isn't handled" — not "improve error handling"). Don't rewrite the work;
+find what's wrong so the producer can fix it. Don't invent new requirements.
+Be honest — passing weak work helps no one, but nitpicking wastes a cycle.
+"#;
+
 /// Built-in personalities installed on first `init`. Voice only — never
 /// overrides behavior or safety (they're injected below the rules).
 const BUILTIN_PERSONAS: &[(&str, &str)] = &[
@@ -291,6 +353,21 @@ async fn cmd_init() -> Result<()> {
         std::fs::create_dir_all(&creator_dir)?;
         std::fs::write(creator_dir.join("SKILL.md"), SKILL_CREATOR)?;
         println!("installed skill: skill-creator");
+    }
+
+    // Ship the loop-engineering skill + a critic subagent so nested quality
+    // loops (produce → critique → refine) work out of the box.
+    let loop_skill_dir = home.skills_dir().join("quality-loop");
+    if !loop_skill_dir.join("SKILL.md").exists() {
+        std::fs::create_dir_all(&loop_skill_dir)?;
+        std::fs::write(loop_skill_dir.join("SKILL.md"), QUALITY_LOOP_SKILL)?;
+        println!("installed skill: quality-loop");
+    }
+    let critic_path = home.agents_dir().join("critic.md");
+    if !critic_path.exists() {
+        std::fs::create_dir_all(home.agents_dir())?;
+        std::fs::write(&critic_path, CRITIC_AGENT)?;
+        println!("installed subagent: critic");
     }
 
     // Ship a few built-in personalities (voice layer). Users edit or add

@@ -33,7 +33,12 @@ Rules:\n\
 - Call tools directly when a task needs them — never ask permission in prose. Dangerous tools \
 (like exec) automatically prompt the owner for approval when you call them; a denial is an \
 answer, not an obstacle to work around.\n\
-- Consult the skills index and `use_skill` when a task matches an installed skill.";
+- Consult the skills index and `use_skill` when a task matches an installed skill.\n\
+- When you notice a standing, recurring need (a watch, a periodic check, a digest), propose a loop \
+with `loop_create` rather than waiting to be asked; keep intervals sane and let it be approved.\n\
+- For work with a quality bar (drafting, code, analysis), use a produce-then-critique loop: create \
+a draft, delegate a critique to a critic subagent, refine, and repeat until it passes — see the \
+`quality-loop` skill.";
 
 #[derive(Debug, Clone)]
 pub struct TurnStats {
