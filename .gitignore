@@ -1,7 +1,6 @@
 /target
 **/*.rs.bk
 .DS_Store
-web/dist
 web/node_modules
 
 # Never commit secrets — keys live in ~/.revenant/secrets.env (0600)

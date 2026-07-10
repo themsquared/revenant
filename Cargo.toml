@@ -50,6 +50,8 @@ petgraph = { version = "0.6", default-features = false, features = ["graphmap"] 
 notify = "6"
 notify-debouncer-full = "0.3"
 strsim = "0.11"
+rust-embed = "8"
+mime_guess = "2"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 

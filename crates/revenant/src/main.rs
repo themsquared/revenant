@@ -51,6 +51,8 @@ enum Command {
     },
     /// Mint a one-time pairing code for chat channels (Telegram etc).
     Pair,
+    /// Print the web UI URL with an embedded login token.
+    Open,
 }
 
 fn main() -> Result<()> {
@@ -74,8 +76,21 @@ fn main() -> Result<()> {
             Command::Render => cmd_render(),
             Command::Memory { action } => cmd_memory(action).await,
             Command::Pair => cmd_pair().await,
+            Command::Open => cmd_open(),
         }
     })
+}
+
+fn cmd_open() -> Result<()> {
+    let home = Home::resolve();
+    let token = std::fs::read_to_string(home.root().join("token"))
+        .context("no token — run `revenant init`")?
+        .trim()
+        .to_string();
+    let url = std::env::var("REVENANT_URL").unwrap_or_else(|_| format!("http://{DEFAULT_BIND}"));
+    println!("{url}/#token={token}");
+    println!("\nopen that URL in a browser (the token pre-fills the login).");
+    Ok(())
 }
 
 async fn cmd_pair() -> Result<()> {

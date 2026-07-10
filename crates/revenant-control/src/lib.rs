@@ -46,8 +46,14 @@ impl AppState {
     }
 }
 
+#[derive(rust_embed::Embed)]
+#[folder = "../../web/dist"]
+struct WebAssets;
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // /v1/* requires the bearer token; static UI assets do not (the browser
+    // needs the HTML/JS before it can authenticate).
+    let api = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/events", get(events))
         .route("/v1/sessions", get(sessions_list).post(session_create))
@@ -56,10 +62,35 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/approvals/:id/decision", post(approval_decide))
         .route("/v1/skills", get(skills_list))
         .route("/v1/spend", get(spend))
+        .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
         .route("/v1/channels/pairings", post(pairing_create))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state)
+        .with_state(state);
+
+    api.fallback(serve_ui)
+}
+
+/// Serve an embedded UI asset, falling back to index.html for SPA routes.
+async fn serve_ui(uri: axum::http::Uri) -> axum::response::Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    let asset = WebAssets::get(path).or_else(|| WebAssets::get("index.html"));
+    match asset {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                [(axum::http::header::CONTENT_TYPE, mime.as_ref())],
+                content.data,
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            "web UI not embedded (build web/ first)",
+        )
+            .into_response(),
+    }
 }
 
 async fn auth(
@@ -300,6 +331,19 @@ async fn pairing_create(State(state): State<AppState>) -> Result<Json<serde_json
 fn getrandom_fill(buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")?.read_exact(buf)
+}
+
+async fn memory_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    match &state.manager.runtime().memory {
+        Some(memory) => {
+            let status = memory.status().await?;
+            Ok(Json(serde_json::to_value(status).unwrap_or_default()))
+        }
+        None => Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "memory engine disabled".into(),
+        }),
+    }
 }
 
 async fn gateway_status(State(state): State<AppState>) -> Json<serde_json::Value> {
