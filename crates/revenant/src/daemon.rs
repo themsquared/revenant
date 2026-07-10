@@ -66,6 +66,12 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         Err(err) => tracing::warn!("skill scan failed: {err:#}"),
     }
     let tools = ToolRegistry::builtin(home, skills.clone());
+    let agents = Arc::new(revenant_agent::AgentRegistry::new(home.agents_dir()));
+    match agents.scan() {
+        Ok(n) if n > 0 => tracing::info!("indexed {n} subagent definitions"),
+        Ok(_) => {}
+        Err(err) => tracing::warn!("subagent scan failed: {err:#}"),
+    }
     let llm = revenant_llm::LlmClient::new(endpoint.clone());
 
     // Memory engine: fail-open. A missing model or broken vault must not
@@ -99,6 +105,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         approvals,
         events,
         skills,
+        agents,
         home: home.clone(),
         memory,
         max_history: cfg.agent.max_history_messages,
@@ -165,6 +172,7 @@ pub async fn cmd_up() -> Result<()> {
         token,
         default_tier,
         revenant_llm::LlmClient::new(daemon.llm_endpoint.clone()),
+        home.clone(),
     );
 
     let listener = tokio::net::TcpListener::bind(crate::DEFAULT_BIND)

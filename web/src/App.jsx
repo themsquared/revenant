@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api, eventStream, getToken, setToken } from './api.js'
 
-const TABS = ['chat', 'approvals', 'skills', 'tools', 'subagents', 'spend', 'memory', 'status']
+const TABS = ['chat', 'approvals', 'skills', 'tools', 'subagents', 'spend', 'memory', 'settings']
 
 export default function App() {
   const [authed, setAuthed] = useState(false)
@@ -51,7 +51,7 @@ export default function App() {
         {tab === 'subagents' && <Subagents />}
         {tab === 'spend' && <Spend />}
         {tab === 'memory' && <Memory />}
-        {tab === 'status' && <Status />}
+        {tab === 'settings' && <Settings />}
       </main>
     </div>
   )
@@ -409,14 +409,31 @@ function Tools() {
   )
 }
 
-// ---- subagents ----
+// ---- subagents: editable roster + run history ----
+
+const BLANK_AGENT = {
+  name: '',
+  description: '',
+  tier: 'fast',
+  tools: [],
+  skills: [],
+  directive: '',
+}
 
 function Subagents() {
+  const [defs, setDefs] = useState([])
   const [subs, setSubs] = useState([])
   const [live, setLive] = useState([])
-  const refresh = () => api.subagents().then((r) => setSubs(r.subagents))
+  const [editing, setEditing] = useState(null) // AgentDef being edited, or null
+  const [allTools, setAllTools] = useState([])
+
+  const refreshDefs = () => api.agents().then((r) => setDefs(r.agents))
+  const refreshRuns = () => api.subagents().then((r) => setSubs(r.subagents))
+
   useEffect(() => {
-    refresh()
+    refreshDefs()
+    refreshRuns()
+    api.tools().then((r) => setAllTools(r.tools.map((t) => t.name)))
     const source = eventStream((type, event) => {
       if (type === 'subagent_spawned') {
         setLive((prev) => [
@@ -425,42 +442,90 @@ function Subagents() {
         ])
       }
       if (type === 'subagent_finished') {
-        setLive((prev) =>
-          prev.map((s) =>
-            s.child_session === event.child_session ? { ...s, done: true, ok: event.ok } : s
-          )
-        )
-        setTimeout(refresh, 500)
+        setLive((prev) => prev.filter((s) => s.child_session !== event.child_session))
+        setTimeout(refreshRuns, 500)
       }
     })
-    const timer = setInterval(refresh, 6000)
-    return () => {
-      source.close()
-      clearInterval(timer)
-    }
+    return () => source.close()
   }, [])
+
+  const openEditor = async (name) => {
+    if (name) {
+      const def = await api.agent(name)
+      setEditing({ ...BLANK_AGENT, ...def, tools: def.tools || [], skills: def.skills || [] })
+    } else {
+      setEditing({ ...BLANK_AGENT })
+    }
+  }
+
+  const save = async () => {
+    if (!editing.name.trim() || !editing.directive.trim()) return
+    await api.saveAgent(editing.name, {
+      description: editing.description,
+      tier: editing.tier,
+      tools: editing.tools,
+      skills: editing.skills,
+      directive: editing.directive,
+    })
+    setEditing(null)
+    refreshDefs()
+  }
+
+  if (editing) {
+    return (
+      <AgentEditor
+        agent={editing}
+        setAgent={setEditing}
+        allTools={allTools}
+        onSave={save}
+        onCancel={() => setEditing(null)}
+      />
+    )
+  }
 
   return (
     <div className="list">
-      <div className="card-meta">
-        the agent delegates self-contained subtasks to focused child agents
-        (cheaper tier, one level deep). Live spawns appear here.
-      </div>
-      {live
-        .filter((s) => !s.done)
-        .map((s) => (
-          <div key={s.child_session} className="card running">
-            <div className="card-title">
-              <span className="spinner">◍</span> #{s.child_session} · {s.tier}
-              <small> from #{s.parent_session}</small>
-            </div>
-            <div>{s.task}</div>
-          </div>
-        ))}
-      {subs.length === 0 && live.length === 0 && (
-        <div className="empty">
-          no subagents yet — ask the agent to "use a subagent to research X"
+      <div className="row-between">
+        <div className="card-meta">
+          named subagents the main agent can delegate to. Revenant can draft
+          these; you own the directive, tools, tier, and skills. Files live in
+          ~/.revenant/agents/*.md.
         </div>
+        <button className="newchat" style={{ width: 'auto' }} onClick={() => openEditor(null)}>
+          + define agent
+        </button>
+      </div>
+
+      <div className="section-label">defined agents</div>
+      {defs.length === 0 && <div className="empty">none defined yet</div>}
+      {defs.map((a) => (
+        <div key={a.name} className="card clickable" onClick={() => openEditor(a.name)}>
+          <div className="card-title">
+            {a.name}
+            <span className="pill sm" style={{ background: TIER_COLOR.ReadOnly, marginLeft: 8 }}>
+              {a.tier || 'fast'}
+            </span>
+          </div>
+          <div>{a.description}</div>
+          <div className="card-meta">
+            tools: {a.tools?.length ? a.tools.join(', ') : 'all (inherited)'}
+            {a.skills?.length ? ` · skills: ${a.skills.join(', ')}` : ''}
+          </div>
+        </div>
+      ))}
+
+      <div className="section-label">recent runs</div>
+      {live.map((s) => (
+        <div key={s.child_session} className="card running">
+          <div className="card-title">
+            <span className="spinner">◍</span> #{s.child_session} · {s.tier}
+            <small> from #{s.parent_session}</small>
+          </div>
+          <div>{s.task}</div>
+        </div>
+      ))}
+      {subs.length === 0 && live.length === 0 && (
+        <div className="empty">no runs yet — ask the agent to delegate something</div>
       )}
       {subs.map((s) => (
         <div key={s.id} className="card">
@@ -469,11 +534,78 @@ function Subagents() {
             <small> from #{s.parent_session} · {s.messages} msgs</small>
           </div>
           <div>{s.task}</div>
-          <div className="card-meta">
-            {new Date(s.created_at * 1000).toLocaleString()}
-          </div>
+          <div className="card-meta">{new Date(s.created_at * 1000).toLocaleString()}</div>
         </div>
       ))}
+    </div>
+  )
+}
+
+function AgentEditor({ agent, setAgent, allTools, onSave, onCancel }) {
+  const toggleTool = (name) => {
+    setAgent((a) => ({
+      ...a,
+      tools: a.tools.includes(name)
+        ? a.tools.filter((t) => t !== name)
+        : [...a.tools, name],
+    }))
+  }
+  return (
+    <div className="list">
+      <div className="section-label">
+        {agent.name ? `edit ${agent.name}` : 'new subagent'}
+      </div>
+      <label className="field">
+        <span>name</span>
+        <input
+          value={agent.name}
+          onChange={(e) => setAgent({ ...agent, name: e.target.value })}
+          placeholder="researcher"
+        />
+      </label>
+      <label className="field">
+        <span>description</span>
+        <input
+          value={agent.description}
+          onChange={(e) => setAgent({ ...agent, description: e.target.value })}
+          placeholder="what this agent is for (shown to the main agent)"
+        />
+      </label>
+      <label className="field">
+        <span>tier</span>
+        <select value={agent.tier || 'fast'} onChange={(e) => setAgent({ ...agent, tier: e.target.value })}>
+          {['fast', 'balanced', 'deep', 'local'].map((t) => (
+            <option key={t} value={t}>{t}</option>
+          ))}
+        </select>
+      </label>
+      <div className="field">
+        <span>tools (none = inherit all)</span>
+        <div className="tool-picker">
+          {allTools.map((t) => (
+            <button
+              key={t}
+              className={agent.tools.includes(t) ? 'chip on' : 'chip'}
+              onClick={() => toggleTool(t)}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+      </div>
+      <label className="field">
+        <span>directive (the agent's instructions)</span>
+        <textarea
+          rows={10}
+          value={agent.directive}
+          onChange={(e) => setAgent({ ...agent, directive: e.target.value })}
+          placeholder="You are a focused research subagent. Given a topic, search memory and files…"
+        />
+      </label>
+      <div className="card-actions">
+        <button className="ok" onClick={onSave}>save</button>
+        <button className="no" onClick={onCancel}>cancel</button>
+      </div>
     </div>
   )
 }
@@ -506,39 +638,82 @@ function Memory() {
   )
 }
 
-// ---- status ----
+// ---- settings: gateway, models/tiers, keys, health ----
 
-function Status() {
+function Settings() {
+  const [config, setConfig] = useState(null)
   const [health, setHealth] = useState(null)
   useEffect(() => {
-    const refresh = () => api.health().then(setHealth)
+    api.config().then(setConfig).catch(() => setConfig(null))
+    const refresh = () => api.health().then(setHealth).catch(() => {})
     refresh()
     const timer = setInterval(refresh, 5000)
     return () => clearInterval(timer)
   }, [])
-  if (!health) return <div className="empty">loading…</div>
+  if (!config) return <div className="empty">loading…</div>
+
   return (
     <div className="list">
       <div className="card">
-        <div className="card-title">daemon</div>
+        <div className="card-title">gateway (agentgateway, supervised)</div>
         <table>
           <tbody>
+            <tr><td>mode</td><td>{config.gateway.mode}</td></tr>
+            <tr><td>version</td><td>{config.gateway.version}</td></tr>
+            <tr><td>llm port</td><td>{config.gateway.llm_port}</td></tr>
             <tr>
-              <td>version</td>
-              <td>{health.version}</td>
-            </tr>
-            <tr>
-              <td>gateway</td>
-              <td className={health.gateway_healthy ? 'good' : 'bad'}>
-                {health.gateway_healthy ? '✓ healthy' : '✗ unreachable'}
+              <td>health</td>
+              <td className={health?.gateway_healthy ? 'good' : 'bad'}>
+                {health?.gateway_healthy ? '✓ healthy' : '✗ unreachable'}
               </td>
             </tr>
           </tbody>
         </table>
         <div className="card-meta">
-          gateway admin UI: <a href="http://localhost:15000/ui" target="_blank" rel="noreferrer">localhost:15000/ui</a>
+          admin UI: <a href="http://localhost:15000/ui" target="_blank" rel="noreferrer">localhost:15000/ui</a>
         </div>
       </div>
+
+      <div className="section-label">model tiers → provider routing</div>
+      <div className="card-meta">
+        the harness sends a tier alias; agentgateway routes it to the provider
+        models below (top = primary, rest = failover). Default tier:{' '}
+        <b>{config.default_tier}</b>. Edit tiers in ~/.revenant/config.toml.
+      </div>
+      {Object.entries(config.tiers).map(([name, tier]) => (
+        <div key={name} className="card">
+          <div className="card-title">
+            {name}
+            {tier.failover && <span className="pill sm" style={{ background: '#60a5fa', marginLeft: 8 }}>failover</span>}
+          </div>
+          {tier.targets.map((t, i) => (
+            <div key={i} className="tool-row">
+              <b>{t.provider}</b>
+              <span>{t.model}</span>
+              <span className={t.key_present ? 'good' : 'bad'}>
+                {t.api_key_env ? (t.key_present ? `✓ ${t.api_key_env}` : `✗ ${t.api_key_env} missing`) : 'no key needed'}
+              </span>
+            </div>
+          ))}
+        </div>
+      ))}
+
+      <div className="section-label">API keys</div>
+      <div className="card">
+        <div className="card-meta">
+          keys live only in ~/.revenant/secrets.env and are injected into the
+          gateway process — never stored by revenant, never sent to the browser.
+        </div>
+        {config.keys_present.length === 0 && <div className="card-meta">none set</div>}
+        {config.keys_present.map((k) => (
+          <div key={k} className="tool-row">
+            <b className="good">✓ {k}</b>
+            <span>set</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="card-meta">embedder: {config.embedder}</div>
     </div>
   )
 }

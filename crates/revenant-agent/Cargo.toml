@@ -13,6 +13,8 @@ revenant-skills = { workspace = true }
 revenant-security = { workspace = true }
 revenant-memory = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

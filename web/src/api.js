@@ -46,6 +46,10 @@ export const api = {
   skills: () => request('GET', '/v1/skills'),
   tools: () => request('GET', '/v1/tools'),
   subagents: () => request('GET', '/v1/subagents'),
+  agents: () => request('GET', '/v1/agents'),
+  agent: (name) => request('GET', `/v1/agents/${encodeURIComponent(name)}`),
+  saveAgent: (name, def) => request('PUT', `/v1/agents/${encodeURIComponent(name)}`, def),
+  config: () => request('GET', '/v1/config'),
   gateway: () => request('GET', '/v1/gateway/status'),
   memoryStatus: () => request('GET', '/v1/memory/status'),
 }

@@ -50,6 +50,9 @@ impl Home {
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join("skills")
     }
+    pub fn agents_dir(&self) -> PathBuf {
+        self.root.join("agents")
+    }
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }

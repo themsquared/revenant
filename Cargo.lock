@@ -2174,7 +2174,9 @@ dependencies = [
  "revenant-skills",
  "revenant-store",
  "revenant-tools",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "tracing",
 ]

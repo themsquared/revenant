@@ -26,6 +26,7 @@ pub struct AppState {
     pub token: String,
     pub default_tier: Tier,
     pub gateway_probe: revenant_llm::LlmClient,
+    pub home: revenant_core::home::Home,
     event_seq: Arc<AtomicU64>,
 }
 
@@ -35,12 +36,14 @@ impl AppState {
         token: String,
         default_tier: Tier,
         gateway_probe: revenant_llm::LlmClient,
+        home: revenant_core::home::Home,
     ) -> Self {
         AppState {
             manager,
             token,
             default_tier,
             gateway_probe,
+            home,
             event_seq: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -63,6 +66,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/skills", get(skills_list))
         .route("/v1/tools", get(tools_list))
         .route("/v1/subagents", get(subagents_list))
+        .route("/v1/agents", get(agents_list))
+        .route("/v1/agents/:name", get(agent_get).put(agent_put))
+        .route("/v1/config", get(config_get))
         .route("/v1/spend", get(spend))
         .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
@@ -335,6 +341,126 @@ async fn pairing_create(State(state): State<AppState>) -> Result<Json<serde_json
 fn getrandom_fill(buf: &mut [u8]) -> std::io::Result<()> {
     use std::io::Read;
     std::fs::File::open("/dev/urandom")?.read_exact(buf)
+}
+
+async fn agents_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let agents: Vec<_> = state
+        .manager
+        .runtime()
+        .agents
+        .list()
+        .into_iter()
+        .map(|a| {
+            json!({
+                "name": a.name,
+                "description": a.description,
+                "tier": a.tier,
+                "tools": a.tools,
+                "skills": a.skills,
+            })
+        })
+        .collect();
+    Json(json!({ "agents": agents }))
+}
+
+async fn agent_get(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let def = state
+        .manager
+        .runtime()
+        .agents
+        .get(&name)
+        .ok_or_else(|| ApiError { status: StatusCode::NOT_FOUND, message: format!("no agent '{name}'") })?;
+    Ok(Json(json!({
+        "name": def.name,
+        "description": def.description,
+        "tier": def.tier,
+        "tools": def.tools,
+        "skills": def.skills,
+        "directive": def.directive,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AgentBody {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tier: Option<String>,
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+    directive: String,
+}
+
+async fn agent_put(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<AgentBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let def = revenant_agent::AgentDef {
+        name,
+        description: body.description,
+        tier: body.tier,
+        tools: body.tools,
+        skills: body.skills,
+        directive: body.directive,
+    };
+    state.manager.runtime().agents.write(&def)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Redacted gateway/config view: tiers + models + failover, API-key
+/// PRESENCE (never values), gateway info, embedder. Keys are file-only.
+async fn config_get(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let raw = std::fs::read_to_string(state.home.config_path())
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("read config: {e}") })?;
+    let cfg = revenant_core::config::Config::from_toml(&raw)
+        .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("parse config: {e}") })?;
+
+    // Which key env vars are present in secrets.env (names only).
+    let present: std::collections::HashSet<String> = std::fs::read_to_string(state.home.secrets_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim().to_string()))
+        .collect();
+
+    let tiers: serde_json::Map<String, serde_json::Value> = cfg
+        .tiers
+        .iter()
+        .map(|(name, tier)| {
+            let targets: Vec<_> = tier
+                .targets
+                .iter()
+                .map(|t| {
+                    json!({
+                        "provider": format!("{:?}", t.provider).to_lowercase(),
+                        "model": t.model,
+                        "api_key_env": t.api_key_env,
+                        "key_present": t.api_key_env.as_ref().map(|e| present.contains(e)).unwrap_or(true),
+                        "base_url": t.base_url,
+                    })
+                })
+                .collect();
+            (name.clone(), json!({ "targets": targets, "failover": tier.targets.len() > 1 }))
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "gateway": {
+            "mode": format!("{:?}", cfg.gateway.mode).to_lowercase(),
+            "version": cfg.gateway.version,
+            "llm_port": cfg.gateway.llm_port,
+            "endpoint": cfg.gateway.endpoint,
+        },
+        "tiers": tiers,
+        "default_tier": cfg.agent.default_tier,
+        "embedder": format!("{:?}", cfg.memory.embedder).to_lowercase(),
+        "keys_present": present.into_iter().collect::<Vec<_>>(),
+    })))
 }
 
 async fn tools_list(State(state): State<AppState>) -> Json<serde_json::Value> {
