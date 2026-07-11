@@ -283,6 +283,20 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// Filesystem-safe slug for an adopted artifact's install path.
+fn net_slug(title: &str) -> String {
+    let s: String = title
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() {
+        "artifact".to_string()
+    } else {
+        s
+    }
+}
+
 async fn cmd_net(action: Vec<String>) -> Result<()> {
     let home = Home::resolve();
     let cfg = load_config(&home).ok();
@@ -394,7 +408,54 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 println!("wrote payload to {out}");
             }
         }
-        other => bail!("unknown net command '{other}' (id|register|peers|publish|list|pull|sync|verify)"),
+        "adopt" => {
+            // Pull (signature + hash verified inside client.pull), install the
+            // capability into the local box, and attest the adoption — the
+            // horde teaching itself. Nothing is trusted until it verifies here.
+            let aid = action.get(1).context("usage: net adopt <id>")?;
+            let artifact = client.pull(aid).await?;
+            let slug = net_slug(&artifact.title);
+            let payload = artifact.payload()?;
+            let dest = match artifact.kind {
+                revenant_net::ArtifactKind::Skill => {
+                    let dir = home.skills_dir().join(&slug);
+                    std::fs::create_dir_all(&dir)?;
+                    let p = dir.join("SKILL.md");
+                    std::fs::write(&p, &payload)?;
+                    p
+                }
+                revenant_net::ArtifactKind::Plugin => {
+                    std::fs::create_dir_all(home.plugins_dir())?;
+                    let p = home.plugins_dir().join(format!("{slug}.wasm"));
+                    std::fs::write(&p, &payload)?;
+                    p
+                }
+                revenant_net::ArtifactKind::Signal => {
+                    let p = home.root().join("signals.log");
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
+                    writeln!(f, "{}\t{}", artifact.title, String::from_utf8_lossy(&payload))?;
+                    p
+                }
+                revenant_net::ArtifactKind::Improvement => {
+                    // Code changes are never auto-applied — saved for review.
+                    let dir = home.root().join("adopted-improvements");
+                    std::fs::create_dir_all(&dir)?;
+                    let p = dir.join(format!("{slug}.patch"));
+                    std::fs::write(&p, &payload)?;
+                    p
+                }
+            };
+            client.attest(aid, &id.id(), true).await?;
+            println!(
+                "adopted '{}' [{:?}] by {} → {} · attested to the network",
+                artifact.title,
+                artifact.kind,
+                &artifact.author[..8],
+                dest.display(),
+            );
+        }
+        other => bail!("unknown net command '{other}' (id|register|peers|publish|list|pull|adopt)"),
     }
     Ok(())
 }
