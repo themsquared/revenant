@@ -193,6 +193,9 @@ enum Command {
         /// install | uninstall
         action: String,
     },
+    /// Observe the eval scorecard and plan self-improvement candidates (the
+    /// Ascension loop's safe front half — never edits anything).
+    Ascend,
     /// Run the eval scorecard against the live daemon (proves the numbers).
     Eval {
         /// Directory of `*.toml` task files. Omit to use the embedded suite.
@@ -236,8 +239,54 @@ fn main() -> Result<()> {
                 other => bail!("usage: revenant service install|uninstall (got '{other}')"),
             },
             Command::Eval { suite, json, tag } => cmd_eval(suite, json, tag).await,
+            Command::Ascend => cmd_ascend().await,
         }
     })
+}
+
+async fn cmd_ascend() -> Result<()> {
+    let home = Home::resolve();
+    let cfg = load_config(&home)?;
+    let asc = &cfg.ascension;
+    let client = revenant_client::Client::from_env(&home)?;
+    client
+        .health()
+        .await
+        .context("ascend needs a running daemon — start it with `revenant up`")?;
+
+    println!("🜁 Ascension — observe & plan");
+    println!(
+        "   engine: {} · autonomy: {} · bar: {} proof-runs, >= {:.0}% metric gain, zero regressions",
+        if asc.enabled { "ENABLED" } else { "observe-only (disabled)" },
+        asc.autonomy,
+        asc.proof_runs,
+        asc.min_gain_pct,
+    );
+    println!("   warded paths (never auto-edited): {}", asc.denylist.join(", "));
+    println!();
+
+    // Observe: run the live scorecard, then detect candidates.
+    eprintln!("running eval scorecard to observe current state…");
+    let suite = revenant_evals::default_suite();
+    let report = revenant_evals::run_suite(&client, &suite).await?;
+    println!("{}", report.markdown());
+
+    let candidates = revenant_ascension::detect(&report);
+    if candidates.is_empty() {
+        println!("\nNo improvement candidates — the scorecard is clean. Nothing to raise.");
+        return Ok(());
+    }
+    println!("\n## Candidates (most promising first)\n");
+    for (i, c) in candidates.iter().enumerate() {
+        println!("{}. [{:?}] `{}` — {}", i + 1, c.kind, c.target, c.detail);
+    }
+    println!(
+        "\nNext: the actuator would take each candidate into an ephemeral worktree, \
+         make a bounded change, and only open a `{}`-namespace PR if it clears the bar. \
+         (Autonomous run is gated behind `ascension.enabled`.)",
+        asc.staging_prefix.trim_end_matches('/'),
+    );
+    Ok(())
 }
 
 async fn cmd_eval(

@@ -18,6 +18,9 @@ pub struct Config {
     /// Global gateway-enforced spend cap (the intelligent-spending ceiling).
     #[serde(default)]
     pub spending: SpendingConfig,
+    /// Self-improvement loop (opens eval-proven PRs; off by default).
+    #[serde(default)]
+    pub ascension: AscensionConfig,
     /// MCP servers multiplexed behind the gateway (the plugin bus).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServer>,
@@ -136,6 +139,85 @@ fn default_budget_amount() -> u64 {
 }
 fn default_budget_interval() -> String {
     "24h".to_string()
+}
+
+/// The Ascension loop: a revenant that betters itself and offers eval-proven
+/// improvements back as PRs. Off by default. The `autonomy` dial governs the
+/// only outward-facing step (opening a PR); the engine can never merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AscensionConfig {
+    /// Master switch. When false, `revenant ascend` only ever observes.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Outward-facing autonomy for a proven change: `propose` (write branch
+    /// locally, human opens PR) | `staging` (auto-open PR into staging
+    /// namespace, human promotes) | `upstream` (auto-open PR to base branch).
+    #[serde(default = "default_autonomy")]
+    pub autonomy: String,
+    /// Branch namespace for staging-mode PRs.
+    #[serde(default = "default_staging_prefix")]
+    pub staging_prefix: String,
+    /// The branch proven changes are measured against and PR'd toward.
+    #[serde(default = "default_base_branch")]
+    pub base_branch: String,
+    /// Hard cap on machine-authored PRs per day.
+    #[serde(default = "default_max_prs")]
+    pub max_prs_per_day: u32,
+    /// How many times the eval suite must confirm the win (noise robustness).
+    #[serde(default = "default_proof_runs")]
+    pub proof_runs: usize,
+    /// Minimum mean improvement for the metric acceptance path (percent).
+    #[serde(default = "default_min_gain")]
+    pub min_gain_pct: f64,
+    /// Path prefixes the self-improver may never modify (the wards).
+    #[serde(default = "default_ascension_denylist")]
+    pub denylist: Vec<String>,
+}
+
+impl Default for AscensionConfig {
+    fn default() -> Self {
+        AscensionConfig {
+            enabled: false,
+            autonomy: default_autonomy(),
+            staging_prefix: default_staging_prefix(),
+            base_branch: default_base_branch(),
+            max_prs_per_day: default_max_prs(),
+            proof_runs: default_proof_runs(),
+            min_gain_pct: default_min_gain(),
+            denylist: default_ascension_denylist(),
+        }
+    }
+}
+
+fn default_autonomy() -> String {
+    "staging".to_string()
+}
+fn default_staging_prefix() -> String {
+    "self-improve/".to_string()
+}
+fn default_base_branch() -> String {
+    "main".to_string()
+}
+fn default_max_prs() -> u32 {
+    3
+}
+fn default_proof_runs() -> usize {
+    3
+}
+fn default_min_gain() -> f64 {
+    5.0
+}
+/// The wards guard themselves: security, gateway key handling, the approval
+/// broker, the WASM sandbox, the Ascension engine, and CI are off-limits to
+/// autonomous change.
+fn default_ascension_denylist() -> Vec<String> {
+    vec![
+        "crates/revenant-security".into(),
+        "crates/revenant-gateway".into(),
+        "crates/revenant-wasm".into(),
+        "crates/revenant-ascension".into(),
+        ".github/".into(),
+    ]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -483,6 +565,7 @@ impl Config {
             channels: ChannelsConfig::default(),
             privacy: PrivacyConfig::default(),
             spending: SpendingConfig::default(),
+            ascension: AscensionConfig::default(),
             mcp: Vec::new(),
             a2a_agents: Vec::new(),
             tiers,
