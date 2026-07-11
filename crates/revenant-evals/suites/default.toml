@@ -1,0 +1,46 @@
+# revenant default eval suite — deterministic, provider-agnostic, runs out of
+# the box against a live daemon (`revenant eval`). Each task grades the real
+# turn: latency, tokens, and tools are captured as ground truth from the
+# gateway. Add your own `*.toml` files and point `--suite <dir>` at them; the
+# same task shape can be driven against any harness for a head-to-head.
+
+[[task]]
+id = "arithmetic"
+prompt = "Compute 17 * 23. Reply with only the number, nothing else."
+tier = "fast"
+tags = ["speed", "capability"]
+grade = { contains = ["391"] }
+
+[[task]]
+id = "reasoning-trap"
+prompt = "A farmer has 12 sheep. All but 7 run away. How many sheep remain? Reply with only the number."
+tier = "fast"
+tags = ["reasoning"]
+grade = { contains = ["7"], not_contains = ["5"] }
+
+[[task]]
+id = "format-following"
+prompt = "List the first three prime numbers as a comma-separated list and nothing else."
+tier = "fast"
+tags = ["instruction-following"]
+grade = { regex = '2\s*,\s*3\s*,\s*5' }
+
+[[task]]
+id = "memory-recall"
+prompt = "What is my project codename?"
+setup = ["My project codename is Nightjar. Please acknowledge."]
+tags = ["memory"]
+grade = { contains = ["Nightjar"] }
+
+[[task]]
+id = "tool-memory-save"
+prompt = "Save this durable fact to memory using your tools: my lucky number is 42. Then confirm you saved it."
+tags = ["tools"]
+grade = { min_tools = 1, contains_any = ["42", "saved", "memory"] }
+
+[[task]]
+id = "capability-explain"
+prompt = "In exactly one sentence, explain what a reverse proxy does."
+tier = "balanced"
+tags = ["capability"]
+grade = { contains_any = ["client", "server", "forward", "behalf", "backend"] }
