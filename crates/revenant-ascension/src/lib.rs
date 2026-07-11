@@ -23,6 +23,7 @@ use std::process::Command;
 pub mod config;
 pub mod offer;
 pub mod review;
+pub mod run;
 pub use config::AscensionConfig;
 
 // --- observe -------------------------------------------------------------

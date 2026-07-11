@@ -193,9 +193,15 @@ enum Command {
         /// install | uninstall
         action: String,
     },
-    /// Observe the eval scorecard and plan self-improvement candidates (the
-    /// Ascension loop's safe front half — never edits anything).
-    Ascend,
+    /// Observe the eval scorecard and plan self-improvement candidates. With
+    /// --run, drive the top candidate through the full actuator (isolate →
+    /// implement → prove → review → offer). PRs are dry-run unless --live.
+    Ascend {
+        #[arg(long)]
+        run: bool,
+        #[arg(long)]
+        live: bool,
+    },
     /// Run a Necropolis directory server (the horde's muster point).
     Necropolis {
         #[arg(long, default_value_t = 7720)]
@@ -204,7 +210,7 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
-    /// Revenant-only network: register | peers | publish <kind> <file> | list [kind] | pull <id>
+    /// Revenant-only network: register | peers | publish <kind> <file> | list [kind] | pull <id> | sync <peer-url> | verify
     Net {
         #[arg(num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]
         action: Vec<String>,
@@ -252,7 +258,7 @@ fn main() -> Result<()> {
                 other => bail!("usage: revenant service install|uninstall (got '{other}')"),
             },
             Command::Eval { suite, json, tag } => cmd_eval(suite, json, tag).await,
-            Command::Ascend => cmd_ascend().await,
+            Command::Ascend { run, live } => cmd_ascend(run, live).await,
             Command::Necropolis { port, db } => cmd_necropolis(port, db).await,
             Command::Net { action } => cmd_net(action).await,
         }
@@ -281,13 +287,54 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
     let home = Home::resolve();
     let cfg = load_config(&home).ok();
     let id = revenant_net::Identity::load_or_create(&home.identity_dir())?;
+    let verb = action.first().map(String::as_str).unwrap_or("");
+
+    // Local-ledger verbs need no muster URL — they operate on this node's own
+    // durable Necropolis (or, for `sync`, an explicit peer given as an arg).
+    let local_db = home.root().join("necropolis.db");
+    match verb {
+        "verify" => {
+            let dir = revenant_net::Directory::open(&local_db.to_string_lossy())
+                .context("opening local Necropolis ledger")?;
+            // Directory::open re-verifies the entire hash chain on load; reaching
+            // here means the audit passed.
+            println!(
+                "🜁 ledger VERIFIED — {} entries, head seq {}  ({})",
+                dir.ledger_len()?,
+                dir.head_seq()?,
+                local_db.display()
+            );
+            return Ok(());
+        }
+        "sync" => {
+            let peer_url = action.get(1).context("usage: net sync <peer-url>")?;
+            let mut dir = revenant_net::Directory::open(&local_db.to_string_lossy())
+                .context("opening local Necropolis ledger")?;
+            let peer = revenant_net::NecropolisClient::new(peer_url);
+            let peer_head = peer.ledger_head().await.context("reading peer ledger head")?;
+            let since = dir.head_seq()?;
+            let incoming = peer.ledger_since(since).await.context("pulling peer ledger")?;
+            let fetched = incoming.len();
+            let applied = dir
+                .apply_remote(&incoming)
+                .context("applying peer entries (chain re-verified locally)")?;
+            println!(
+                "🜁 synced from {peer_url}\n   peer head: seq {} · local head: seq {}\n   fetched {fetched}, applied {applied} new entr{} — every hash re-verified on this box",
+                peer_head.seq,
+                dir.head_seq()?,
+                if applied == 1 { "y" } else { "ies" },
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let url = std::env::var("REVENANT_NECROPOLIS")
         .ok()
         .or_else(|| cfg.as_ref().and_then(|c| c.network.necropolis_url.clone()))
         .context("no Necropolis URL — set REVENANT_NECROPOLIS or [network].necropolis_url")?;
     let client = revenant_net::NecropolisClient::new(&url);
 
-    let verb = action.first().map(String::as_str).unwrap_or("");
     match verb {
         "id" => println!("{} (fingerprint {})", id.id(), id.fingerprint()),
         "register" => {
@@ -347,15 +394,15 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 println!("wrote payload to {out}");
             }
         }
-        other => bail!("unknown net command '{other}' (id|register|peers|publish|list|pull)"),
+        other => bail!("unknown net command '{other}' (id|register|peers|publish|list|pull|sync|verify)"),
     }
     Ok(())
 }
 
-async fn cmd_ascend() -> Result<()> {
+async fn cmd_ascend(run: bool, live: bool) -> Result<()> {
     let home = Home::resolve();
     let cfg = load_config(&home)?;
-    let asc = &cfg.ascension;
+    let asc = cfg.ascension.clone();
     let client = revenant_client::Client::from_env(&home)?;
     client
         .health()
@@ -364,13 +411,11 @@ async fn cmd_ascend() -> Result<()> {
 
     println!("🜁 Ascension — observe & plan");
     println!(
-        "   engine: {} · autonomy: {} · bar: {} proof-runs, >= {:.0}% metric gain, zero regressions",
-        if asc.enabled { "ENABLED" } else { "observe-only (disabled)" },
+        "   autonomy: {} · reviewer: {} tier · warded: {}",
         asc.autonomy,
-        asc.proof_runs,
-        asc.min_gain_pct,
+        asc.reviewer_tier,
+        asc.denylist.join(", "),
     );
-    println!("   warded paths (never auto-edited): {}", asc.denylist.join(", "));
     println!();
 
     // Observe: run the live scorecard, then detect candidates.
@@ -388,12 +433,52 @@ async fn cmd_ascend() -> Result<()> {
     for (i, c) in candidates.iter().enumerate() {
         println!("{}. [{:?}] `{}` — {}", i + 1, c.kind, c.target, c.detail);
     }
+
+    if !run {
+        println!("\n(observe-only — pass --run to drive the top candidate through the actuator.)");
+        return Ok(());
+    }
+
+    // The repository the actuator edits is the current directory.
+    let repo = std::env::current_dir()?;
+    if !repo.join(".git").exists() {
+        bail!("`revenant ascend --run` must be run from the revenant git repo (cwd has no .git)");
+    }
+    let top = candidates.into_iter().next().unwrap();
     println!(
-        "\nNext: the actuator would take each candidate into an ephemeral worktree, \
-         make a bounded change, and only open a `{}`-namespace PR if it clears the bar. \
-         (Autonomous run is gated behind `ascension.enabled`.)",
-        asc.staging_prefix.trim_end_matches('/'),
+        "\n🜁 ACTUATOR — driving top candidate `{}` in an isolated worktree{}…\n",
+        top.target,
+        if live { " (LIVE — will open a real PR if approved)" } else { " (dry-run offer)" },
     );
+    let run_cfg = revenant_ascension::run::RunConfig {
+        coder_tier: asc.reviewer_tier.clone(),
+        reviewer_tier: asc.reviewer_tier.clone(),
+        base_branch: asc.base_branch.clone(),
+        staging_prefix: asc.staging_prefix.clone(),
+        max_prs_per_day: asc.max_prs_per_day,
+        denylist: asc.denylist.clone(),
+        max_repair: 3,
+        live,
+    };
+    let today = (now_ts() / 86_400).to_string();
+    let outcome =
+        revenant_ascension::run::run_candidate(&client, &repo, top, &run_cfg, home.root(), &today)
+            .await?;
+
+    println!("── actuator outcome ──");
+    println!(
+        "build={} test={} clippy={} · files={:?}",
+        outcome.build_ok, outcome.test_ok, outcome.clippy_ok, outcome.changed_files
+    );
+    if let Some(approved) = outcome.reviewer_approved {
+        println!("reviewer approved: {approved}");
+    }
+    if let Some(offer) = &outcome.offer {
+        println!("offer: {offer}");
+    }
+    for n in &outcome.notes {
+        println!("· {n}");
+    }
     Ok(())
 }
 

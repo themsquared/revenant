@@ -15,5 +15,7 @@ pub mod ledger;
 pub mod necropolis;
 
 pub use artifact::{Artifact, ArtifactKind};
-pub use client::NecropolisClient;
+pub use client::{LedgerHead, NecropolisClient};
 pub use identity::Identity;
+pub use ledger::Entry;
+pub use necropolis::Directory;

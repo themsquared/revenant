@@ -3,7 +3,15 @@
 //! attest a successful local re-verification.
 
 use crate::artifact::Artifact;
+use crate::ledger::Entry;
 use anyhow::{bail, Context, Result};
+
+/// A peer Necropolis's ledger head — its current length and chained hash.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LedgerHead {
+    pub seq: i64,
+    pub hash: String,
+}
 
 #[derive(Clone)]
 pub struct NecropolisClient {
@@ -78,5 +86,21 @@ impl NecropolisClient {
             .await
             .context("attesting")?;
         Ok(())
+    }
+
+    /// The peer's current ledger head — how far its history has advanced.
+    pub async fn ledger_head(&self) -> Result<LedgerHead> {
+        Ok(self.http.get(self.url("/ledger/head")).send().await?.json().await?)
+    }
+
+    /// Pull the peer's ledger entries with `seq > since`, in order. The bytes
+    /// are transferred verbatim so the caller can recompute each hash and
+    /// re-verify the chain locally before trusting a single entry.
+    pub async fn ledger_since(&self, since: i64) -> Result<Vec<Entry>> {
+        let resp = self.http.get(self.url(&format!("/ledger/since/{since}"))).send().await?;
+        if !resp.status().is_success() {
+            bail!("ledger pull failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(resp.json().await?)
     }
 }
