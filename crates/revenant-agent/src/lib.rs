@@ -1167,8 +1167,10 @@ fn estimate(content: &[ContentBlock]) -> Option<i64> {
 ///     persisting the assistant tool call but before the result), and
 ///   - a `tool_result` with no preceding `tool_use` (window truncated
 ///     mid-sequence, or the above cascade).
+///
 /// Both are hard 400s from the API. Applied at request-build time, so it also
 /// heals sessions already corrupted on disk without any DB surgery.
+#[allow(clippy::needless_range_loop)] // i±1 adjacency genuinely needs the index
 fn sanitize_history(mut messages: Vec<WireMessage>) -> Vec<WireMessage> {
     use std::collections::HashSet;
     let result_ids = |m: &WireMessage| -> HashSet<String> {
