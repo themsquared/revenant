@@ -1,7 +1,7 @@
 //! Built-in tools. Each is a small struct; heavy shared logic lives in the
 //! jail and the store.
 
-use crate::{Jail, Tool, ToolCx};
+use crate::{A2aTarget, Jail, Tool, ToolCx};
 use revenant_core::home::Home;
 use revenant_core::{PermissionTier, ToolOutput, ToolSpec};
 use revenant_skills::SkillIndex;
@@ -466,6 +466,105 @@ impl Tool for SkillWrite {
                 "skill '{name}' saved and indexed — you can use_skill it now"
             )),
             Err(err) => ToolOutput::err(format!("{err:#}")),
+        }
+    }
+}
+
+/// Delegate to another agent over A2A. By default the call is proxied through
+/// the gateway (governed egress); `via_gateway=false` means a direct call on a
+/// trusted substrate. Never talks to an unlisted URL.
+pub struct CallAgent {
+    targets: Vec<A2aTarget>,
+    http: reqwest::Client,
+}
+
+impl CallAgent {
+    pub fn new(targets: Vec<A2aTarget>) -> Self {
+        CallAgent {
+            targets,
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("reqwest client"),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for CallAgent {
+    fn spec(&self) -> ToolSpec {
+        let roster = self
+            .targets
+            .iter()
+            .map(|t| {
+                format!("{} ({})", t.name, if t.via_gateway { "via gateway" } else { "direct" })
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        spec!(
+            "call_agent",
+            format!(
+                "Delegate a task to another agent over A2A and return its reply. Known agents: {roster}."
+            ),
+            json!({"type":"object","properties":{
+                "agent":{"type":"string","description":"name of a configured agent"},
+                "message":{"type":"string"}
+            },"required":["agent","message"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let (agent, message) = match (arg_str(&args, "agent"), arg_str(&args, "message")) {
+            (Ok(a), Ok(m)) => (a, m),
+            (Err(e), _) | (_, Err(e)) => return e,
+        };
+        let Some(target) = self.targets.iter().find(|t| t.name == agent) else {
+            return ToolOutput::err(format!(
+                "unknown agent '{agent}' — configure it under [[a2a_agents]]"
+            ));
+        };
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "message/send",
+            "params": { "message": { "role": "user", "parts": [{ "kind": "text", "text": message }] } }
+        });
+        let mut req = self.http.post(&target.url).json(&body);
+        if let Some(token) = &target.token {
+            req = req.bearer_auth(token);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(err) => return ToolOutput::err(format!("A2A call to '{agent}' failed: {err}")),
+        };
+        if !resp.status().is_success() {
+            return ToolOutput::err(format!("agent '{agent}' returned {}", resp.status()));
+        }
+        let value: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(err) => return ToolOutput::err(format!("bad A2A response from '{agent}': {err}")),
+        };
+        if let Some(err) = value.get("error") {
+            return ToolOutput::err(format!("agent '{agent}' error: {err}"));
+        }
+        // A2A reply: result.parts[].text (message) — concatenate text parts.
+        let text = value
+            .pointer("/result/parts")
+            .and_then(|p| p.as_array())
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if text.is_empty() {
+            ToolOutput::ok("(agent returned no text)".to_string())
+        } else {
+            ToolOutput::ok(truncate_result(text))
         }
     }
 }

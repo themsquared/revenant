@@ -118,6 +118,37 @@ pub fn render_gateway_yaml(cfg: &Config, available_env: &HashSet<String>) -> Res
         );
     }
 
+    // Governed A2A egress: one gateway bind per gateway-routed remote agent.
+    // Marking the route `a2a: {}` enables A2A processing, telemetry, and the
+    // hook for authz/guardrails/rate-limits — the first law extended to
+    // agent-to-agent traffic. `direct` agents are skipped (substrate governs).
+    let mut binds: Vec<Value> = Vec::new();
+    for (idx, agent) in cfg.a2a_agents.iter().enumerate() {
+        if agent.direct {
+            continue;
+        }
+        let Some((scheme, host, _path)) = revenant_core::config::parse_endpoint(&agent.url) else {
+            bail!("a2a agent '{}' has an unparseable url: {}", agent.name, agent.url);
+        };
+        let mut backend = Map::new();
+        backend.insert("host".into(), json!(host));
+        if scheme == "https" {
+            backend.insert("backendTLS".into(), json!({}));
+        }
+        binds.push(json!({
+            "port": cfg.gateway.a2a_egress_base + idx as u16,
+            "listeners": [{
+                "routes": [{
+                    "policies": { "a2a": {} },
+                    "backends": [Value::Object(backend)]
+                }]
+            }]
+        }));
+    }
+    if !binds.is_empty() {
+        doc.as_object_mut().unwrap().insert("binds".into(), Value::Array(binds));
+    }
+
     let yaml = serde_yaml::to_string(&doc)?;
     Ok(format!(
         "# Rendered by revenant — DO NOT EDIT. Source of truth: ~/.revenant/config.toml\n{yaml}"
