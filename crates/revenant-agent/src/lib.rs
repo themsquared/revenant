@@ -114,6 +114,9 @@ pub struct AgentRuntime {
     pub learn_min_tools: usize,
     /// Timestamps of recent auto-distilled skills (rolling 1h) — anti-spam.
     pub learn_budget: Arc<Mutex<Vec<i64>>>,
+    /// Privacy router: sensitive turns are forced onto `privacy_tier`. None
+    /// when disabled or misconfigured (no such tier).
+    pub privacy: Option<(Arc<revenant_core::privacy::Detector>, Tier)>,
 }
 
 impl AgentRuntime {
@@ -204,6 +207,28 @@ impl AgentRuntime {
             })
             .collect::<Vec<_>>()
             .join("\n");
+
+        // Privacy router: if this turn's input contains sensitive data, force
+        // it onto the local tier so it never reaches a cloud provider. The
+        // tier is fixed for the whole turn, so tool results stay local too.
+        let mut tier = tier;
+        if depth == 0 {
+            if let Some((detector, safe_tier)) = &self.privacy {
+                if tier != *safe_tier {
+                    if let Some(category) = detector.scan(&user_text) {
+                        tracing::info!(
+                            "privacy router: {category} detected — routing this turn to '{safe_tier}' (stays on-box)"
+                        );
+                        self.events.emit(Event::PrivacyRouted {
+                            session_id,
+                            category,
+                            tier: safe_tier.to_string(),
+                        });
+                        tier = *safe_tier;
+                    }
+                }
+            }
+        }
 
         // Pre-turn hybrid retrieval — fail-open, never blocks the turn on
         // memory trouble.

@@ -2321,11 +2321,13 @@ dependencies = [
  "chrono",
  "croner",
  "dirs 5.0.1",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tracing",
 ]
 
 [[package]]

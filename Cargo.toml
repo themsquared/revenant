@@ -58,6 +58,7 @@ rust-embed = "8"
 croner = "2"
 chrono = "0.4"
 inventory = "0.3"
+regex = "1"
 mime_guess = "2"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

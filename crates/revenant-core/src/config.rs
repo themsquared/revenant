@@ -13,6 +13,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub channels: ChannelsConfig,
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
     /// MCP servers multiplexed behind the gateway (the plugin bus).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServer>,
@@ -31,6 +33,31 @@ pub struct McpServer {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// Privacy router: when enabled, a turn whose input contains sensitive data
+/// is forced onto `tier` (a local, on-box model) so it never reaches a cloud
+/// provider. Off by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The safe tier sensitive turns route to (must be a local/on-box tier).
+    #[serde(default = "default_privacy_tier")]
+    pub tier: String,
+    /// Extra regexes counted as sensitive, on top of the built-in set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_patterns: Vec<String>,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        PrivacyConfig { enabled: false, tier: default_privacy_tier(), extra_patterns: Vec::new() }
+    }
+}
+
+fn default_privacy_tier() -> String {
+    "local".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -322,6 +349,7 @@ impl Config {
             agent: AgentConfig::default(),
             memory: MemoryConfig::default(),
             channels: ChannelsConfig::default(),
+            privacy: PrivacyConfig::default(),
             mcp: Vec::new(),
             tiers,
         }

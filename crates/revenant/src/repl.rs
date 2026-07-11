@@ -199,6 +199,9 @@ pub async fn cmd_chat(tier_arg: Option<String>) -> Result<()> {
                 Event::ToolStarted { summary, .. } => {
                     println!("\n\x1b[2m[tool] {summary}\x1b[0m");
                 }
+                Event::PrivacyRouted { category, tier, .. } => {
+                    println!("\n\x1b[36m[privacy] {category} detected → routed to '{tier}' (stays on-box)\x1b[0m");
+                }
                 Event::ApprovalCreated { id, summary, .. } => {
                     print!("\x1b[33m⚠ approve? {summary} [y/N]:\x1b[0m ");
                     std::io::stdout().flush()?;
