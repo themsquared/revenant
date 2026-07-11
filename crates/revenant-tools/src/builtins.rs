@@ -54,12 +54,89 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
 /// A browser-ish HTTP client for the web tools: real UA, bounded timeouts,
 /// redirects followed. Shared shape so search + fetch behave consistently.
 fn web_client() -> reqwest::Client {
+    // Redirect policy is part of the SSRF defence: a public URL must not be
+    // able to bounce the fetch to an internal target via 30x.
+    let redirect = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > 8 {
+            return attempt.stop();
+        }
+        match attempt.url().host_str() {
+            Some(h) if host_blocked(h) => attempt.error("redirect to a blocked (internal) host"),
+            _ => attempt.follow(),
+        }
+    });
     reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; revenant/1.0; +https://revenant.ai)")
         .timeout(Duration::from_secs(25))
         .connect_timeout(Duration::from_secs(10))
+        .redirect(redirect)
         .build()
         .unwrap_or_default()
+}
+
+/// True if a host string is an internal/reserved target the web tools must
+/// never reach (SSRF guard): loopback, private ranges, link-local (incl. the
+/// 169.254.169.254 cloud-metadata endpoint), and internal naming suffixes.
+fn host_blocked(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".internal")
+        || h.ends_with(".lan")
+    {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return ip_blocked(&ip);
+    }
+    false
+}
+
+fn ip_blocked(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local() // 169.254.0.0/16 — incl. 169.254.169.254 metadata
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0
+                // Carrier-grade NAT 100.64.0.0/10
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
+/// Validate a fetch target: reject internal hosts, resolving DNS so a public
+/// name that points at a private IP is caught too. Returns Err(reason) if the
+/// URL must not be fetched.
+async fn ssrf_check(url: &str) -> std::result::Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("bad url: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => return Err(format!("scheme {s:?} not allowed")),
+    }
+    let host = parsed.host_str().ok_or_else(|| "url has no host".to_string())?;
+    if host_blocked(host) {
+        return Err(format!("host {host:?} is internal/reserved — refusing (SSRF guard)"));
+    }
+    // Resolve and reject if ANY address is internal (defends DNS-based SSRF).
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    if let Ok(addrs) = tokio::net::lookup_host((host, port)).await {
+        for a in addrs {
+            if ip_blocked(&a.ip()) {
+                return Err(format!("host {host:?} resolves to an internal address — refusing"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn truncate_result(mut s: String) -> String {
@@ -918,6 +995,10 @@ impl Tool for WebFetch {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return ToolOutput::err("url must start with http:// or https://");
         }
+        // SSRF guard: never let the model reach internal/cloud-metadata targets.
+        if let Err(reason) = ssrf_check(url).await {
+            return ToolOutput::err(reason);
+        }
         let resp = match self.http.get(url).send().await {
             Ok(r) => r,
             Err(e) => return ToolOutput::err(format!("web_fetch request failed: {e}")),
@@ -1093,6 +1174,25 @@ mod web_tests {
     fn ddg_unwraps_redirect() {
         let u = ddg_unwrap("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=x");
         assert_eq!(u, "https://example.com/page");
+    }
+
+    #[test]
+    fn ssrf_blocks_internal_targets() {
+        // Cloud metadata + loopback + private + internal names → blocked.
+        assert!(host_blocked("localhost"));
+        assert!(host_blocked("169.254.169.254")); // AWS/GCP/Azure metadata
+        assert!(host_blocked("127.0.0.1"));
+        assert!(host_blocked("10.1.2.3"));
+        assert!(host_blocked("192.168.0.1"));
+        assert!(host_blocked("172.16.5.5"));
+        assert!(host_blocked("100.64.0.1")); // CGNAT
+        assert!(host_blocked("[::1]"));
+        assert!(host_blocked("db.internal"));
+        assert!(host_blocked("printer.local"));
+        // Public hosts → allowed.
+        assert!(!host_blocked("example.com"));
+        assert!(!host_blocked("8.8.8.8"));
+        assert!(!host_blocked("140.82.112.3"));
     }
 
     #[test]
