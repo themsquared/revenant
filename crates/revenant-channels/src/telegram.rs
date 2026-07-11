@@ -196,6 +196,7 @@ struct StreamState {
     edited_len: usize,
 }
 
+#[derive(Clone)]
 pub struct TelegramChannel {
     pub client: TelegramClient,
     pub manager: SessionManager,
@@ -222,7 +223,6 @@ impl TelegramChannel {
     }
 
     async fn poll_loop(&self) -> Result<()> {
-        let runtime = self.manager.runtime().clone();
         let mut offset = 0i64;
         loop {
             let updates = match self.client.get_updates(offset).await {
@@ -233,14 +233,21 @@ impl TelegramChannel {
                     continue;
                 }
             };
+            // Handle each update on its own task so the poll loop keeps
+            // fetching — one slow turn (or a slow store/typing call) can never
+            // stall inbound processing or make the bot look hung.
             for update in updates {
                 offset = offset.max(update.update_id + 1);
-                if let Some(message) = update.message {
-                    self.handle_message(&runtime, message).await;
-                }
-                if let Some(callback) = update.callback_query {
-                    self.handle_callback(&runtime, callback).await;
-                }
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let runtime = this.manager.runtime().clone();
+                    if let Some(message) = update.message {
+                        this.handle_message(&runtime, message).await;
+                    }
+                    if let Some(callback) = update.callback_query {
+                        this.handle_callback(&runtime, callback).await;
+                    }
+                });
             }
         }
     }
@@ -398,16 +405,28 @@ impl OutboundMirror {
             };
 
             match event {
-                // A new turn NEVER inherits the previous turn's message.
-                // Belt-and-suspenders against missed TurnCompleted events
-                // (e.g. broadcast lag): drop any stale stream state; the old
-                // message keeps whatever it last showed.
+                // A new turn NEVER inherits the previous turn's message. Drop
+                // any stale stream state, then post a placeholder IMMEDIATELY
+                // (for telegram sessions) so the user gets instant feedback —
+                // the deltas edit it in place. This is what makes the bot feel
+                // responsive even when the first token is seconds away
+                // (thinking, tool calls, gateway latency).
                 Event::TurnStarted { session_id } => {
-                    if streams.remove(&session_id).is_some() {
-                        tracing::debug!(
-                            session_id,
-                            "dropped stale stream state at turn start"
-                        );
+                    streams.remove(&session_id);
+                    if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
+                        self.client.typing(chat_id).await;
+                        if let Ok(message_id) = self.client.send_message(chat_id, "…").await {
+                            streams.insert(
+                                session_id,
+                                StreamState {
+                                    chat_id,
+                                    message_id,
+                                    buffer: String::new(),
+                                    last_edit: Instant::now(),
+                                    edited_len: 0,
+                                },
+                            );
+                        }
                     }
                 }
                 Event::TurnDelta { session_id, text } => {
