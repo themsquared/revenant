@@ -69,6 +69,13 @@ pub enum Event {
         name: String,
         description: String,
     },
+    /// The privacy router forced a turn onto a local tier — sensitive data
+    /// detected, kept off the cloud.
+    PrivacyRouted {
+        session_id: i64,
+        category: String,
+        tier: String,
+    },
     GatewayStatus {
         healthy: bool,
         detail: String,
@@ -84,7 +91,8 @@ impl Event {
             | Event::ToolFinished { session_id, .. }
             | Event::TurnCompleted { session_id, .. }
             | Event::TurnFailed { session_id, .. }
-            | Event::ApprovalCreated { session_id, .. } => Some(*session_id),
+            | Event::ApprovalCreated { session_id, .. }
+            | Event::PrivacyRouted { session_id, .. } => Some(*session_id),
             Event::SubagentSpawned { parent_session, .. }
             | Event::SubagentFinished { parent_session, .. } => Some(*parent_session),
             _ => None,

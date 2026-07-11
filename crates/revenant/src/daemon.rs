@@ -142,6 +142,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         learn: cfg.agent.learn,
         learn_min_tools: cfg.agent.learn_min_tools,
         learn_budget: Arc::new(std::sync::Mutex::new(Vec::new())),
+        privacy: build_privacy(cfg),
     });
 
     let manager = SessionManager::new(runtime);
@@ -195,6 +196,39 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         gateway_handle,
         llm_endpoint: endpoint,
     })
+}
+
+/// Build the privacy router if enabled AND its target tier actually exists —
+/// otherwise disable with a loud warning rather than give a false sense of
+/// security or fail turns at the gateway.
+fn build_privacy(
+    cfg: &Config,
+) -> Option<(std::sync::Arc<revenant_core::privacy::Detector>, revenant_core::Tier)> {
+    if !cfg.privacy.enabled {
+        return None;
+    }
+    let tier: revenant_core::Tier = match cfg.privacy.tier.parse() {
+        Ok(t) => t,
+        Err(_) => {
+            tracing::warn!("privacy router disabled: '{}' is not a valid tier", cfg.privacy.tier);
+            return None;
+        }
+    };
+    if !cfg.tiers.contains_key(&cfg.privacy.tier) {
+        tracing::warn!(
+            "privacy router disabled: tier '{}' is not configured — add a local tier to engage it",
+            cfg.privacy.tier
+        );
+        return None;
+    }
+    tracing::info!(
+        "privacy router ON — sensitive turns route to '{}' (stays on-box)",
+        cfg.privacy.tier
+    );
+    let detector = std::sync::Arc::new(revenant_core::privacy::Detector::new(
+        &cfg.privacy.extra_patterns,
+    ));
+    Some((detector, tier))
 }
 
 const REFLECTION_ID: &str = "lp-reflection";
