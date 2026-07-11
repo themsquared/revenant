@@ -2479,6 +2479,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "inventory",
+ "reqwest",
  "revenant-core",
  "revenant-memory",
  "revenant-skills",

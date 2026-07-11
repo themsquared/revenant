@@ -12,6 +12,7 @@ revenant-memory = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 inventory = { workspace = true }
+reqwest = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

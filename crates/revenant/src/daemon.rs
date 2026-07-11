@@ -65,7 +65,31 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         Ok(_) => {}
         Err(err) => tracing::warn!("skill scan failed: {err:#}"),
     }
-    let tools = ToolRegistry::builtin(home, skills.clone());
+    // Resolve A2A peers: gateway-egress URL (governed) by default, direct URL
+    // only on a substrate. Bearer token read from its env var if named.
+    let a2a_targets: Vec<revenant_tools::A2aTarget> = cfg
+        .a2a_agents
+        .iter()
+        .enumerate()
+        .map(|(idx, a)| {
+            let token = a.token_env.as_ref().and_then(|e| std::env::var(e).ok());
+            let (url, via_gateway) = if a.direct {
+                (a.url.clone(), false)
+            } else {
+                // Route through the gateway's per-agent egress port, preserving
+                // the remote's path so the proxy forwards correctly.
+                let path = revenant_core::config::parse_endpoint(&a.url)
+                    .map(|(_, _, p)| p)
+                    .unwrap_or_else(|| "/".to_string());
+                (
+                    format!("http://127.0.0.1:{}{}", cfg.gateway.a2a_egress_base + idx as u16, path),
+                    true,
+                )
+            };
+            revenant_tools::A2aTarget { name: a.name.clone(), url, token, via_gateway }
+        })
+        .collect();
+    let tools = ToolRegistry::builtin(home, skills.clone(), a2a_targets);
     let agents = Arc::new(revenant_agent::AgentRegistry::new(home.agents_dir()));
     match agents.scan() {
         Ok(n) if n > 0 => tracing::info!("indexed {n} subagent definitions"),

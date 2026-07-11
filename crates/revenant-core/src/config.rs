@@ -18,6 +18,9 @@ pub struct Config {
     /// MCP servers multiplexed behind the gateway (the plugin bus).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServer>,
+    /// Remote A2A agents this agent can delegate to (the mesh, outbound).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub a2a_agents: Vec<A2aAgent>,
     /// Tier name ("fast"/"balanced"/"deep"/"local") -> targets.
     pub tiers: BTreeMap<String, TierConfig>,
 }
@@ -33,6 +36,23 @@ pub struct McpServer {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// A remote A2A agent revenant can call via the mesh. `token_env` names an
+/// env var holding a bearer token, if the peer requires one.
+///
+/// By default the call is proxied THROUGH the gateway (governed egress — the
+/// first law extended to agents: authz, guardrails, telemetry, audit apply).
+/// Set `direct = true` ONLY when revenant runs inside a substrate that already
+/// governs the mesh (e.g. kagent), where a clean direct call is appropriate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct A2aAgent {
+    pub name: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+    #[serde(default)]
+    pub direct: bool,
 }
 
 /// Privacy router: when enabled, a turn whose input contains sensitive data
@@ -170,6 +190,10 @@ pub struct GatewayConfig {
     pub stats_port: u16,
     #[serde(default = "default_mcp_port")]
     pub mcp_port: u16,
+    /// Base port for governed A2A egress; each gateway-routed remote agent
+    /// gets `a2a_egress_base + its index`.
+    #[serde(default = "default_a2a_egress_base")]
+    pub a2a_egress_base: u16,
     /// Explicit path to an agentgateway binary (dev override). When unset,
     /// the pinned release is downloaded into the home dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,6 +308,26 @@ fn default_readiness_port() -> u16 {
 fn default_mcp_port() -> u16 {
     41002
 }
+fn default_a2a_egress_base() -> u16 {
+    41010
+}
+
+/// Parse an endpoint URL into (scheme, host:port, path). Ports default by
+/// scheme. Used to render gateway A2A backends and to build egress URLs.
+pub fn parse_endpoint(url: &str) -> Option<(String, String, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let host_with_port = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        let port = if scheme == "https" { 443 } else { 80 };
+        format!("{hostport}:{port}")
+    };
+    Some((scheme.to_string(), host_with_port, path.to_string()))
+}
 fn default_stats_port() -> u16 {
     19002
 }
@@ -343,6 +387,7 @@ impl Config {
                 readiness_port: default_readiness_port(),
                 stats_port: default_stats_port(),
                 mcp_port: default_mcp_port(),
+                a2a_egress_base: default_a2a_egress_base(),
                 binary: None,
                 endpoint: None,
             },
@@ -351,6 +396,7 @@ impl Config {
             channels: ChannelsConfig::default(),
             privacy: PrivacyConfig::default(),
             mcp: Vec::new(),
+            a2a_agents: Vec::new(),
             tiers,
         }
     }
