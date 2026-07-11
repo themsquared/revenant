@@ -97,6 +97,28 @@ impl LlmClient {
         LlmClient { http, base_url: base_url.into() }
     }
 
+    /// Minimal liveness + credit check: a 1-token request against `model`.
+    /// `Ok(())` if the provider accepts it; a humanized error (credit / auth /
+    /// rate / overload) otherwise. Used by `revenant doctor`.
+    pub async fn ping(&self, model: &str) -> Result<()> {
+        let url = format!("{}/v1/messages", self.base_url);
+        let req = serde_json::json!({
+            "model": model, "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let resp = Self::headers(self.http.post(&url))
+            .json(&req)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("{}", humanize_gateway_error(status.as_u16(), &body));
+        }
+        Ok(())
+    }
+
     fn headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         // The gateway injects real provider credentials; these satisfy the
         // Anthropic API shape.
@@ -121,7 +143,7 @@ impl LlmClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("gateway returned {status}: {}", truncate(&body, 600));
+            bail!("{}", humanize_gateway_error(status.as_u16(), &body));
         }
 
         let mut outcome = StreamOutcome::default();
@@ -322,4 +344,59 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Turn a provider/gateway HTTP error into a plain-English, actionable message.
+/// This is what a user sees in chat/Telegram when a turn fails — no raw JSON,
+/// just what's wrong and how to fix it. Falls back to the trimmed body.
+pub fn humanize_gateway_error(status: u16, body: &str) -> String {
+    let b = body.to_lowercase();
+    if b.contains("credit balance is too low") || b.contains("insufficient") && b.contains("credit")
+    {
+        return "Out of API credits. Add credits in your provider console — for Anthropic: \
+console.anthropic.com → Settings → Billing (this is separate from a Claude subscription's \
+\"extra usage\"). Or switch a tier to a provider that has credit."
+            .to_string();
+    }
+    if status == 401 || b.contains("invalid x-api-key") || b.contains("authentication") {
+        return "The provider rejected the API key. Check the key in ~/.revenant/secrets.env \
+(and that it's for the right provider), then restart.".to_string();
+    }
+    if status == 429 || b.contains("rate limit") || b.contains("rate_limit") {
+        return "Rate-limited by the provider. It'll retry automatically; if it keeps happening, \
+slow down or raise your account's rate limit.".to_string();
+    }
+    if b.contains("overloaded") || status == 529 {
+        return "The model provider is overloaded right now. Try again in a moment — a multi-target \
+tier will fail over automatically.".to_string();
+    }
+    if status == 404 && b.contains("model") {
+        return "The configured model wasn't found at the provider. Check the model name in your \
+tier config (`revenant render` shows what's sent).".to_string();
+    }
+    // Unknown: keep it short and honest.
+    format!("Provider error {status}: {}", truncate(body, 400))
+}
+
+#[cfg(test)]
+mod humanize_tests {
+    use super::*;
+
+    #[test]
+    fn credit_error_is_actionable() {
+        let msg = humanize_gateway_error(
+            400,
+            r#"{"error":{"message":"Your credit balance is too low to access the Anthropic API."}}"#,
+        );
+        assert!(msg.contains("Out of API credits"));
+        assert!(msg.contains("Billing"));
+        assert!(!msg.contains("{"), "should not leak raw JSON");
+    }
+
+    #[test]
+    fn auth_and_rate_and_unknown() {
+        assert!(humanize_gateway_error(401, "").contains("rejected the API key"));
+        assert!(humanize_gateway_error(429, "").contains("Rate-limited"));
+        assert!(humanize_gateway_error(500, "boom").contains("Provider error 500"));
+    }
 }

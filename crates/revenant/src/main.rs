@@ -198,6 +198,9 @@ enum Command {
     },
     /// Daemon status.
     Status,
+    /// Diagnose your setup in plain English — config, keys, credit, daemon,
+    /// channels, network. Run this first if anything feels off.
+    Doctor,
     /// List pending approvals, or resolve one.
     Approvals {
         /// approve <id> | deny <id>
@@ -285,6 +288,7 @@ fn main() -> Result<()> {
             Command::Up => daemon::cmd_up().await,
             Command::Chat { tier } => repl::cmd_chat(tier).await,
             Command::Status => cmd_status().await,
+            Command::Doctor => cmd_doctor().await,
             Command::Approvals { action } => cmd_approvals(action).await,
             Command::Render => cmd_render(),
             Command::Memory { action } => cmd_memory(action).await,
@@ -983,6 +987,110 @@ fn cmd_render() -> Result<()> {
         .map(|(k, _)| k)
         .collect();
     print!("{}", revenant_gateway::render_gateway_yaml(&cfg, &available)?);
+    Ok(())
+}
+
+async fn cmd_doctor() -> Result<()> {
+    let home = Home::resolve();
+    println!("🩺 revenant doctor — checking your setup\n");
+    let ok = |l: &str, d: &str| println!("  ✅ {l}{}", if d.is_empty() { String::new() } else { format!(" — {d}") });
+    let warn = |l: &str, d: &str| println!("  ⚠️  {l} — {d}");
+    let bad = |l: &str, d: &str| println!("  ❌ {l} — {d}");
+
+    // Config
+    let cfg = match load_config(&home) {
+        Ok(c) => {
+            ok("config", &home.root().join("config.toml").display().to_string());
+            Some(c)
+        }
+        Err(e) => {
+            bad("config", &format!("{e:#}"));
+            None
+        }
+    };
+
+    // Secrets / provider keys
+    let secrets = std::fs::read_to_string(home.root().join("secrets.env")).unwrap_or_default();
+    let present: Vec<&str> = [
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY",
+    ]
+    .into_iter()
+    .filter(|k| secrets.contains(k))
+    .collect();
+    if secrets.is_empty() {
+        bad("secrets.env", "missing — add a provider key, e.g. ANTHROPIC_API_KEY=sk-ant-...");
+    } else if present.is_empty() {
+        warn("secrets.env", "present, but no known provider API key found");
+    } else {
+        ok("provider keys", &present.join(", "));
+    }
+
+    // Gateway binary
+    let gw_ok = std::fs::read_dir(home.gateway_bin_dir())
+        .ok()
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains("agentgateway"))
+        })
+        .unwrap_or(false);
+    if gw_ok {
+        ok("gateway binary", "installed");
+    } else {
+        warn("gateway binary", "not found — downloads automatically on first `revenant up`");
+    }
+
+    // Daemon
+    let client = revenant_client::Client::from_env(&home).ok();
+    let daemon_up = match &client {
+        Some(c) => c.health().await.is_ok(),
+        None => false,
+    };
+    if daemon_up {
+        ok("daemon", "running");
+    } else {
+        warn("daemon", "not running — start it with `revenant up`");
+    }
+
+    // Provider credit / key check (the silent killer) — only if daemon is up.
+    if daemon_up {
+        if let Some(cfg) = &cfg {
+            let llm = revenant_llm::LlmClient::new(format!("http://127.0.0.1:{}", cfg.gateway.llm_port));
+            let model = if cfg.tiers.contains_key("fast") {
+                "fast".to_string()
+            } else {
+                cfg.tiers.keys().next().cloned().unwrap_or_else(|| "fast".to_string())
+            };
+            match llm.ping(&model).await {
+                Ok(()) => ok("provider reachable", &format!("'{model}' tier responded — keys + credit OK")),
+                Err(e) => bad("provider", &format!("{e}")),
+            }
+        }
+    } else {
+        warn("provider credit", "can't check while the daemon is down (start it, then re-run)");
+    }
+
+    // Telegram
+    if let Some(cfg) = &cfg {
+        let tg = &cfg.channels.telegram;
+        if tg.enabled && secrets.contains(&tg.token_env) {
+            ok("telegram", &format!("enabled ({} present)", tg.token_env));
+        } else if tg.enabled {
+            warn("telegram", &format!("enabled but {} not in secrets.env", tg.token_env));
+        } else {
+            ok("telegram", "disabled");
+        }
+    }
+
+    // Network / the horde
+    if let Some(cfg) = &cfg {
+        match &cfg.network.necropolis_url {
+            Some(u) => ok("network", &format!("Necropolis: {u}")),
+            None => warn("network", "no Necropolis set — set network.necropolis_url to join the horde"),
+        }
+    }
+
+    println!("\n  Legend: ✅ good · ⚠️ optional/attention · ❌ must fix");
+    println!("  Next: `revenant up` runs everything; `revenant chat` to talk; `revenant doctor` to re-check.");
     Ok(())
 }
 
