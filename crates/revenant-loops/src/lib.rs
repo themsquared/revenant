@@ -13,14 +13,24 @@ use revenant_core::{Event, Tier};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How many loops may execute at once. Due loops fire concurrently (a slow
+/// one never blocks the rest), but this bounds the burst so a pile-up of due
+/// loops can't thrash the box — the excess queues on the semaphore.
+const MAX_CONCURRENT_FIRES: usize = 4;
+
 pub struct LoopScheduler {
     manager: SessionManager,
     default_tier: Tier,
+    sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl LoopScheduler {
     pub fn new(manager: SessionManager, default_tier: Tier) -> Self {
-        LoopScheduler { manager, default_tier }
+        LoopScheduler {
+            manager,
+            default_tier,
+            sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FIRES)),
+        }
     }
 
     /// Start the background scheduler: wakes every 15s, fires due loops.
@@ -36,7 +46,7 @@ impl LoopScheduler {
         });
     }
 
-    async fn tick_once(&self) -> Result<()> {
+    async fn tick_once(self: &Arc<Self>) -> Result<()> {
         let now = unix_now();
         let store = &self.manager.runtime().store;
         let due = store.loops_due(now).await?;
@@ -61,7 +71,18 @@ impl LoopScheduler {
                 continue;
             }
 
-            self.fire(&lp).await;
+            // Fire concurrently: a slow loop never blocks the others, but the
+            // semaphore bounds the burst (excess queues). Non-blocking, capped.
+            let this = Arc::clone(self);
+            let sem = Arc::clone(&self.sem);
+            let lp = lp.clone();
+            tokio::spawn(async move {
+                let _permit = match sem.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                this.fire(&lp).await;
+            });
         }
         Ok(())
     }
