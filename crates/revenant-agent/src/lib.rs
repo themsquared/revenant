@@ -221,8 +221,15 @@ impl AgentRuntime {
         let prompt = format!(
             "You are editing a Rust workspace checked out at the repository root; every path you \
 pass to a tool is relative to that root. Make the SMALLEST change that accomplishes the task and \
-keeps the workspace compiling. Use read_file and list_dir to inspect before you write_file. Do not \
-attempt to run cargo. When finished, state briefly which files you changed and why.\n\nTask: {task}"
+keeps the workspace COMPILING.\n\
+Rules for not breaking the build:\n\
+- read_file the ENTIRE file before you edit it, and read it again after writing to confirm it is \
+still valid Rust (balanced braces/parens, imports present, no half-finished edits).\n\
+- Be especially careful inside multi-line string literals, raw strings (r#\"...\"#), and macros — \
+preserve the exact delimiters and escaping; a stray quote or brace there breaks compilation.\n\
+- Prefer the narrowest edit that works; do not refactor unrelated code or reformat whole files.\n\
+- Do not run cargo (the harness builds and tests your change).\n\
+When finished, state briefly which files you changed and why.\n\nTask: {task}"
         );
         let stats = coder
             .run_turn(session_id, tier, vec![ContentBlock::text(prompt)])

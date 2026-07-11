@@ -518,7 +518,7 @@ async fn cmd_ascend(run: bool, live: bool) -> Result<()> {
         staging_prefix: asc.staging_prefix.clone(),
         max_prs_per_day: asc.max_prs_per_day,
         denylist: asc.denylist.clone(),
-        max_repair: 3,
+        max_repair: 5,
         live,
     };
     let today = (now_ts() / 86_400).to_string();
