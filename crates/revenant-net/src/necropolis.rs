@@ -32,8 +32,12 @@ pub struct Peer {
 
 pub struct Directory {
     ledger: Ledger,
+    accounts: crate::accounts::Accounts,
     peers: BTreeMap<String, Peer>,
     artifacts: BTreeMap<String, Artifact>,
+    /// When true, publishing requires the author to be bound to a verified
+    /// human account. Reads are always open. Default true (env can disable).
+    require_account: bool,
 }
 
 pub type SharedDir = Arc<Mutex<Directory>>;
@@ -41,14 +45,27 @@ pub type SharedDir = Arc<Mutex<Directory>>;
 impl Directory {
     /// Open a directory backed by a ledger file (`":memory:"` for ephemeral),
     /// verifying the chain and replaying it to rebuild the catalog + reputation.
+    /// The accounts store (human registration) lives alongside in the same file.
     pub fn open(ledger_path: &str) -> anyhow::Result<Self> {
         let ledger = Ledger::open(ledger_path)?;
         ledger.verify_chain()?; // refuse to serve a tampered history
-        let mut dir = Directory { ledger, peers: BTreeMap::new(), artifacts: BTreeMap::new() };
+        let accounts = crate::accounts::Accounts::open(ledger_path)?;
+        let mut dir = Directory {
+            ledger,
+            accounts,
+            peers: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            require_account: std::env::var("NECROPOLIS_OPEN_PUBLISH").is_err(),
+        };
         for e in dir.ledger.since(0)? {
             dir.apply(&e);
         }
         Ok(dir)
+    }
+
+    /// Toggle the human-account publish gate (default on). Testing/transition.
+    pub fn set_require_account(&mut self, v: bool) {
+        self.require_account = v;
     }
 
     pub fn in_memory() -> Self {
@@ -146,6 +163,9 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/artifacts/:id/attest", post(attest))
         .route("/ledger/head", get(ledger_head))
         .route("/ledger/since/:seq", get(ledger_since))
+        .route("/account/register", post(account_register))
+        .route("/account/verify", post(account_verify))
+        .route("/account/bind", post(account_bind))
         // The catalog is public read — allow any origin so the static skills
         // marketplace (Netlify) can fetch it cross-origin. Authenticity is the
         // per-artifact signature, never the origin, so `*` is safe here.
@@ -205,9 +225,83 @@ async fn publish(
     let body = serde_json::to_string(&artifact).map_err(ise)?;
     let id = artifact.id.clone();
     let mut d = dir.lock().unwrap();
+    // Human accountability gate: the author must be an agent bound to a
+    // verified human account. Reads stay open; only publishing is gated.
+    if d.require_account && !d.accounts.is_authorized(&artifact.author) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "publishing requires a verified human account — register with `revenant net signup <email>`, verify, then `revenant net bind`".into(),
+        ));
+    }
     let entry = d.ledger.append("artifact", &body, artifact.created_ts).map_err(ise)?;
     d.apply(&entry);
     Ok(Json(serde_json::json!({ "ok": true, "id": id, "seq": entry.seq })))
+}
+
+fn bad<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, e.to_string())
+}
+
+#[derive(Deserialize)]
+struct RegisterAccountReq {
+    email: String,
+}
+
+/// Register a human by email. Sends a verification token (dev-mode returns it).
+async fn account_register(
+    State(dir): State<SharedDir>,
+    Json(req): Json<RegisterAccountReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let reg = {
+        let d = dir.lock().unwrap();
+        d.accounts.register(&req.email).map_err(bad)?
+    }; // lock released before the (async) email send
+    if reg.already {
+        return Ok(Json(serde_json::json!({ "ok": true, "status": "already verified" })));
+    }
+    let _ = crate::email::send_verification(&req.email, &reg.verify_token).await;
+    let mut resp = serde_json::json!({
+        "ok": true,
+        "account_key": reg.account_key,
+        "status": "registered — verify the emailed token, then bind your agent",
+    });
+    if crate::email::dev_mode() {
+        resp["dev_mode"] = serde_json::json!(true);
+        resp["verify_token"] = serde_json::json!(reg.verify_token);
+    }
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+struct VerifyReq {
+    token: String,
+}
+
+async fn account_verify(
+    State(dir): State<SharedDir>,
+    Json(req): Json<VerifyReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ok = dir.lock().unwrap().accounts.verify(&req.token).map_err(ise)?;
+    if ok {
+        Ok(Json(serde_json::json!({ "ok": true, "verified": true })))
+    } else {
+        Err((StatusCode::BAD_REQUEST, "invalid or expired verification token".into()))
+    }
+}
+
+#[derive(Deserialize)]
+struct BindReq {
+    account_key: String,
+    pubkey: String,
+    sig: String,
+}
+
+async fn account_bind(
+    State(dir): State<SharedDir>,
+    Json(req): Json<BindReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    dir.lock().unwrap().accounts.bind(&req.account_key, &req.pubkey, &req.sig).map_err(bad)?;
+    Ok(Json(serde_json::json!({ "ok": true, "bound": req.pubkey })))
 }
 
 #[derive(Deserialize)]
@@ -339,7 +433,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn shared() -> SharedDir {
-        Arc::new(Mutex::new(Directory::in_memory()))
+        // Router tests exercise the catalog/ledger paths; open publishing here
+        // and cover the account gate separately in publish_requires_account.
+        let mut d = Directory::in_memory();
+        d.set_require_account(false);
+        Arc::new(Mutex::new(d))
     }
 
     #[tokio::test]
@@ -381,6 +479,31 @@ mod tests {
         // Catalog + reputation were derived from the entry.
         assert_eq!(dir.lock().unwrap().artifacts.len(), 1);
         assert_eq!(dir.lock().unwrap().peers[&k.id()].reputation.published, 1);
+    }
+
+    #[tokio::test]
+    async fn publish_requires_a_verified_human_account() {
+        // Gate ON (the default). Unbound author → 403; after signup→verify→bind → OK.
+        let dir = Arc::new(Mutex::new(Directory::in_memory())); // require_account = true
+        let k = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let a = Artifact::create(&k, ArtifactKind::Skill, "gated", "d", b"x", None, 1);
+        let body = serde_json::to_vec(&a).unwrap();
+        let post = || {
+            router(dir.clone()).oneshot(
+                Request::post("/artifacts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(post().await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // Register → verify → bind the author, then publish succeeds.
+        let reg = { dir.lock().unwrap().accounts.register("h@x.com").unwrap() };
+        dir.lock().unwrap().accounts.verify(&reg.verify_token).unwrap();
+        let sig = k.sign_hex(reg.account_key.as_bytes());
+        dir.lock().unwrap().accounts.bind(&reg.account_key, &k.id(), &sig).unwrap();
+        assert_eq!(post().await.unwrap().status(), StatusCode::OK);
     }
 
     #[test]

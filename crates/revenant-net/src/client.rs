@@ -28,6 +28,52 @@ impl NecropolisClient {
         format!("{}{}", self.base.trim_end_matches('/'), path)
     }
 
+    /// Register a human by email. Returns the server JSON (account_key, and in
+    /// dev mode the verify_token).
+    pub async fn signup(&self, email: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(self.url("/account/register"))
+            .json(&serde_json::json!({ "email": email }))
+            .send()
+            .await
+            .context("POST /account/register")?;
+        if !resp.status().is_success() {
+            bail!("signup failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Verify an emailed token.
+    pub async fn verify_account(&self, token: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url("/account/verify"))
+            .json(&serde_json::json!({ "token": token }))
+            .send()
+            .await
+            .context("POST /account/verify")?;
+        if !resp.status().is_success() {
+            bail!("verify failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Bind this agent's pubkey to a verified account (sig proves ownership).
+    pub async fn bind_agent(&self, account_key: &str, pubkey: &str, sig: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url("/account/bind"))
+            .json(&serde_json::json!({ "account_key": account_key, "pubkey": pubkey, "sig": sig }))
+            .send()
+            .await
+            .context("POST /account/bind")?;
+        if !resp.status().is_success() {
+            bail!("bind failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
     pub async fn register(&self, id: &str, endpoint: &str, capabilities: &[String]) -> Result<()> {
         let resp = self
             .http

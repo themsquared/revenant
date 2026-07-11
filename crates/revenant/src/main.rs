@@ -514,7 +514,50 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 dest.display(),
             );
         }
-        other => bail!("unknown net command '{other}' (id|register|peers|publish|list|pull|adopt)"),
+        "signup" => {
+            // Register a human by email; save the account key locally.
+            let email = action.get(1).context("usage: net signup <email>")?;
+            let resp = client.signup(email).await?;
+            if resp.get("status").and_then(|s| s.as_str()) == Some("already verified") {
+                println!("that email is already verified — run `revenant net bind` to add this agent");
+                return Ok(());
+            }
+            if let Some(key) = resp.get("account_key").and_then(|k| k.as_str()) {
+                std::fs::write(home.root().join("account.key"), key)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        home.root().join("account.key"),
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            }
+            println!("registered {email} — account key saved to ~/.revenant/account.key");
+            match resp.get("verify_token").and_then(|t| t.as_str()) {
+                Some(tok) => println!(
+                    "DEV MODE (no email provider): confirm now with\n  revenant net confirm {tok}"
+                ),
+                None => println!("check your email for the token, then: revenant net confirm <token>"),
+            }
+        }
+        "confirm" => {
+            let token = action.get(1).context("usage: net confirm <token>")?;
+            client.verify_account(token).await?;
+            println!("✅ email confirmed. Now bind this agent: revenant net bind");
+        }
+        "bind" => {
+            // Bind THIS node's identity to the verified account (sign a proof).
+            let key = std::fs::read_to_string(home.root().join("account.key"))
+                .context("no account key — run `revenant net signup <email>` first")?;
+            let key = key.trim();
+            let sig = id.sign_hex(key.as_bytes());
+            client.bind_agent(key, &id.id(), &sig).await?;
+            println!("🜁 bound agent {} to your account — it may now publish to the horde", id.fingerprint());
+        }
+        other => bail!(
+            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify)"
+        ),
     }
     Ok(())
 }
