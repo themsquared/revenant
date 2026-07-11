@@ -47,7 +47,7 @@ pub fn offer(
         return Ok(Offered::RateLimited { used, cap: max_prs_per_day });
     }
 
-    let title = format!("ascension: {} ({})", summarize(evidence), evidence.candidate.target);
+    let title = format!("ascension: {}", summarize(evidence));
     let body = format!(
         "{}\n\n---\n### Reviewer verdict\n- approved: {} (confidence {:.2})\n{}\n",
         evidence.markdown(),
@@ -84,13 +84,21 @@ pub fn offer(
 }
 
 fn summarize(evidence: &EvidenceBundle) -> String {
-    if !evidence.verdict.fixed_tasks.is_empty() {
-        format!("fix {}", evidence.verdict.fixed_tasks.join(", "))
-    } else if evidence.verdict.latency_delta_pct >= 1.0 {
-        format!("speed up ({:.0}% faster)", evidence.verdict.latency_delta_pct)
-    } else {
-        "improvement".to_string()
+    let c = &evidence.candidate;
+    // A concrete eval-task fix gets named; an ad-hoc task summarizes from its
+    // description (the placeholder "adhoc-fix" target is never a good title).
+    if !evidence.verdict.fixed_tasks.is_empty() && c.target != "adhoc-fix" {
+        return format!("fix {}", evidence.verdict.fixed_tasks.join(", "));
     }
+    let detail = c.detail.trim();
+    if !detail.is_empty() {
+        let short: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+        return short.chars().take(72).collect::<String>().trim_end().to_string();
+    }
+    if evidence.verdict.latency_delta_pct >= 1.0 {
+        return format!("speed up ({:.0}% faster)", evidence.verdict.latency_delta_pct);
+    }
+    "improvement".to_string()
 }
 
 fn commit_all(wt: &Worktree, title: &str) -> Result<()> {
