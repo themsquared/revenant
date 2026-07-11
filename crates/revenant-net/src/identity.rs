@@ -89,4 +89,11 @@ mod tests {
         // Garbage → fails, no panic.
         assert!(!verify_hex("zz", b"x", "zz"));
     }
+
+    #[test]
+    fn fingerprint_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::load_or_create(dir.path()).unwrap();
+        assert_eq!(id.fingerprint().len(), 8);
+    }
 }
