@@ -117,6 +117,13 @@ fn commit_all(wt: &Worktree, title: &str) -> Result<()> {
 }
 
 fn gh_pr_create(wt: &Worktree, base: &str, title: &str, body: &str) -> Result<String> {
+    // Ensure the provenance label exists (idempotent) so every machine-authored
+    // PR is filterable and the gatekeeper (`revenant pr-review`) can find it.
+    let _ = Command::new("gh")
+        .current_dir(&wt.path)
+        .args(["label", "create", "ascension", "--color", "5319e7"])
+        .args(["--description", "machine-authored by the Ascension loop", "--force"])
+        .output();
     let out = Command::new("gh")
         .current_dir(&wt.path)
         .args(["pr", "create", "--base", base, "--head", &wt.branch])
