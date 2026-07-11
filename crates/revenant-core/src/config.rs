@@ -15,9 +15,18 @@ pub struct Config {
     pub channels: ChannelsConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    /// Global gateway-enforced spend cap (the intelligent-spending ceiling).
+    #[serde(default)]
+    pub spending: SpendingConfig,
+    /// Self-improvement loop (opens eval-proven PRs; off by default).
+    #[serde(default)]
+    pub ascension: AscensionConfig,
     /// MCP servers multiplexed behind the gateway (the plugin bus).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServer>,
+    /// Remote A2A agents this agent can delegate to (the mesh, outbound).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub a2a_agents: Vec<A2aAgent>,
     /// Tier name ("fast"/"balanced"/"deep"/"local") -> targets.
     pub tiers: BTreeMap<String, TierConfig>,
 }
@@ -33,6 +42,23 @@ pub struct McpServer {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// A remote A2A agent revenant can call via the mesh. `token_env` names an
+/// env var holding a bearer token, if the peer requires one.
+///
+/// By default the call is proxied THROUGH the gateway (governed egress — the
+/// first law extended to agents: authz, guardrails, telemetry, audit apply).
+/// Set `direct = true` ONLY when revenant runs inside a substrate that already
+/// governs the mesh (e.g. kagent), where a clean direct call is appropriate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct A2aAgent {
+    pub name: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+    #[serde(default)]
+    pub direct: bool,
 }
 
 /// Privacy router: when enabled, a turn whose input contains sensitive data
@@ -58,6 +84,140 @@ impl Default for PrivacyConfig {
 
 fn default_privacy_tier() -> String {
     "local".to_string()
+}
+
+/// Global spend cap enforced by the gateway on the LLM listener — a token
+/// bucket BELOW the agent, so the ceiling cannot be reasoned or coded around
+/// from inside the harness (the moat, made literal). Renders to
+/// `llm.policies.localRateLimit`. Off by default (no cap).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpendingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bucket size = refill amount per `interval`, i.e. the rolling cap.
+    #[serde(default = "default_budget_amount")]
+    pub budget: u64,
+    /// Refill window, as an agentgateway duration ("24h", "1h", "60s").
+    #[serde(default = "default_budget_interval")]
+    pub interval: String,
+    /// What the budget counts: LLM `tokens` (input+output) or `requests`.
+    #[serde(default)]
+    pub count: BudgetCount,
+}
+
+impl Default for SpendingConfig {
+    fn default() -> Self {
+        SpendingConfig {
+            enabled: false,
+            budget: default_budget_amount(),
+            interval: default_budget_interval(),
+            count: BudgetCount::default(),
+        }
+    }
+}
+
+/// Unit the spend cap counts — matches agentgateway's localRateLimit `type`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetCount {
+    #[default]
+    Tokens,
+    Requests,
+}
+
+impl BudgetCount {
+    pub fn gateway_type(&self) -> &'static str {
+        match self {
+            BudgetCount::Tokens => "tokens",
+            BudgetCount::Requests => "requests",
+        }
+    }
+}
+
+fn default_budget_amount() -> u64 {
+    1_000_000
+}
+fn default_budget_interval() -> String {
+    "24h".to_string()
+}
+
+/// The Ascension loop: a revenant that betters itself and offers eval-proven
+/// improvements back as PRs. Off by default. The `autonomy` dial governs the
+/// only outward-facing step (opening a PR); the engine can never merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AscensionConfig {
+    /// Master switch. When false, `revenant ascend` only ever observes.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Outward-facing autonomy for a proven change: `propose` (write branch
+    /// locally, human opens PR) | `staging` (auto-open PR into staging
+    /// namespace, human promotes) | `upstream` (auto-open PR to base branch).
+    #[serde(default = "default_autonomy")]
+    pub autonomy: String,
+    /// Branch namespace for staging-mode PRs.
+    #[serde(default = "default_staging_prefix")]
+    pub staging_prefix: String,
+    /// The branch proven changes are measured against and PR'd toward.
+    #[serde(default = "default_base_branch")]
+    pub base_branch: String,
+    /// Hard cap on machine-authored PRs per day.
+    #[serde(default = "default_max_prs")]
+    pub max_prs_per_day: u32,
+    /// How many times the eval suite must confirm the win (noise robustness).
+    #[serde(default = "default_proof_runs")]
+    pub proof_runs: usize,
+    /// Minimum mean improvement for the metric acceptance path (percent).
+    #[serde(default = "default_min_gain")]
+    pub min_gain_pct: f64,
+    /// Path prefixes the self-improver may never modify (the wards).
+    #[serde(default = "default_ascension_denylist")]
+    pub denylist: Vec<String>,
+}
+
+impl Default for AscensionConfig {
+    fn default() -> Self {
+        AscensionConfig {
+            enabled: false,
+            autonomy: default_autonomy(),
+            staging_prefix: default_staging_prefix(),
+            base_branch: default_base_branch(),
+            max_prs_per_day: default_max_prs(),
+            proof_runs: default_proof_runs(),
+            min_gain_pct: default_min_gain(),
+            denylist: default_ascension_denylist(),
+        }
+    }
+}
+
+fn default_autonomy() -> String {
+    "staging".to_string()
+}
+fn default_staging_prefix() -> String {
+    "self-improve/".to_string()
+}
+fn default_base_branch() -> String {
+    "main".to_string()
+}
+fn default_max_prs() -> u32 {
+    3
+}
+fn default_proof_runs() -> usize {
+    3
+}
+fn default_min_gain() -> f64 {
+    5.0
+}
+/// The wards guard themselves: security, gateway key handling, the approval
+/// broker, the WASM sandbox, the Ascension engine, and CI are off-limits to
+/// autonomous change.
+fn default_ascension_denylist() -> Vec<String> {
+    vec![
+        "crates/revenant-security".into(),
+        "crates/revenant-gateway".into(),
+        "crates/revenant-wasm".into(),
+        "crates/revenant-ascension".into(),
+        ".github/".into(),
+    ]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -170,6 +330,10 @@ pub struct GatewayConfig {
     pub stats_port: u16,
     #[serde(default = "default_mcp_port")]
     pub mcp_port: u16,
+    /// Base port for governed A2A egress; each gateway-routed remote agent
+    /// gets `a2a_egress_base + its index`.
+    #[serde(default = "default_a2a_egress_base")]
+    pub a2a_egress_base: u16,
     /// Explicit path to an agentgateway binary (dev override). When unset,
     /// the pinned release is downloaded into the home dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +391,23 @@ fn default_learn_min_tools() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierConfig {
     pub targets: Vec<TierTarget>,
+    /// How a multi-target tier routes across its targets. `failover` (default)
+    /// tries targets in priority order with health-based eviction — resilience.
+    /// `weighted` splits traffic across targets by `weight` — cross-provider
+    /// cost/quality balancing (the intelligent-spending knob). Single-target
+    /// tiers ignore this and render as a plain alias.
+    #[serde(default)]
+    pub strategy: RouteStrategy,
+}
+
+/// Multi-target routing strategy, matching agentgateway's `virtualModels`
+/// routing enum (verified against v1.3.1: `failover` | `weighted`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteStrategy {
+    #[default]
+    Failover,
+    Weighted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +421,10 @@ pub struct TierTarget {
     /// Base URL override (e.g. a remote Ollama).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Relative weight for `weighted` routing (ignored under `failover`, where
+    /// target order is priority order). Defaults to 1 when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
 }
 
 /// Providers we render into agentgateway config. Serialized here in
@@ -284,6 +469,26 @@ fn default_readiness_port() -> u16 {
 fn default_mcp_port() -> u16 {
     41002
 }
+fn default_a2a_egress_base() -> u16 {
+    41010
+}
+
+/// Parse an endpoint URL into (scheme, host:port, path). Ports default by
+/// scheme. Used to render gateway A2A backends and to build egress URLs.
+pub fn parse_endpoint(url: &str) -> Option<(String, String, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let host_with_port = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        let port = if scheme == "https" { 443 } else { 80 };
+        format!("{hostport}:{port}")
+    };
+    Some((scheme.to_string(), host_with_port, path.to_string()))
+}
 fn default_stats_port() -> u16 {
     19002
 }
@@ -316,11 +521,15 @@ impl Config {
             model: model.to_string(),
             api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
             base_url: None,
+            weight: None,
         };
         let mut tiers = BTreeMap::new();
         tiers.insert(
             "fast".into(),
-            TierConfig { targets: vec![anthropic("claude-haiku-4-5-20251001")] },
+            TierConfig {
+                targets: vec![anthropic("claude-haiku-4-5-20251001")],
+                strategy: RouteStrategy::Failover,
+            },
         );
         tiers.insert(
             "balanced".into(),
@@ -329,11 +538,15 @@ impl Config {
                     anthropic("claude-sonnet-5"),
                     anthropic("claude-haiku-4-5-20251001"),
                 ],
+                strategy: RouteStrategy::Failover,
             },
         );
         tiers.insert(
             "deep".into(),
-            TierConfig { targets: vec![anthropic("claude-opus-4-8")] },
+            TierConfig {
+                targets: vec![anthropic("claude-opus-4-8")],
+                strategy: RouteStrategy::Failover,
+            },
         );
         Config {
             gateway: GatewayConfig {
@@ -343,6 +556,7 @@ impl Config {
                 readiness_port: default_readiness_port(),
                 stats_port: default_stats_port(),
                 mcp_port: default_mcp_port(),
+                a2a_egress_base: default_a2a_egress_base(),
                 binary: None,
                 endpoint: None,
             },
@@ -350,7 +564,10 @@ impl Config {
             memory: MemoryConfig::default(),
             channels: ChannelsConfig::default(),
             privacy: PrivacyConfig::default(),
+            spending: SpendingConfig::default(),
+            ascension: AscensionConfig::default(),
             mcp: Vec::new(),
+            a2a_agents: Vec::new(),
             tiers,
         }
     }

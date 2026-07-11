@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use revenant_core::config::{Config, GatewayMode};
 use revenant_core::home::Home;
 use std::io::Write;
+use std::path::PathBuf;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7717";
 
@@ -192,6 +193,21 @@ enum Command {
         /// install | uninstall
         action: String,
     },
+    /// Observe the eval scorecard and plan self-improvement candidates (the
+    /// Ascension loop's safe front half — never edits anything).
+    Ascend,
+    /// Run the eval scorecard against the live daemon (proves the numbers).
+    Eval {
+        /// Directory of `*.toml` task files. Omit to use the embedded suite.
+        #[arg(long)]
+        suite: Option<PathBuf>,
+        /// Write the machine-readable JSON report here.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Only run tasks carrying this tag (e.g. speed, memory).
+        #[arg(long)]
+        tag: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -222,8 +238,97 @@ fn main() -> Result<()> {
                 "uninstall" => service::uninstall(),
                 other => bail!("usage: revenant service install|uninstall (got '{other}')"),
             },
+            Command::Eval { suite, json, tag } => cmd_eval(suite, json, tag).await,
+            Command::Ascend => cmd_ascend().await,
         }
     })
+}
+
+async fn cmd_ascend() -> Result<()> {
+    let home = Home::resolve();
+    let cfg = load_config(&home)?;
+    let asc = &cfg.ascension;
+    let client = revenant_client::Client::from_env(&home)?;
+    client
+        .health()
+        .await
+        .context("ascend needs a running daemon — start it with `revenant up`")?;
+
+    println!("🜁 Ascension — observe & plan");
+    println!(
+        "   engine: {} · autonomy: {} · bar: {} proof-runs, >= {:.0}% metric gain, zero regressions",
+        if asc.enabled { "ENABLED" } else { "observe-only (disabled)" },
+        asc.autonomy,
+        asc.proof_runs,
+        asc.min_gain_pct,
+    );
+    println!("   warded paths (never auto-edited): {}", asc.denylist.join(", "));
+    println!();
+
+    // Observe: run the live scorecard, then detect candidates.
+    eprintln!("running eval scorecard to observe current state…");
+    let suite = revenant_evals::default_suite();
+    let report = revenant_evals::run_suite(&client, &suite).await?;
+    println!("{}", report.markdown());
+
+    let candidates = revenant_ascension::detect(&report);
+    if candidates.is_empty() {
+        println!("\nNo improvement candidates — the scorecard is clean. Nothing to raise.");
+        return Ok(());
+    }
+    println!("\n## Candidates (most promising first)\n");
+    for (i, c) in candidates.iter().enumerate() {
+        println!("{}. [{:?}] `{}` — {}", i + 1, c.kind, c.target, c.detail);
+    }
+    println!(
+        "\nNext: the actuator would take each candidate into an ephemeral worktree, \
+         make a bounded change, and only open a `{}`-namespace PR if it clears the bar. \
+         (Autonomous run is gated behind `ascension.enabled`.)",
+        asc.staging_prefix.trim_end_matches('/'),
+    );
+    Ok(())
+}
+
+async fn cmd_eval(
+    suite_dir: Option<PathBuf>,
+    json_out: Option<PathBuf>,
+    tag: Option<String>,
+) -> Result<()> {
+    let home = Home::resolve();
+    let client = revenant_client::Client::from_env(&home)?;
+    // Fail fast with a clear message if the daemon isn't up — evals grade the
+    // live system, not a mock.
+    client
+        .health()
+        .await
+        .context("eval needs a running daemon — start it with `revenant up`")?;
+
+    let mut suite = match &suite_dir {
+        Some(dir) => revenant_evals::load_suite_dir(dir)?,
+        None => revenant_evals::default_suite(),
+    };
+    if let Some(t) = &tag {
+        suite.tasks.retain(|task| task.tags.iter().any(|x| x == t));
+    }
+    if suite.tasks.is_empty() {
+        bail!("no tasks to run (check --suite path / --tag filter)");
+    }
+
+    eprintln!("running {} eval task(s)…", suite.tasks.len());
+    let report = revenant_evals::run_suite(&client, &suite).await?;
+    println!("{}", report.markdown());
+
+    if let Some(path) = json_out {
+        std::fs::write(&path, serde_json::to_vec_pretty(&report.json())?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("wrote JSON report to {}", path.display());
+    }
+
+    // Non-zero exit when any task failed, so CI can gate on the scorecard.
+    if report.passed() < report.outcomes.len() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn cmd_open() -> Result<()> {
@@ -424,6 +529,7 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(home.gateway_bin_dir())?;
     std::fs::create_dir_all(home.workspace_dir())?;
     std::fs::create_dir_all(home.skills_dir())?;
+    std::fs::create_dir_all(home.plugins_dir())?;
     std::fs::create_dir_all(home.logs_dir())?;
 
     // Ship the skill-creator meta-skill on fresh installs so the agent knows

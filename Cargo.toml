@@ -25,6 +25,9 @@ revenant-mcp = { path = "crates/revenant-mcp" }
 revenant-plugin = { path = "crates/revenant-plugin" }
 revenant-plugin-example = { path = "plugins/revenant-plugin-example" }
 revenant-loops = { path = "crates/revenant-loops" }
+revenant-evals = { path = "crates/revenant-evals" }
+revenant-wasm = { path = "crates/revenant-wasm" }
+revenant-ascension = { path = "crates/revenant-ascension" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "sync", "time", "io-util", "io-std", "fs"] }
 tokio-util = "0.7"

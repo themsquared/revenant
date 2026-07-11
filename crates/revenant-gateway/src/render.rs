@@ -44,29 +44,41 @@ pub fn render_gateway_yaml(cfg: &Config, available_env: &HashSet<String>) -> Res
         if usable.len() == 1 {
             models.push(render_model(tier, usable[0], false)?);
         } else {
+            use revenant_core::config::RouteStrategy;
+            let weighted = tier_cfg.strategy == RouteStrategy::Weighted;
             let mut targets = Vec::new();
             for (idx, target) in usable.iter().enumerate() {
                 let internal_name = format!("{tier}/{idx}");
                 let mut model = render_model(&internal_name, target, true)?;
-                // Failover members get outlier detection: a target answering
-                // with "I am broken" codes (auth/quota/missing model/5xx) is
-                // evicted so the virtual model routes to the next priority.
-                // The harness retries the turn once to ride the eviction.
-                model.as_object_mut().unwrap().insert(
-                    "health".into(),
-                    json!({
-                        "unhealthyExpression":
-                            "response.code >= 500 || response.code == 429 || response.code == 401 || response.code == 403 || response.code == 404",
-                        "eviction": { "duration": "60s" },
-                    }),
-                );
+                if weighted {
+                    // Weighted split across providers for cost/quality balance;
+                    // agentgateway distributes traffic by relative weight.
+                    targets.push(
+                        json!({ "model": internal_name, "weight": target.weight.unwrap_or(1) }),
+                    );
+                } else {
+                    // Failover members get outlier detection: a target answering
+                    // with "I am broken" codes (auth/quota/missing model/5xx) is
+                    // evicted so the virtual model routes to the next priority.
+                    // The harness retries the turn once to ride the eviction.
+                    model.as_object_mut().unwrap().insert(
+                        "health".into(),
+                        json!({
+                            "unhealthyExpression":
+                                "response.code >= 500 || response.code == 429 || response.code == 401 || response.code == 403 || response.code == 404",
+                            "eviction": { "duration": "60s" },
+                        }),
+                    );
+                    targets.push(json!({ "model": internal_name, "priority": idx }));
+                }
                 models.push(model);
-                targets.push(json!({ "model": internal_name, "priority": idx }));
             }
-            virtual_models.push(json!({
-                "name": tier,
-                "routing": { "failover": { "targets": targets } },
-            }));
+            let routing = if weighted {
+                json!({ "weighted": { "targets": targets } })
+            } else {
+                json!({ "failover": { "targets": targets } })
+            };
+            virtual_models.push(json!({ "name": tier, "routing": routing }));
         }
     }
     if models.is_empty() {
@@ -78,6 +90,23 @@ pub fn render_gateway_yaml(cfg: &Config, available_env: &HashSet<String>) -> Res
     llm.insert("models".into(), Value::Array(models));
     if !virtual_models.is_empty() {
         llm.insert("virtualModels".into(), Value::Array(virtual_models));
+    }
+    // Global spend cap: a token bucket the gateway enforces on the LLM
+    // listener. Because it lives below the agent, the ceiling holds no matter
+    // what the harness does — the moat property made literal. Bucket capacity
+    // and refill are both `budget` per `interval` → a rolling cap.
+    if cfg.spending.enabled {
+        llm.insert(
+            "policies".into(),
+            json!({
+                "localRateLimit": [{
+                    "maxTokens": cfg.spending.budget,
+                    "tokensPerFill": cfg.spending.budget,
+                    "fillInterval": cfg.spending.interval,
+                    "type": cfg.spending.count.gateway_type(),
+                }]
+            }),
+        );
     }
 
     let mut doc = json!({
@@ -116,6 +145,37 @@ pub fn render_gateway_yaml(cfg: &Config, available_env: &HashSet<String>) -> Res
             "mcp".into(),
             json!({ "port": cfg.gateway.mcp_port, "targets": targets }),
         );
+    }
+
+    // Governed A2A egress: one gateway bind per gateway-routed remote agent.
+    // Marking the route `a2a: {}` enables A2A processing, telemetry, and the
+    // hook for authz/guardrails/rate-limits — the first law extended to
+    // agent-to-agent traffic. `direct` agents are skipped (substrate governs).
+    let mut binds: Vec<Value> = Vec::new();
+    for (idx, agent) in cfg.a2a_agents.iter().enumerate() {
+        if agent.direct {
+            continue;
+        }
+        let Some((scheme, host, _path)) = revenant_core::config::parse_endpoint(&agent.url) else {
+            bail!("a2a agent '{}' has an unparseable url: {}", agent.name, agent.url);
+        };
+        let mut backend = Map::new();
+        backend.insert("host".into(), json!(host));
+        if scheme == "https" {
+            backend.insert("backendTLS".into(), json!({}));
+        }
+        binds.push(json!({
+            "port": cfg.gateway.a2a_egress_base + idx as u16,
+            "listeners": [{
+                "routes": [{
+                    "policies": { "a2a": {} },
+                    "backends": [Value::Object(backend)]
+                }]
+            }]
+        }));
+    }
+    if !binds.is_empty() {
+        doc.as_object_mut().unwrap().insert("binds".into(), Value::Array(binds));
     }
 
     let yaml = serde_yaml::to_string(&doc)?;
@@ -198,11 +258,68 @@ mod tests {
                     model: "qwen3:0.6b".into(),
                     api_key_env: None,
                     base_url: None,
+                    weight: None,
                 }],
+                strategy: revenant_core::config::RouteStrategy::Failover,
             },
         );
         let yaml = render_gateway_yaml(&cfg, &env).unwrap();
         assert!(yaml.contains("name: local"));
         assert!(!yaml.contains("anthropic"));
+    }
+
+    #[test]
+    fn weighted_tier_renders_weighted_routing() {
+        use revenant_core::config::{Provider, RouteStrategy, TierConfig, TierTarget};
+        let env: HashSet<String> =
+            ["ANTHROPIC_API_KEY".to_string(), "OPENAI_API_KEY".to_string()].into();
+        let mut cfg = Config::default_config();
+        cfg.tiers.insert(
+            "balanced".into(),
+            TierConfig {
+                strategy: RouteStrategy::Weighted,
+                targets: vec![
+                    TierTarget {
+                        provider: Provider::OpenAI,
+                        model: "gpt-4o-mini".into(),
+                        api_key_env: Some("OPENAI_API_KEY".into()),
+                        base_url: None,
+                        weight: Some(70),
+                    },
+                    TierTarget {
+                        provider: Provider::Anthropic,
+                        model: "claude-sonnet-5".into(),
+                        api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                        base_url: None,
+                        weight: Some(30),
+                    },
+                ],
+            },
+        );
+        let yaml = render_gateway_yaml(&cfg, &env).unwrap();
+        assert!(yaml.contains("weighted"));
+        assert!(yaml.contains("weight: 70"));
+        assert!(yaml.contains("weight: 30"));
+        // Weighted members carry no failover priority/health.
+        assert!(!yaml.contains("priority:"));
+    }
+
+    #[test]
+    fn spending_cap_renders_local_rate_limit() {
+        use revenant_core::config::BudgetCount;
+        let env: HashSet<String> = ["ANTHROPIC_API_KEY".to_string()].into();
+        let mut cfg = Config::default_config();
+        cfg.spending.enabled = true;
+        cfg.spending.budget = 500_000;
+        cfg.spending.interval = "24h".into();
+        cfg.spending.count = BudgetCount::Tokens;
+        let yaml = render_gateway_yaml(&cfg, &env).unwrap();
+        assert!(yaml.contains("localRateLimit"));
+        assert!(yaml.contains("maxTokens: 500000"));
+        assert!(yaml.contains("fillInterval: 24h"));
+        assert!(yaml.contains("type: tokens"));
+        // Off by default → no policies block.
+        let off = render_gateway_yaml(&Config::default_config(), &env).unwrap();
+        assert!(!off.contains("localRateLimit"));
     }
 }

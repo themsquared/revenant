@@ -10,3 +10,7 @@ secrets.env
 
 # release artifacts
 dist/
+
+# Nested workspaces (e.g. wasm example plugins) have their own target dirs
+examples/**/target/
+**/target/

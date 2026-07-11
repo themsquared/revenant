@@ -78,10 +78,111 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
         .route("/v1/channels/pairings", post(pairing_create))
+        // A2A: revenant as a callable node in the agent mesh (authed).
+        .route("/a2a", post(a2a_message))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state);
+        .with_state(state.clone());
 
-    api.fallback(serve_ui)
+    // The A2A agent card is discovery — served unauthenticated (loopback).
+    Router::new()
+        .route("/.well-known/agent-card.json", get(agent_card))
+        .with_state(state)
+        .merge(api)
+        .fallback(serve_ui)
+}
+
+/// A2A agent card (well-known discovery document) describing revenant as an
+/// agent other agents can call. Shape follows the A2A AgentCard schema.
+async fn agent_card(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let skills: Vec<serde_json::Value> = state
+        .manager
+        .runtime()
+        .skills
+        .list()
+        .into_iter()
+        .map(|s| json!({ "id": s.name, "name": s.name, "description": s.description, "tags": [] }))
+        .collect();
+    let base = std::env::var("REVENANT_URL").unwrap_or_else(|_| "http://127.0.0.1:7717".to_string());
+    Json(json!({
+        "protocolVersion": "0.3.0",
+        "name": "revenant",
+        "description": "A lean, security-first personal agent. Gateway-native: keys, spend, and \
+            data boundaries enforced beneath the agent. Send it a task; it does not stop.",
+        "url": format!("{base}/a2a"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "capabilities": { "streaming": false, "pushNotifications": false },
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "securitySchemes": {
+            "bearer": { "type": "http", "scheme": "bearer" }
+        },
+        "security": [{ "bearer": [] }],
+        "skills": if skills.is_empty() {
+            json!([{ "id": "chat", "name": "chat", "description": "General assistance, tools, memory.", "tags": ["general"] }])
+        } else {
+            json!(skills)
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+struct A2aRpc {
+    #[serde(default)]
+    id: serde_json::Value,
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+/// A2A JSON-RPC endpoint. Implements `message/send`: extract the text parts,
+/// run a full revenant turn, return the reply as an A2A agent message.
+async fn a2a_message(
+    State(state): State<AppState>,
+    Json(rpc): Json<A2aRpc>,
+) -> Json<serde_json::Value> {
+    let rpc_err = |id: &serde_json::Value, code: i64, msg: &str| {
+        Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } }))
+    };
+    if rpc.method != "message/send" {
+        return rpc_err(&rpc.id, -32601, &format!("unsupported A2A method '{}'", rpc.method));
+    }
+    // Concatenate the text parts of the incoming message.
+    let text: String = rpc
+        .params
+        .pointer("/message/parts")
+        .and_then(|p| p.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return rpc_err(&rpc.id, -32602, "message has no text parts");
+    }
+
+    let runtime = state.manager.runtime();
+    let session_id = match runtime.store.ensure_session("a2a", "peer", "chat").await {
+        Ok(id) => id,
+        Err(err) => return rpc_err(&rpc.id, -32603, &format!("session: {err:#}")),
+    };
+    match runtime
+        .run_turn(session_id, state.default_tier, vec![revenant_core::ContentBlock::text(text)])
+        .await
+    {
+        Ok(stats) => Json(json!({
+            "jsonrpc": "2.0",
+            "id": rpc.id,
+            "result": {
+                "role": "agent",
+                "parts": [{ "kind": "text", "text": stats.final_text }],
+                "kind": "message"
+            }
+        })),
+        Err(err) => rpc_err(&rpc.id, -32603, &format!("turn failed: {err:#}")),
+    }
 }
 
 /// Serve an embedded UI asset, falling back to index.html for SPA routes.

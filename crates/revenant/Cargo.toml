@@ -23,6 +23,9 @@ revenant-memory = { workspace = true }
 revenant-channels = { workspace = true }
 revenant-loops = { workspace = true }
 revenant-mcp = { workspace = true }
+revenant-evals = { workspace = true }
+revenant-wasm = { workspace = true }
+revenant-ascension = { workspace = true }
 # Bundled reference plugin, compiled in via the default `plugins` feature.
 revenant-plugin-example = { workspace = true, optional = true }
 serde_json = { workspace = true }

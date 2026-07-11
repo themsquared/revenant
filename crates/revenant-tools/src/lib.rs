@@ -58,18 +58,42 @@ pub struct ToolRegistry {
     tools: Arc<BTreeMap<String, Arc<dyn Tool>>>,
 }
 
+/// A resolved A2A peer the `call_agent` tool can reach: `url` is already the
+/// governed gateway-egress URL (or the direct URL on a substrate), and `token`
+/// is the resolved bearer, if any.
+#[derive(Clone)]
+pub struct A2aTarget {
+    pub name: String,
+    pub url: String,
+    pub token: Option<String>,
+    pub via_gateway: bool,
+}
+
 impl ToolRegistry {
-    pub fn builtin(home: &Home, skills: Arc<SkillIndex>) -> Self {
+    pub fn builtin(
+        home: &Home,
+        skills: Arc<SkillIndex>,
+        a2a: Vec<A2aTarget>,
+        extra: Vec<Arc<dyn Tool>>,
+    ) -> Self {
         let mut tools: BTreeMap<String, Arc<dyn Tool>> = BTreeMap::new();
-        // Plugin-contributed tools first; built-ins win any name clash so a
-        // plugin extends rather than silently overrides core capabilities.
+        // Plugin-contributed tools first (compiled-in via inventory, plus any
+        // dynamically-loaded `extra` such as WASM plugins); built-ins win any
+        // name clash so a plugin extends rather than silently overrides core.
         for plugin in inventory::iter::<ToolPlugin> {
             let tool = (plugin.make)();
+            tools.insert(tool.spec().name.clone(), tool);
+        }
+        for tool in extra {
             tools.insert(tool.spec().name.clone(), tool);
         }
         let plugin_count = tools.len();
         for tool in builtins::all(home, skills) {
             tools.insert(tool.spec().name.clone(), tool);
+        }
+        if !a2a.is_empty() {
+            let t = Arc::new(builtins::CallAgent::new(a2a));
+            tools.insert(t.spec().name.clone(), t);
         }
         if plugin_count > 0 {
             tracing::info!("loaded {plugin_count} plugin tool(s)");
