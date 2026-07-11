@@ -70,12 +70,21 @@ pub struct A2aTarget {
 }
 
 impl ToolRegistry {
-    pub fn builtin(home: &Home, skills: Arc<SkillIndex>, a2a: Vec<A2aTarget>) -> Self {
+    pub fn builtin(
+        home: &Home,
+        skills: Arc<SkillIndex>,
+        a2a: Vec<A2aTarget>,
+        extra: Vec<Arc<dyn Tool>>,
+    ) -> Self {
         let mut tools: BTreeMap<String, Arc<dyn Tool>> = BTreeMap::new();
-        // Plugin-contributed tools first; built-ins win any name clash so a
-        // plugin extends rather than silently overrides core capabilities.
+        // Plugin-contributed tools first (compiled-in via inventory, plus any
+        // dynamically-loaded `extra` such as WASM plugins); built-ins win any
+        // name clash so a plugin extends rather than silently overrides core.
         for plugin in inventory::iter::<ToolPlugin> {
             let tool = (plugin.make)();
+            tools.insert(tool.spec().name.clone(), tool);
+        }
+        for tool in extra {
             tools.insert(tool.spec().name.clone(), tool);
         }
         let plugin_count = tools.len();

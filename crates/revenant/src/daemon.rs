@@ -89,7 +89,11 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
             revenant_tools::A2aTarget { name: a.name.clone(), url, token, via_gateway }
         })
         .collect();
-    let tools = ToolRegistry::builtin(home, skills.clone(), a2a_targets);
+    let wasm_tools = revenant_wasm::load_dir(&home.plugins_dir());
+    if !wasm_tools.is_empty() {
+        tracing::info!("loaded {} sandboxed wasm plugin tool(s)", wasm_tools.len());
+    }
+    let tools = ToolRegistry::builtin(home, skills.clone(), a2a_targets, wasm_tools);
     let agents = Arc::new(revenant_agent::AgentRegistry::new(home.agents_dir()));
     match agents.scan() {
         Ok(n) if n > 0 => tracing::info!("indexed {n} subagent definitions"),

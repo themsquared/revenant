@@ -480,6 +480,7 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(home.gateway_bin_dir())?;
     std::fs::create_dir_all(home.workspace_dir())?;
     std::fs::create_dir_all(home.skills_dir())?;
+    std::fs::create_dir_all(home.plugins_dir())?;
     std::fs::create_dir_all(home.logs_dir())?;
 
     // Ship the skill-creator meta-skill on fresh installs so the agent knows
