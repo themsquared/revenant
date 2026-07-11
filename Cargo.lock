@@ -2685,6 +2685,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "inventory",
+ "regex",
  "reqwest",
  "revenant-core",
  "revenant-memory",
