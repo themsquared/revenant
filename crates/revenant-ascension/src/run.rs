@@ -47,6 +47,7 @@ pub async fn run_candidate(
     cfg: &RunConfig,
     state_dir: &Path,
     today: &str,
+    task_override: Option<&str>,
 ) -> Result<RunOutcome> {
     let mut notes = Vec::new();
     let slug = slugify(&candidate.target);
@@ -69,7 +70,10 @@ pub async fn run_candidate(
     let root = wt.path.to_string_lossy().to_string();
 
     // Implement, with a repair loop: feed compile errors back to the agent.
-    let mut task = task_for(&candidate);
+    // An explicit override lets a caller point the actuator at any task, not
+    // just an eval-derived candidate.
+    let base_task = task_override.map(String::from).unwrap_or_else(|| task_for(&candidate));
+    let mut task = base_task.clone();
     let mut build_ok = false;
     for pass in 0..cfg.max_repair.max(1) {
         client
@@ -84,7 +88,7 @@ pub async fn run_candidate(
         }
         task = format!(
             "{}\n\nYour previous edit does NOT compile. Fix exactly these errors, minimally:\n{}",
-            task_for(&candidate),
+            base_task,
             tail(&out, 3000)
         );
     }

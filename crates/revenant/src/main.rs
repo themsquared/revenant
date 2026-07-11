@@ -201,6 +201,10 @@ enum Command {
         run: bool,
         #[arg(long)]
         live: bool,
+        /// Drive the actuator on an explicit task instead of an eval-derived
+        /// candidate (e.g. "fix the clippy warning in crates/foo/src/bar.rs").
+        #[arg(long)]
+        fix: Option<String>,
     },
     /// Run a Necropolis directory server (the horde's muster point).
     Necropolis {
@@ -258,7 +262,7 @@ fn main() -> Result<()> {
                 other => bail!("usage: revenant service install|uninstall (got '{other}')"),
             },
             Command::Eval { suite, json, tag } => cmd_eval(suite, json, tag).await,
-            Command::Ascend { run, live } => cmd_ascend(run, live).await,
+            Command::Ascend { run, live, fix } => cmd_ascend(run, live, fix).await,
             Command::Necropolis { port, db } => cmd_necropolis(port, db).await,
             Command::Net { action } => cmd_net(action).await,
         }
@@ -460,7 +464,7 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_ascend(run: bool, live: bool) -> Result<()> {
+async fn cmd_ascend(run: bool, live: bool, fix: Option<String>) -> Result<()> {
     let home = Home::resolve();
     let cfg = load_config(&home)?;
     let asc = cfg.ascension.clone();
@@ -469,6 +473,32 @@ async fn cmd_ascend(run: bool, live: bool) -> Result<()> {
         .health()
         .await
         .context("ascend needs a running daemon — start it with `revenant up`")?;
+
+    // --fix: drive the actuator on an explicit task, skipping eval detection.
+    if let Some(task) = fix {
+        let repo = std::env::current_dir()?;
+        if !repo.join(".git").exists() {
+            bail!("`revenant ascend --fix` must run from the revenant git repo (cwd has no .git)");
+        }
+        let candidate = revenant_ascension::Candidate {
+            kind: revenant_ascension::CandidateKind::FailingTask,
+            target: "adhoc-fix".into(),
+            detail: task.clone(),
+            priority: 100.0,
+        };
+        println!(
+            "🜁 ACTUATOR — ad-hoc task in an isolated worktree{}:\n   {task}\n",
+            if live { " (LIVE)" } else { " (dry-run offer)" }
+        );
+        let run_cfg = ascend_run_cfg(&asc, live);
+        let today = (now_ts() / 86_400).to_string();
+        let outcome = revenant_ascension::run::run_candidate(
+            &client, &repo, candidate, &run_cfg, home.root(), &today, Some(&task),
+        )
+        .await?;
+        print_ascend_outcome(&outcome);
+        return Ok(());
+    }
 
     println!("🜁 Ascension — observe & plan");
     println!(
@@ -511,7 +541,21 @@ async fn cmd_ascend(run: bool, live: bool) -> Result<()> {
         top.target,
         if live { " (LIVE — will open a real PR if approved)" } else { " (dry-run offer)" },
     );
-    let run_cfg = revenant_ascension::run::RunConfig {
+    let run_cfg = ascend_run_cfg(&asc, live);
+    let today = (now_ts() / 86_400).to_string();
+    let outcome = revenant_ascension::run::run_candidate(
+        &client, &repo, top, &run_cfg, home.root(), &today, None,
+    )
+    .await?;
+    print_ascend_outcome(&outcome);
+    Ok(())
+}
+
+fn ascend_run_cfg(
+    asc: &revenant_core::config::AscensionConfig,
+    live: bool,
+) -> revenant_ascension::run::RunConfig {
+    revenant_ascension::run::RunConfig {
         coder_tier: asc.reviewer_tier.clone(),
         reviewer_tier: asc.reviewer_tier.clone(),
         base_branch: asc.base_branch.clone(),
@@ -520,12 +564,10 @@ async fn cmd_ascend(run: bool, live: bool) -> Result<()> {
         denylist: asc.denylist.clone(),
         max_repair: 5,
         live,
-    };
-    let today = (now_ts() / 86_400).to_string();
-    let outcome =
-        revenant_ascension::run::run_candidate(&client, &repo, top, &run_cfg, home.root(), &today)
-            .await?;
+    }
+}
 
+fn print_ascend_outcome(outcome: &revenant_ascension::run::RunOutcome) {
     println!("── actuator outcome ──");
     println!(
         "build={} test={} clippy={} · files={:?}",
@@ -540,7 +582,6 @@ async fn cmd_ascend(run: bool, live: bool) -> Result<()> {
     for n in &outcome.notes {
         println!("· {n}");
     }
-    Ok(())
 }
 
 async fn cmd_eval(
