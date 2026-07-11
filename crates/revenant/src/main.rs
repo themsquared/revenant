@@ -247,6 +247,14 @@ enum Command {
         #[arg(long)]
         fix: Option<String>,
     },
+    /// Gatekeeper: independently review open machine-authored (`ascension`) PRs
+    /// and label them ascension-approved / ascension-blocked for your merge.
+    PrReview {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Run a Necropolis directory server (the horde's muster point).
     Necropolis {
         #[arg(long, default_value_t = 7720)]
@@ -309,6 +317,7 @@ fn main() -> Result<()> {
             },
             Command::Eval { suite, json, tag, agent } => cmd_eval(suite, json, tag, agent).await,
             Command::Ascend { run, live, fix } => cmd_ascend(run, live, fix).await,
+            Command::PrReview { repo, limit } => cmd_pr_review(repo, limit).await,
             Command::Necropolis { port, db } => cmd_necropolis(port, db).await,
             Command::Net { action } => cmd_net(action).await,
         }
@@ -594,6 +603,96 @@ async fn cmd_ascend(run: bool, live: bool, fix: Option<String>) -> Result<()> {
     )
     .await?;
     print_ascend_outcome(&outcome);
+    Ok(())
+}
+
+fn gh_capture(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("gh").args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+async fn cmd_pr_review(repo: Option<String>, limit: Option<usize>) -> Result<()> {
+    let home = Home::resolve();
+    let cfg = load_config(&home)?;
+    let asc = cfg.ascension.clone();
+    let client = revenant_client::Client::from_env(&home)?;
+    client
+        .health()
+        .await
+        .context("pr-review needs a running daemon — start it with `revenant up`")?;
+    let repo = repo.unwrap_or_else(|| "themsquared/revenant".to_string());
+
+    // Ensure the verdict labels exist (idempotent).
+    for (name, color, desc) in [
+        ("ascension-approved", "0e8a16", "gatekeeper approved — ready for human merge"),
+        ("ascension-blocked", "b60205", "gatekeeper blocked — do not merge as-is"),
+    ] {
+        let _ = std::process::Command::new("gh")
+            .args(["label", "create", name, "--repo", &repo, "--color", color, "--description", desc, "--force"])
+            .output();
+    }
+
+    // Open, machine-authored PRs (the `ascension` label).
+    let list = gh_capture(&["pr", "list", "--repo", &repo, "--label", "ascension", "--state", "open", "--json", "number,title"])
+        .context("gh pr list failed (is gh authed?)")?;
+    let mut prs: Vec<serde_json::Value> = serde_json::from_str(&list).unwrap_or_default();
+    if let Some(n) = limit {
+        prs.truncate(n);
+    }
+    if prs.is_empty() {
+        println!("No open `ascension` PRs to review on {repo}.");
+        return Ok(());
+    }
+
+    println!("🜁 Gatekeeper — independently reviewing {} PR(s) on {repo}\n", prs.len());
+    let (mut approved, mut blocked) = (0, 0);
+    for pr in prs {
+        let n = pr["number"].as_i64().unwrap_or(0);
+        let title = pr["title"].as_str().unwrap_or("").to_string();
+        let ns = n.to_string();
+        let body = gh_capture(&["pr", "view", &ns, "--repo", &repo, "--json", "body", "-q", ".body"])
+            .unwrap_or_default();
+        let diff = gh_capture(&["pr", "diff", &ns, "--repo", &repo]).unwrap_or_default();
+        if diff.trim().is_empty() {
+            println!("  PR #{n} {title}\n    → skipped (no diff available)");
+            continue;
+        }
+        let verdict = revenant_ascension::review::review_pr(
+            &client, &asc.reviewer_tier, &title, &body, &diff, &asc.denylist,
+        )
+        .await?;
+        let (add, rm, mark) = if verdict.approved {
+            approved += 1;
+            ("ascension-approved", "ascension-blocked", "✅ APPROVED")
+        } else {
+            blocked += 1;
+            ("ascension-blocked", "ascension-approved", "🛑 CHANGES REQUESTED")
+        };
+        let reasons = verdict
+            .reasons
+            .iter()
+            .chain(verdict.concerns.iter())
+            .map(|r| format!("- {r}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let comment = format!(
+            "## 🜁 Ascension gatekeeper — {mark} (confidence {:.2})\n\n{reasons}\n\n_Independent owner-side review (Gate 2). A human still makes the final merge decision._",
+            verdict.confidence
+        );
+        let _ = std::process::Command::new("gh")
+            .args(["pr", "comment", &ns, "--repo", &repo, "--body", &comment])
+            .output();
+        let _ = std::process::Command::new("gh")
+            .args(["pr", "edit", &ns, "--repo", &repo, "--add-label", add])
+            .output();
+        let _ = std::process::Command::new("gh")
+            .args(["pr", "edit", &ns, "--repo", &repo, "--remove-label", rm])
+            .output();
+        println!("  PR #{n} {title}\n    → {mark} (conf {:.2}) · labeled `{add}`", verdict.confidence);
+    }
+    println!(
+        "\n{approved} approved · {blocked} blocked. Review the `ascension-approved` PRs and merge the ones you want:\n  gh pr list --repo {repo} --label ascension-approved"
+    );
     Ok(())
 }
 

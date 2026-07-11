@@ -71,6 +71,54 @@ pub async fn review(
     Ok(parse_verdict(&reply))
 }
 
+/// The OWNER'S independent gatekeeper review of an already-open PR (Gate 2).
+/// Distinct from the author-side reviewer above: it sees the real diff + PR
+/// body, assumes an author reviewer already passed, and is the skeptical
+/// second opinion whose only job is to keep trash out of the repo. Fails
+/// closed (unparseable = request changes) and hard-rejects warded paths.
+pub async fn review_pr(
+    client: &Client,
+    tier: &str,
+    title: &str,
+    body: &str,
+    diff: &str,
+    denylist: &[String],
+) -> Result<ReviewVerdict> {
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/").or_else(|| line.strip_prefix("--- a/")) {
+            for deny in denylist {
+                if path.starts_with(deny) {
+                    return Ok(ReviewVerdict::rejected(format!(
+                        "PR touches warded path {path:?} — blocked"
+                    )));
+                }
+            }
+        }
+    }
+    const MAX_DIFF: usize = 24_000;
+    let (diff_shown, truncated) = if diff.len() > MAX_DIFF {
+        (&diff[..MAX_DIFF], true)
+    } else {
+        (diff, false)
+    };
+    let prompt = format!(
+        "You are the repository OWNER'S independent gatekeeper on a machine-authored pull request. \
+A separate author-side reviewer already approved it — you are the SECOND, skeptical opinion, and \
+your only job is to keep trash out of the repo before a human spends a merge click. Be adversarial; \
+default to REQUEST CHANGES under any real doubt, but do not manufacture doubt.\n\n\
+Approve only if ALL hold: the diff genuinely does what the PR claims; it's minimal and coherent (no \
+unrelated edits, no dead code, no needless new dependencies / supply-chain surface); no plausible \
+bug, security issue, or regression; and it's actually worth merging.\n\n\
+## PR title\n{title}\n\n## PR body (author's evidence)\n{body}\n\n## Diff{}\n```diff\n{}\n```\n\n\
+Reply with ONLY a JSON object, no prose:\n\
+{{\"approved\": <bool>, \"confidence\": <0..1>, \"concerns\": [<string>...], \"reasons\": [<string>...]}}",
+        if truncated { " (truncated — a huge diff is itself suspect)" } else { "" },
+        diff_shown,
+    );
+    let reply = ask(client, &prompt, tier).await?;
+    Ok(parse_verdict(&reply))
+}
+
 fn build_prompt(evidence: &EvidenceBundle, diff: &str) -> String {
     // Truncate very large diffs so the reviewer stays in budget; a huge diff
     // is itself a reason to be suspicious, which we note.
