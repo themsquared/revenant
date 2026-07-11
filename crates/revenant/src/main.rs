@@ -200,6 +200,9 @@ enum Command {
     Necropolis {
         #[arg(long, default_value_t = 7720)]
         port: u16,
+        /// Ledger file (durable, hash-linked). Defaults to ~/.revenant/necropolis.db.
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Revenant-only network: register | peers | publish <kind> <file> | list [kind] | pull <id>
     Net {
@@ -250,18 +253,21 @@ fn main() -> Result<()> {
             },
             Command::Eval { suite, json, tag } => cmd_eval(suite, json, tag).await,
             Command::Ascend => cmd_ascend().await,
-            Command::Necropolis { port } => cmd_necropolis(port).await,
+            Command::Necropolis { port, db } => cmd_necropolis(port, db).await,
             Command::Net { action } => cmd_net(action).await,
         }
     })
 }
 
-async fn cmd_necropolis(port: u16) -> Result<()> {
+async fn cmd_necropolis(port: u16, db: Option<PathBuf>) -> Result<()> {
     use std::sync::{Arc, Mutex};
-    let dir = Arc::new(Mutex::new(revenant_net::necropolis::Directory::default()));
+    let home = Home::resolve();
+    let db_path = db.unwrap_or_else(|| home.root().join("necropolis.db"));
+    let dir = revenant_net::necropolis::Directory::open(&db_path.to_string_lossy())
+        .context("opening Necropolis ledger")?;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    println!("🜁 Necropolis — the horde musters at http://{addr}");
-    revenant_net::necropolis::serve(addr, dir).await
+    println!("🜁 Necropolis — the horde musters at http://{addr} (ledger: {})", db_path.display());
+    revenant_net::necropolis::serve(addr, Arc::new(Mutex::new(dir))).await
 }
 
 fn now_ts() -> i64 {

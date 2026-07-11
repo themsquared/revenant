@@ -1,0 +1,34 @@
+# Fly.io app for the canonical Necropolis directory + hash-linked ledger.
+# The ledger lives on a persistent volume so history survives restarts.
+#
+# First deploy (from repo root; not yet validated — run and confirm):
+#   fly launch --no-deploy --dockerfile deploy/necropolis/Dockerfile
+#   fly volumes create necropolis_data --size 1
+#   fly deploy
+#
+# NOTE: `app` name below is a placeholder — set your own before deploying.
+app = "revenant-necropolis"
+primary_region = "iad"
+
+[build]
+  dockerfile = "deploy/necropolis/Dockerfile"
+
+[env]
+  PORT = "8080"
+  NECROPOLIS_DB = "/data/necropolis.db"
+
+[mounts]
+  source = "necropolis_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # a directory should stay up
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    method = "get"
+    path = "/health"
+    interval = "15s"
+    timeout = "2s"
