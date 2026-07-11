@@ -150,16 +150,22 @@ pub struct AscensionConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Outward-facing autonomy for a proven change: `propose` (write branch
-    /// locally, human opens PR) | `staging` (auto-open PR into staging
-    /// namespace, human promotes) | `upstream` (auto-open PR to base branch).
+    /// locally, human opens PR) | `staging` (auto-open PR into a staging
+    /// namespace) | `upstream` (auto-open PR straight to the OSS base branch).
+    /// Every mode still passes the adversarial reviewer-agent gate first, and
+    /// a human does the final merge (branch protection is the backstop).
     #[serde(default = "default_autonomy")]
     pub autonomy: String,
-    /// Branch namespace for staging-mode PRs.
+    /// Branch namespace for machine-authored PR head branches.
     #[serde(default = "default_staging_prefix")]
     pub staging_prefix: String,
     /// The branch proven changes are measured against and PR'd toward.
     #[serde(default = "default_base_branch")]
     pub base_branch: String,
+    /// Model tier the reviewer agent runs on (default: the smartest tier —
+    /// the gate should be sharper than the author).
+    #[serde(default = "default_reviewer_tier")]
+    pub reviewer_tier: String,
     /// Hard cap on machine-authored PRs per day.
     #[serde(default = "default_max_prs")]
     pub max_prs_per_day: u32,
@@ -181,6 +187,7 @@ impl Default for AscensionConfig {
             autonomy: default_autonomy(),
             staging_prefix: default_staging_prefix(),
             base_branch: default_base_branch(),
+            reviewer_tier: default_reviewer_tier(),
             max_prs_per_day: default_max_prs(),
             proof_runs: default_proof_runs(),
             min_gain_pct: default_min_gain(),
@@ -190,10 +197,15 @@ impl Default for AscensionConfig {
 }
 
 fn default_autonomy() -> String {
-    "staging".to_string()
+    // The operator's choice: proven changes PR straight to the OSS repo,
+    // gated by the reviewer agent + a human final merge.
+    "upstream".to_string()
 }
 fn default_staging_prefix() -> String {
     "self-improve/".to_string()
+}
+fn default_reviewer_tier() -> String {
+    "deep".to_string()
 }
 fn default_base_branch() -> String {
     "main".to_string()

@@ -2326,6 +2326,8 @@ name = "revenant-ascension"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
+ "revenant-client",
  "revenant-core",
  "revenant-evals",
  "serde",

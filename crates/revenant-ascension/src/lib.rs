@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub mod config;
+pub mod offer;
+pub mod review;
 pub use config::AscensionConfig;
 
 // --- observe -------------------------------------------------------------
