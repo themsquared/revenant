@@ -2,6 +2,13 @@
   publish = "site"
   # static site — no build step
 
+# Pretty URL: /marketplace serves marketplace.html (200 = rewrite, URL stays
+# clean). The reliable Netlify equivalent of a symlink.
+[[redirects]]
+  from = "/marketplace"
+  to = "/marketplace.html"
+  status = 200
+
 [[headers]]
   for = "/*"
   [headers.values]

@@ -80,9 +80,11 @@ const $ = s => document.querySelector(s);
 const grid = $('#grid'), statusEl = $('#status'), emptyEl = $('#empty');
 const KINDS = ['skill','plugin','improvement','signal'];
 
-// Necropolis URL: ?necropolis= param, else last-used, else blank.
+// The one canonical Necropolis (the horde has a single directory). Override
+// with ?necropolis= for a local/dev directory; otherwise this is the default.
+const DEFAULT_NECROPOLIS = 'https://necropolis.revenantai.dev';
 const params = new URLSearchParams(location.search);
-$('#url').value = params.get('necropolis') || localStorage.getItem('necropolis') || '';
+$('#url').value = params.get('necropolis') || localStorage.getItem('necropolis') || DEFAULT_NECROPOLIS;
 
 function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function short(s){ return s ? s.slice(0,8) : '?'; }
