@@ -21,6 +21,9 @@ pub struct Config {
     /// Self-improvement loop (opens eval-proven PRs; off by default).
     #[serde(default)]
     pub ascension: AscensionConfig,
+    /// The revenant-only network (the horde): Necropolis directory + P2P.
+    #[serde(default)]
+    pub network: NetworkConfig,
     /// MCP servers multiplexed behind the gateway (the plugin bus).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServer>,
@@ -219,6 +222,24 @@ fn default_proof_runs() -> usize {
 fn default_min_gain() -> f64 {
     5.0
 }
+/// The revenant-only network. Off by default; joining is deliberate. When
+/// enabled, the revenant musters at `necropolis_url` and advertises `endpoint`
+/// (its A2A address) so peers can reach it directly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory to register/discover/publish at (the horde's muster point).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub necropolis_url: Option<String>,
+    /// This revenant's publicly reachable A2A endpoint, advertised to peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Auto-publish eval-proven Ascension molts to the network.
+    #[serde(default)]
+    pub auto_publish: bool,
+}
+
 /// The wards guard themselves: security, gateway key handling, the approval
 /// broker, the WASM sandbox, the Ascension engine, and CI are off-limits to
 /// autonomous change.
@@ -578,6 +599,7 @@ impl Config {
             privacy: PrivacyConfig::default(),
             spending: SpendingConfig::default(),
             ascension: AscensionConfig::default(),
+            network: NetworkConfig::default(),
             mcp: Vec::new(),
             a2a_agents: Vec::new(),
             tiers,

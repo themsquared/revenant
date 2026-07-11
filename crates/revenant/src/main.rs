@@ -196,6 +196,16 @@ enum Command {
     /// Observe the eval scorecard and plan self-improvement candidates (the
     /// Ascension loop's safe front half — never edits anything).
     Ascend,
+    /// Run a Necropolis directory server (the horde's muster point).
+    Necropolis {
+        #[arg(long, default_value_t = 7720)]
+        port: u16,
+    },
+    /// Revenant-only network: register | peers | publish <kind> <file> | list [kind] | pull <id>
+    Net {
+        #[arg(num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]
+        action: Vec<String>,
+    },
     /// Run the eval scorecard against the live daemon (proves the numbers).
     Eval {
         /// Directory of `*.toml` task files. Omit to use the embedded suite.
@@ -240,8 +250,100 @@ fn main() -> Result<()> {
             },
             Command::Eval { suite, json, tag } => cmd_eval(suite, json, tag).await,
             Command::Ascend => cmd_ascend().await,
+            Command::Necropolis { port } => cmd_necropolis(port).await,
+            Command::Net { action } => cmd_net(action).await,
         }
     })
+}
+
+async fn cmd_necropolis(port: u16) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+    let dir = Arc::new(Mutex::new(revenant_net::necropolis::Directory::default()));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    println!("🜁 Necropolis — the horde musters at http://{addr}");
+    revenant_net::necropolis::serve(addr, dir).await
+}
+
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+async fn cmd_net(action: Vec<String>) -> Result<()> {
+    let home = Home::resolve();
+    let cfg = load_config(&home).ok();
+    let id = revenant_net::Identity::load_or_create(&home.identity_dir())?;
+    let url = std::env::var("REVENANT_NECROPOLIS")
+        .ok()
+        .or_else(|| cfg.as_ref().and_then(|c| c.network.necropolis_url.clone()))
+        .context("no Necropolis URL — set REVENANT_NECROPOLIS or [network].necropolis_url")?;
+    let client = revenant_net::NecropolisClient::new(&url);
+
+    let verb = action.first().map(String::as_str).unwrap_or("");
+    match verb {
+        "id" => println!("{} (fingerprint {})", id.id(), id.fingerprint()),
+        "register" => {
+            let endpoint = cfg
+                .as_ref()
+                .and_then(|c| c.network.endpoint.clone())
+                .unwrap_or_else(|| "http://127.0.0.1:7717/a2a".to_string());
+            client.register(&id.id(), &endpoint, &["chat".into(), "ascension".into()]).await?;
+            println!("mustered at {url} as {} (endpoint {endpoint})", id.fingerprint());
+        }
+        "peers" => {
+            for p in client.peers().await? {
+                println!(
+                    "{}  rep(published={}, adopted={})  {}",
+                    &p["id"].as_str().unwrap_or("")[..8.min(p["id"].as_str().unwrap_or("").len())],
+                    p["reputation"]["published"], p["reputation"]["adopted"], p["endpoint"],
+                );
+            }
+        }
+        "publish" => {
+            let kind_s = action.get(1).context("usage: net publish <kind> <file> [title]")?;
+            let file = action.get(2).context("usage: net publish <kind> <file> [title]")?;
+            let title = action.get(3).cloned().unwrap_or_else(|| file.clone());
+            let kind: revenant_net::ArtifactKind =
+                serde_json::from_value(serde_json::Value::String(kind_s.clone()))
+                    .with_context(|| format!("bad kind '{kind_s}' (skill|plugin|signal|improvement)"))?;
+            let bytes = std::fs::read(file).with_context(|| format!("reading {file}"))?;
+            let artifact = revenant_net::Artifact::create(
+                &id, kind, title, "", &bytes, None, now_ts(),
+            );
+            let aid = client.publish(&artifact).await?;
+            println!("published {} artifact {}", kind_s, &aid[..12]);
+        }
+        "list" => {
+            for a in client.list(action.get(1).map(String::as_str)).await? {
+                println!(
+                    "{}  [{}]  {}  by {}  {}",
+                    &a["id"].as_str().unwrap_or("")[..12.min(a["id"].as_str().unwrap_or("").len())],
+                    a["kind"].as_str().unwrap_or("?"),
+                    a["title"].as_str().unwrap_or(""),
+                    &a["author"].as_str().unwrap_or("")[..8.min(a["author"].as_str().unwrap_or("").len())],
+                    if a["has_eval_proof"].as_bool().unwrap_or(false) { "✅proof" } else { "" },
+                );
+            }
+        }
+        "pull" => {
+            let aid = action.get(1).context("usage: net pull <id> [out-file]")?;
+            let artifact = client.pull(aid).await?; // verifies signature + hash
+            println!(
+                "pulled '{}' [{:?}] by {} — signature VERIFIED",
+                artifact.title,
+                artifact.kind,
+                &artifact.author[..8],
+            );
+            if let Some(out) = action.get(2) {
+                std::fs::write(out, artifact.payload()?)?;
+                println!("wrote payload to {out}");
+            }
+        }
+        other => bail!("unknown net command '{other}' (id|register|peers|publish|list|pull)"),
+    }
+    Ok(())
 }
 
 async fn cmd_ascend() -> Result<()> {
@@ -530,6 +632,7 @@ async fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(home.workspace_dir())?;
     std::fs::create_dir_all(home.skills_dir())?;
     std::fs::create_dir_all(home.plugins_dir())?;
+    std::fs::create_dir_all(home.identity_dir())?;
     std::fs::create_dir_all(home.logs_dir())?;
 
     // Ship the skill-creator meta-skill on fresh installs so the agent knows
