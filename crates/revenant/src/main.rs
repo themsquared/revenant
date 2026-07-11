@@ -100,6 +100,38 @@ loop until the result actually meets the goal.
   loop via `exec` before spending a critique pass.
 "#;
 
+/// Autoresearch methodology skill — drives web_search + web_fetch well.
+const AUTORESEARCH_SKILL: &str = r#"---
+name: autoresearch
+description: Use for any question that needs current, external, or factual information you can't answer from memory — research it with web_search + web_fetch and answer with citations.
+---
+
+# Autoresearch
+
+When a question needs facts you don't already hold (current events, docs,
+prices, comparisons, "what is X", "how do I Y with library Z"), do not guess.
+Research it.
+
+## Method
+1. **Decompose** the question into 2–4 distinct search angles. Different
+   phrasings surface different sources.
+2. **web_search** each angle. Skim titles + snippets; pick the most credible,
+   most relevant URLs (prefer primary sources, official docs, reputable orgs).
+3. **web_fetch** the top 2–5 URLs. Read the actual content — snippets lie.
+4. **Cross-check**: a claim that matters should appear in ≥2 independent
+   sources, or be flagged as single-sourced/uncertain.
+5. **Synthesize**: answer the question directly first, then supporting detail.
+   Cite sources inline as [title](url). Separate what you verified from what
+   you're inferring.
+
+## Rules
+- Fetch before you trust — never answer from snippets alone on anything
+  load-bearing.
+- If sources conflict, say so and give the most credible reading.
+- If the web turns up nothing usable, say that plainly rather than inventing.
+- Keep it tight: the owner wants the answer, then the evidence — not a link dump.
+"#;
+
 /// A general-purpose critic subagent for quality loops.
 const CRITIC_AGENT: &str = r#"---
 name: critic
@@ -850,6 +882,15 @@ async fn cmd_init() -> Result<()> {
         std::fs::create_dir_all(home.agents_dir())?;
         std::fs::write(&critic_path, CRITIC_AGENT)?;
         println!("installed subagent: critic");
+    }
+
+    // Ship the autoresearch skill so web_search + web_fetch are used with a
+    // real methodology (fan out, cross-check, cite) rather than one-shot.
+    let research_dir = home.skills_dir().join("autoresearch");
+    if !research_dir.join("SKILL.md").exists() {
+        std::fs::create_dir_all(&research_dir)?;
+        std::fs::write(research_dir.join("SKILL.md"), AUTORESEARCH_SKILL)?;
+        println!("installed skill: autoresearch");
     }
 
     // Ship a few built-in personalities (voice layer). Users edit or add

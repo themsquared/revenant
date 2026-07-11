@@ -46,7 +46,20 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(LoopCreate),
         Arc::new(LoopControl),
         Arc::new(LoopUpdate),
+        Arc::new(WebSearch { http: web_client() }),
+        Arc::new(WebFetch { http: web_client() }),
     ]
+}
+
+/// A browser-ish HTTP client for the web tools: real UA, bounded timeouts,
+/// redirects followed. Shared shape so search + fetch behave consistently.
+fn web_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; revenant/1.0; +https://revenant.ai)")
+        .timeout(Duration::from_secs(25))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
 }
 
 fn truncate_result(mut s: String) -> String {
@@ -826,5 +839,268 @@ impl Tool for ReadSkillFile {
             Ok(content) => ToolOutput::ok(truncate_result(content)),
             Err(err) => ToolOutput::err(format!("{err:#}")),
         }
+    }
+}
+
+// ---- web (autoresearch primitives) ----
+
+struct WebSearch {
+    http: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl Tool for WebSearch {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "web_search",
+            "Search the web and get a ranked list of {title, url, snippet}. Use this to find sources, then web_fetch the promising URLs. Provider-agnostic (DuckDuckGo).",
+            json!({"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","description":"max results (default 8)"}},"required":["query"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let query = match arg_str(&args, "query") {
+            Ok(q) => q,
+            Err(e) => return e,
+        };
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(8).clamp(1, 20) as usize;
+        // DuckDuckGo's HTML endpoint takes the query as a POST form field.
+        let resp = self
+            .http
+            .post("https://html.duckduckgo.com/html/")
+            .form(&[("q", query)])
+            .send()
+            .await;
+        let body = match resp {
+            Ok(r) => match r.text().await {
+                Ok(b) => b,
+                Err(e) => return ToolOutput::err(format!("web_search read error: {e}")),
+            },
+            Err(e) => return ToolOutput::err(format!("web_search request failed: {e}")),
+        };
+        let results = parse_ddg(&body, limit);
+        if results.is_empty() {
+            return ToolOutput::ok(format!(
+                "No results parsed for {query:?}. The engine may have changed format or rate-limited; try web_fetch on a known URL instead."
+            ));
+        }
+        let mut out = format!("Search results for {query:?}:\n\n");
+        for (i, (title, url, snippet)) in results.iter().enumerate() {
+            out.push_str(&format!("{}. {}\n   {}\n   {}\n\n", i + 1, title, url, snippet));
+        }
+        ToolOutput::ok(truncate_result(out))
+    }
+}
+
+struct WebFetch {
+    http: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl Tool for WebFetch {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "web_fetch",
+            "Fetch a URL and return its readable text content (HTML stripped). Use after web_search, or on any URL the owner gives you.",
+            json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let url = match arg_str(&args, "url") {
+            Ok(u) => u,
+            Err(e) => return e,
+        };
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return ToolOutput::err("url must start with http:// or https://");
+        }
+        let resp = match self.http.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => return ToolOutput::err(format!("web_fetch request failed: {e}")),
+        };
+        let status = resp.status();
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => return ToolOutput::err(format!("web_fetch read error: {e}")),
+        };
+        if !status.is_success() {
+            return ToolOutput::err(format!("web_fetch got HTTP {status} for {url}"));
+        }
+        let text = if ctype.contains("html") || body.trim_start().starts_with('<') {
+            html_to_text(&body)
+        } else {
+            body
+        };
+        ToolOutput::ok(truncate_result(format!("{url}\n\n{text}")))
+    }
+}
+
+/// Parse DuckDuckGo HTML results into (title, url, snippet) tuples.
+fn parse_ddg(html: &str, limit: usize) -> Vec<(String, String, String)> {
+    use regex::Regex;
+    // Result anchor: class="result__a" href="<link>">title</a>
+    let re_a = Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
+        .expect("valid regex");
+    let re_snip = Regex::new(r#"(?s)class="result__snippet"[^>]*>(.*?)</a>"#).expect("valid regex");
+    let snippets: Vec<String> = re_snip
+        .captures_iter(html)
+        .map(|c| clean_fragment(&c[1]))
+        .collect();
+    let mut out = Vec::new();
+    for (i, cap) in re_a.captures_iter(html).enumerate() {
+        if out.len() >= limit {
+            break;
+        }
+        let url = ddg_unwrap(&cap[1]);
+        let title = clean_fragment(&cap[2]);
+        let snippet = snippets.get(i).cloned().unwrap_or_default();
+        if !title.is_empty() && url.starts_with("http") {
+            out.push((title, url, snippet));
+        }
+    }
+    out
+}
+
+/// DDG wraps result links as `//duckduckgo.com/l/?uddg=<percent-encoded-url>`.
+fn ddg_unwrap(href: &str) -> String {
+    if let Some(idx) = href.find("uddg=") {
+        let rest = &href[idx + 5..];
+        let enc = rest.split('&').next().unwrap_or(rest);
+        return percent_decode(enc);
+    }
+    if let Some(stripped) = href.strip_prefix("//") {
+        format!("https://{stripped}")
+    } else {
+        href.to_string()
+    }
+}
+
+/// Minimal percent-decoder (no external dep).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Strip tags from a small HTML fragment and decode entities.
+fn clean_fragment(frag: &str) -> String {
+    decode_entities(&strip_tags(frag)).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Turn a full HTML document into readable plain text.
+fn html_to_text(html: &str) -> String {
+    use regex::Regex;
+    // Drop script/style/head noise entirely. (The regex crate has no
+    // backreferences, so strip each tag with its own pattern.)
+    let mut cleaned = html.to_string();
+    for tag in ["script", "style", "noscript", "head", "svg"] {
+        let re = Regex::new(&format!(r"(?is)<{tag}[^>]*>.*?</\s*{tag}\s*>")).expect("valid regex");
+        cleaned = re.replace_all(&cleaned, " ").into_owned();
+    }
+    // Block-level tags become newlines so structure survives.
+    let re_block = Regex::new(r"(?i)</?(p|br|div|li|tr|h[1-6]|section|article|header|footer)[^>]*>")
+        .expect("valid regex");
+    let spaced = re_block.replace_all(&cleaned, "\n");
+    let text = decode_entities(&strip_tags(&spaced));
+    // Collapse runs of blank lines / spaces.
+    let re_ws = Regex::new(r"[ \t]{2,}").expect("valid regex");
+    let re_nl = Regex::new(r"\n{3,}").expect("valid regex");
+    let text = re_ws.replace_all(&text, " ");
+    re_nl.replace_all(&text, "\n\n").trim().to_string()
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&mdash;", "—")
+        .replace("&ndash;", "–")
+}
+
+#[cfg(test)]
+mod web_tests {
+    use super::*;
+
+    #[test]
+    fn strips_html_to_readable_text() {
+        let html = "<html><head><style>x{}</style></head><body><h1>Title</h1><p>Hello &amp; welcome</p><script>evil()</script></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Title"));
+        assert!(text.contains("Hello & welcome"));
+        assert!(!text.contains("evil"));
+        assert!(!text.contains("x{}"));
+    }
+
+    #[test]
+    fn percent_decodes_urls() {
+        assert_eq!(percent_decode("https%3A%2F%2Fa.com%2Fx"), "https://a.com/x");
+        assert_eq!(percent_decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn ddg_unwraps_redirect() {
+        let u = ddg_unwrap("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=x");
+        assert_eq!(u, "https://example.com/page");
+    }
+
+    #[test]
+    fn parse_ddg_extracts_results() {
+        let html = r#"<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org">Rust Lang</a><a class="result__snippet" href="x">The Rust programming language</a>"#;
+        let r = parse_ddg(html, 8);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, "Rust Lang");
+        assert_eq!(r[0].1, "https://rust-lang.org");
     }
 }
