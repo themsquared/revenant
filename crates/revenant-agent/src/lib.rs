@@ -365,23 +365,16 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
 
         for iteration in 1..=self.max_iterations {
             let history = self.store.history(session_id, self.max_history).await?;
-            let mut messages: Vec<WireMessage> = history
+            let messages: Vec<WireMessage> = history
                 .into_iter()
                 .filter(|m| !m.content.is_empty())
                 .map(|m| WireMessage::new(m.role, m.content))
                 .collect();
-            // Truncating to `max_history` can slice the window so it begins
-            // mid-tool-sequence — a `tool_result` whose matching `tool_use`
-            // fell off the front. The API rejects that. Drop leading messages
-            // until the first is a genuine user message (role=user, no
-            // tool_result block); the current turn's user input is always a
-            // valid anchor at the tail, so this can't empty the list.
-            while messages.first().is_some_and(|m| {
-                m.role != "user"
-                    || m.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-            }) {
-                messages.remove(0);
-            }
+            // Repair the window into a structurally valid message sequence
+            // (see sanitize_history): fixes both a leading orphaned
+            // tool_result AND a dangling tool_use left by a turn that died
+            // before persisting its tool_result. Either one is a hard 400.
+            let mut messages = sanitize_history(messages);
             // Moving breakpoint on the newest message: each iteration/turn
             // extends the prefix, so the provider re-reads history from
             // cache. Applied at request build only — never persisted.
@@ -1168,6 +1161,65 @@ fn estimate(content: &[ContentBlock]) -> Option<i64> {
     Some((bytes as f64 / 3.6).ceil() as i64)
 }
 
+/// Repair a history window into a structurally valid Anthropic message
+/// sequence, whatever corrupted it:
+///   - a `tool_use` with no following `tool_result` (a turn that died after
+///     persisting the assistant tool call but before the result), and
+///   - a `tool_result` with no preceding `tool_use` (window truncated
+///     mid-sequence, or the above cascade).
+/// Both are hard 400s from the API. Applied at request-build time, so it also
+/// heals sessions already corrupted on disk without any DB surgery.
+fn sanitize_history(mut messages: Vec<WireMessage>) -> Vec<WireMessage> {
+    use std::collections::HashSet;
+    let result_ids = |m: &WireMessage| -> HashSet<String> {
+        m.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // 1) Drop tool_use blocks not answered by the immediately-following message.
+    let answered: Vec<HashSet<String>> = messages.iter().map(result_ids).collect();
+    for i in 0..messages.len() {
+        let next = answered.get(i + 1).cloned().unwrap_or_default();
+        messages[i].content.retain(|b| match b {
+            ContentBlock::ToolUse { id, .. } => next.contains(id),
+            _ => true,
+        });
+    }
+    // 2) Drop tool_result blocks with no matching tool_use in the prior message.
+    let uses: Vec<HashSet<String>> = messages
+        .iter()
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    for i in 0..messages.len() {
+        let prev = if i == 0 { HashSet::new() } else { uses[i - 1].clone() };
+        messages[i].content.retain(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => prev.contains(tool_use_id),
+            _ => true,
+        });
+    }
+    // 3) Drop messages emptied by the above.
+    messages.retain(|m| !m.content.is_empty());
+    // 4) The request must begin with a real user message.
+    while messages.first().is_some_and(|m| {
+        m.role != "user" || m.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+    }) {
+        messages.remove(0);
+    }
+    messages
+}
+
 // ---- session actors ----
 
 #[derive(Debug)]
@@ -1237,5 +1289,87 @@ async fn session_actor(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn tuse(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse { id: id.into(), name: "x".into(), input: serde_json::json!({}) }
+    }
+    fn tres(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: serde_json::json!("ok"),
+            is_error: false,
+            cache_control: None,
+        }
+    }
+    fn has_tool_use(m: &WireMessage, id: &str) -> bool {
+        m.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { id: i, .. } if i == id))
+    }
+
+    // Every tool_use in the output must be answered by the next message.
+    fn well_formed(out: &[WireMessage]) -> bool {
+        for (i, m) in out.iter().enumerate() {
+            for b in &m.content {
+                if let ContentBlock::ToolUse { id, .. } = b {
+                    let answered = out.get(i + 1).is_some_and(|n| {
+                        n.content.iter().any(
+                            |x| matches!(x, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id),
+                        )
+                    });
+                    if !answered {
+                        return false;
+                    }
+                }
+            }
+        }
+        // Must start with a real user message.
+        out.first().is_none_or(|m| {
+            m.role == "user"
+                && !m.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        })
+    }
+
+    #[test]
+    fn drops_dangling_tool_use() {
+        let msgs = vec![
+            WireMessage::new(Role::User, vec![ContentBlock::text("hi")]),
+            WireMessage::new(Role::Assistant, vec![tuse("A")]),
+            WireMessage::new(Role::User, vec![tres("A")]),
+            WireMessage::new(Role::Assistant, vec![tuse("B")]), // turn died before result
+            WireMessage::new(Role::User, vec![ContentBlock::text("next")]),
+        ];
+        let out = sanitize_history(msgs);
+        assert!(well_formed(&out), "output not well-formed: {out:?}");
+        assert!(out.iter().any(|m| has_tool_use(m, "A")), "valid pair A dropped");
+        assert!(!out.iter().any(|m| has_tool_use(m, "B")), "dangling B survived");
+    }
+
+    #[test]
+    fn drops_leading_orphan_result() {
+        let msgs = vec![
+            WireMessage::new(Role::User, vec![tres("Z")]), // orphan: its tool_use truncated off
+            WireMessage::new(Role::Assistant, vec![ContentBlock::text("hello")]),
+            WireMessage::new(Role::User, vec![ContentBlock::text("q")]),
+        ];
+        let out = sanitize_history(msgs);
+        assert!(well_formed(&out));
+        assert_eq!(out.first().unwrap().role, "user");
+    }
+
+    #[test]
+    fn valid_history_is_unchanged_in_shape() {
+        let msgs = vec![
+            WireMessage::new(Role::User, vec![ContentBlock::text("hi")]),
+            WireMessage::new(Role::Assistant, vec![tuse("A")]),
+            WireMessage::new(Role::User, vec![tres("A")]),
+        ];
+        let out = sanitize_history(msgs);
+        assert_eq!(out.len(), 3);
+        assert!(well_formed(&out));
     }
 }
