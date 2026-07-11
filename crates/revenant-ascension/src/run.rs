@@ -75,12 +75,14 @@ pub async fn run_candidate(
     let base_task = task_override.map(String::from).unwrap_or_else(|| task_for(&candidate));
     let mut task = base_task.clone();
     let mut build_ok = false;
+    let mut last_build = String::new();
     for pass in 0..cfg.max_repair.max(1) {
         client
             .code(&root, &task, Some(&cfg.coder_tier))
             .await
             .context("actuator coding turn")?;
         let (ok, out) = cargo(&wt, &["check", "--workspace", "--message-format=short"]);
+        last_build = out;
         if ok {
             build_ok = true;
             notes.push(format!("compiles after {} edit pass(es)", pass + 1));
@@ -89,14 +91,17 @@ pub async fn run_candidate(
         task = format!(
             "{}\n\nYour previous edit does NOT compile. Fix exactly these errors, minimally:\n{}",
             base_task,
-            tail(&out, 3000)
+            tail(&last_build, 3000)
         );
     }
 
     let changed_files = wt.changed_files().unwrap_or_default();
 
     if !build_ok {
-        notes.push("did not compile within the repair budget — discarded".into());
+        notes.push(format!(
+            "did not compile within the repair budget — discarded. last build output:\n{}",
+            tail(&last_build, 1200)
+        ));
         return Ok(stop(candidate, build_ok, false, false, changed_files, notes));
     }
 
@@ -207,13 +212,30 @@ path without changing behaviour.",
     }
 }
 
+/// Resolve the cargo binary. `cargo` is often NOT on the daemon/CLI PATH
+/// (rustup installs it at ~/.cargo/bin), so fall back to that explicitly —
+/// otherwise the prove step fails to spawn and looks like a compile failure.
+fn cargo_bin() -> String {
+    if let Ok(c) = std::env::var("CARGO") {
+        return c;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let p = std::path::Path::new(&home).join(".cargo/bin/cargo");
+        if p.exists() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    "cargo".to_string()
+}
+
 fn cargo(wt: &Worktree, args: &[&str]) -> (bool, String) {
+    let bin = cargo_bin();
     let mut a = vec!["--offline"];
     a.extend_from_slice(args);
     // Fall back to online if offline can't resolve (first run in a worktree).
-    match wt.run("cargo", &a) {
+    match wt.run(&bin, &a) {
         Ok((true, out)) => (true, out),
-        _ => wt.run("cargo", args).unwrap_or((false, "cargo failed to spawn".into())),
+        _ => wt.run(&bin, args).unwrap_or((false, "cargo failed to spawn".into())),
     }
 }
 

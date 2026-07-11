@@ -217,7 +217,16 @@ impl AgentRuntime {
     /// caller out-of-band. Returns the agent's final message.
     pub async fn code_once(&self, root: &std::path::Path, task: &str, tier: Tier) -> Result<String> {
         let coder = self.with_tools(ToolRegistry::coder(root));
-        let session_id = self.store.ensure_session("ascension", "coder", "code").await?;
+        // Fresh session per call: each coding pass starts clean (no bloated,
+        // truncation-prone history). Build-error feedback is carried in the
+        // task text by the caller's repair loop, so no cross-pass memory is
+        // needed.
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let session_id =
+            self.store.ensure_session("ascension", &format!("coder-{uniq}"), "code").await?;
         let prompt = format!(
             "You are editing a Rust workspace checked out at the repository root; every path you \
 pass to a tool is relative to that root. Make the SMALLEST change that accomplishes the task and \
@@ -361,6 +370,18 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
                 .filter(|m| !m.content.is_empty())
                 .map(|m| WireMessage::new(m.role, m.content))
                 .collect();
+            // Truncating to `max_history` can slice the window so it begins
+            // mid-tool-sequence — a `tool_result` whose matching `tool_use`
+            // fell off the front. The API rejects that. Drop leading messages
+            // until the first is a genuine user message (role=user, no
+            // tool_result block); the current turn's user input is always a
+            // valid anchor at the tail, so this can't empty the list.
+            while messages.first().is_some_and(|m| {
+                m.role != "user"
+                    || m.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            }) {
+                messages.remove(0);
+            }
             // Moving breakpoint on the newest message: each iteration/turn
             // extends the prefix, so the provider re-reads history from
             // cache. Applied at request build only — never persisted.
