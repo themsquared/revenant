@@ -143,10 +143,15 @@ impl TelegramClient {
                 json!({
                     "chat_id": chat_id,
                     "text": text,
-                    "reply_markup": { "inline_keyboard": [[
-                        { "text": "✅ Approve", "callback_data": format!("apr:{approval_id}:y") },
-                        { "text": "❌ Deny", "callback_data": format!("apr:{approval_id}:n") },
-                    ]]},
+                    "reply_markup": { "inline_keyboard": [
+                        [
+                            { "text": "✅ Approve once", "callback_data": format!("apr:{approval_id}:y") },
+                            { "text": "❌ Deny", "callback_data": format!("apr:{approval_id}:n") },
+                        ],
+                        [
+                            { "text": "✅✅ Run all for this task", "callback_data": format!("apr:{approval_id}:a") },
+                        ],
+                    ]},
                 }),
             )
             .await?;
@@ -354,14 +359,23 @@ impl TelegramChannel {
             self.client.answer_callback(&cb.id, "not paired").await;
             return;
         }
-        let approve = verdict == "y";
-        match runtime.approvals.resolve(approval_id, approve, "telegram").await {
+        // y = approve once · a = approve + grant the rest of this task · n = deny
+        let approve = verdict == "y" || verdict == "a";
+        let grant = verdict == "a";
+        match runtime.approvals.resolve_scoped(approval_id, approve, grant, "telegram").await {
             Ok(true) => {
-                self.client
-                    .answer_callback(&cb.id, if approve { "approved" } else { "denied" })
-                    .await;
+                let toast = match (approve, grant) {
+                    (true, true) => "approved — running the rest of this task without asking",
+                    (true, false) => "approved",
+                    _ => "denied",
+                };
+                self.client.answer_callback(&cb.id, toast).await;
                 if let Some(message) = &cb.message {
-                    let stamp = if approve { "✅ approved" } else { "❌ denied" };
+                    let stamp = match (approve, grant) {
+                        (true, true) => "✅✅ approved for this task",
+                        (true, false) => "✅ approved",
+                        _ => "❌ denied",
+                    };
                     let original = message.text.clone().unwrap_or_default();
                     let _ = self
                         .client

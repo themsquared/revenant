@@ -397,6 +397,9 @@ struct DecisionBody {
     approve: bool,
     #[serde(default)]
     resolver: Option<String>,
+    /// Approve every request of this kind for the session (task-level grant).
+    #[serde(default)]
+    grant: bool,
 }
 
 async fn approval_decide(
@@ -409,7 +412,7 @@ async fn approval_decide(
         .manager
         .runtime()
         .approvals
-        .resolve(&id, body.approve, &resolver)
+        .resolve_scoped(&id, body.approve, body.grant, &resolver)
         .await?;
     Ok(Json(json!({ "applied": applied })))
 }
