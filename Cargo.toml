@@ -28,6 +28,7 @@ revenant-loops = { path = "crates/revenant-loops" }
 revenant-evals = { path = "crates/revenant-evals" }
 revenant-wasm = { path = "crates/revenant-wasm" }
 revenant-ascension = { path = "crates/revenant-ascension" }
+revenant-net = { path = "crates/revenant-net" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "sync", "time", "io-util", "io-std", "fs"] }
 tokio-util = "0.7"
