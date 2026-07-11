@@ -13,6 +13,20 @@ use std::time::Duration;
 /// retrieval via ranges comes with `expand_result` in M2).
 const MAX_RESULT_BYTES: usize = 8 * 1024;
 
+/// A minimal file-editing toolset jailed to a single root — the Ascension
+/// actuator uses this to let a coding agent edit an ephemeral git worktree
+/// (and nothing outside it). No `exec` on purpose: builds/tests are run by the
+/// orchestration out-of-band, so the agent can't spend fuel or trip approval
+/// prompts on `cargo`, and can't reach anything beyond `root`.
+pub fn coder(root: &std::path::Path) -> Vec<Arc<dyn Tool>> {
+    let jail = Jail::new(vec![root.to_path_buf()]);
+    vec![
+        Arc::new(ReadFile { jail: jail.clone() }),
+        Arc::new(WriteFile { jail: jail.clone() }),
+        Arc::new(ListDir { jail }),
+    ]
+}
+
 pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
     let read_jail = Jail::new(vec![home.workspace_dir(), home.skills_dir()]);
     let write_jail = Jail::new(vec![home.workspace_dir()]);

@@ -185,6 +185,51 @@ impl AgentRuntime {
         self.run_turn_inner(session_id, tier, user_content, 0, None).await
     }
 
+    /// A shallow clone with a different toolset — runs a turn against a
+    /// sandboxed (e.g. worktree-jailed) registry without disturbing the live
+    /// runtime. Learning is off and the iteration budget is raised for coding.
+    pub fn with_tools(&self, tools: ToolRegistry) -> Self {
+        AgentRuntime {
+            store: self.store.clone(),
+            llm: self.llm.clone(),
+            tools,
+            approvals: self.approvals.clone(),
+            events: self.events.clone(),
+            skills: self.skills.clone(),
+            agents: self.agents.clone(),
+            personalities: self.personalities.clone(),
+            mcp: self.mcp.clone(),
+            mcp_tools: Vec::new(),
+            home: self.home.clone(),
+            memory: None,
+            max_history: self.max_history,
+            max_tokens: self.max_tokens,
+            max_iterations: self.max_iterations.max(40),
+            learn: false,
+            learn_min_tools: self.learn_min_tools,
+            learn_budget: self.learn_budget.clone(),
+            privacy: None,
+        }
+    }
+
+    /// Run one coding turn jailed to `root` — the Ascension actuator. The agent
+    /// may only read/list/write within `root`; builds and tests are run by the
+    /// caller out-of-band. Returns the agent's final message.
+    pub async fn code_once(&self, root: &std::path::Path, task: &str, tier: Tier) -> Result<String> {
+        let coder = self.with_tools(ToolRegistry::coder(root));
+        let session_id = self.store.ensure_session("ascension", "coder", "code").await?;
+        let prompt = format!(
+            "You are editing a Rust workspace checked out at the repository root; every path you \
+pass to a tool is relative to that root. Make the SMALLEST change that accomplishes the task and \
+keeps the workspace compiling. Use read_file and list_dir to inspect before you write_file. Do not \
+attempt to run cargo. When finished, state briefly which files you changed and why.\n\nTask: {task}"
+        );
+        let stats = coder
+            .run_turn(session_id, tier, vec![ContentBlock::text(prompt)])
+            .await?;
+        Ok(stats.final_text)
+    }
+
     /// `depth` bounds subagent recursion: subagents run at depth 1 and are
     /// not offered the `subagent_run` tool, so the tree is at most one level.
     /// `agent` restricts tools + sets the directive for a named subagent.

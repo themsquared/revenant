@@ -61,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/events", get(events))
         .route("/v1/sessions", get(sessions_list).post(session_create))
         .route("/v1/sessions/:id/messages", get(messages_list).post(message_send))
+        .route("/v1/code", post(code))
         .route("/v1/approvals", get(approvals_pending))
         .route("/v1/approvals/:id/decision", post(approval_decide))
         .route("/v1/skills", get(skills_list))
@@ -354,6 +355,34 @@ async fn message_send(
         .submit(id, SessionMsg::UserInput { content: body.text, tier })
         .await?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": true, "session_id": id }))))
+}
+
+#[derive(Deserialize)]
+struct CodeBody {
+    /// Absolute path to the git worktree the coding agent may edit.
+    root: String,
+    task: String,
+    #[serde(default)]
+    tier: Option<String>,
+}
+
+/// Run one worktree-jailed coding turn (the Ascension actuator). The agent can
+/// only read/write within `root`; the caller builds/tests the result.
+async fn code(
+    State(state): State<AppState>,
+    Json(body): Json<CodeBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tier = match body.tier.as_deref() {
+        Some(t) => t.parse::<Tier>().map_err(ApiError::bad_request)?,
+        None => state.default_tier,
+    };
+    let root = std::path::PathBuf::from(&body.root);
+    // Guard: only ever edit an actual git worktree, never a stray path.
+    if !root.join(".git").exists() {
+        return Err(ApiError::bad_request("root is not a git worktree"));
+    }
+    let text = state.manager.runtime().code_once(&root, &body.task, tier).await?;
+    Ok(Json(json!({ "text": text })))
 }
 
 async fn approvals_pending(

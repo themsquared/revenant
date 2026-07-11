@@ -118,6 +118,26 @@ impl Client {
             .sessions)
     }
 
+    /// Run one worktree-jailed coding turn on the daemon (the Ascension
+    /// actuator). Returns the agent's final message.
+    pub async fn code(&self, root: &str, task: &str, tier: Option<&str>) -> Result<String> {
+        let mut body = serde_json::json!({ "root": root, "task": task });
+        if let Some(t) = tier {
+            body["tier"] = serde_json::json!(t);
+        }
+        let resp = self
+            .req(reqwest::Method::POST, "/v1/code")
+            .json(&body)
+            .send()
+            .await
+            .context("POST /v1/code")?;
+        if !resp.status().is_success() {
+            bail!("code failed: {}", resp.text().await.unwrap_or_default());
+        }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v["text"].as_str().unwrap_or_default().to_string())
+    }
+
     pub async fn send_message(&self, session_id: i64, text: &str, tier: Option<&str>) -> Result<()> {
         let mut body = json!({ "text": text });
         if let Some(tier) = tier {

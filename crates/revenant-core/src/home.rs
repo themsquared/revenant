@@ -69,4 +69,8 @@ impl Home {
     pub fn plugins_dir(&self) -> PathBuf {
         self.root.join("plugins")
     }
+    /// This revenant's self-sovereign network identity (Ed25519 keypair).
+    pub fn identity_dir(&self) -> PathBuf {
+        self.root.join("identity")
+    }
 }

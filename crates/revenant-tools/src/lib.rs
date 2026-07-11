@@ -101,6 +101,16 @@ impl ToolRegistry {
         ToolRegistry { tools: Arc::new(tools) }
     }
 
+    /// A registry with only file tools jailed to `root` — for the Ascension
+    /// actuator editing an isolated worktree.
+    pub fn coder(root: &std::path::Path) -> Self {
+        let mut tools: BTreeMap<String, Arc<dyn Tool>> = BTreeMap::new();
+        for tool in builtins::coder(root) {
+            tools.insert(tool.spec().name.clone(), tool);
+        }
+        ToolRegistry { tools: Arc::new(tools) }
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
     }
