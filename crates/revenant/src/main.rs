@@ -201,6 +201,12 @@ enum Command {
     /// Diagnose your setup in plain English — config, keys, credit, daemon,
     /// channels, network. Run this first if anything feels off.
     Doctor,
+    /// Update revenant to the latest release (checksum-verified, backed up).
+    Update {
+        /// Only report whether an update is available; don't install.
+        #[arg(long)]
+        check: bool,
+    },
     /// List pending approvals, or resolve one.
     Approvals {
         /// approve <id> | deny <id>
@@ -289,6 +295,7 @@ fn main() -> Result<()> {
             Command::Chat { tier } => repl::cmd_chat(tier).await,
             Command::Status => cmd_status().await,
             Command::Doctor => cmd_doctor().await,
+            Command::Update { check } => cmd_update(check),
             Command::Approvals { action } => cmd_approvals(action).await,
             Command::Render => cmd_render(),
             Command::Memory { action } => cmd_memory(action).await,
@@ -1091,6 +1098,142 @@ async fn cmd_doctor() -> Result<()> {
 
     println!("\n  Legend: ✅ good · ⚠️ optional/attention · ❌ must fix");
     println!("  Next: `revenant up` runs everything; `revenant chat` to talk; `revenant doctor` to re-check.");
+    Ok(())
+}
+
+const UPDATE_REPO: &str = "themsquared/revenant";
+
+fn update_triple() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
+        _ => None,
+    }
+}
+
+/// Pull a `"key":"value"` string out of a JSON blob without a full parser.
+fn json_str(body: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let after = &body[body.find(&pat)? + pat.len()..];
+    let rest = after[after.find(':')? + 1..].trim_start().strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let run = |cmd: &str, args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new(cmd).args(args).arg(path).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).split_whitespace().next().map(String::from))
+            .flatten()
+    };
+    run("shasum", &["-a", "256"])
+        .or_else(|| run("sha256sum", &[]))
+        .context("need `shasum` or `sha256sum` to verify the download")
+}
+
+fn install_bin(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    if std::fs::rename(src, dst).is_err() {
+        std::fs::copy(src, dst).with_context(|| format!("installing {}", dst.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(())
+}
+
+fn cmd_update(check: bool) -> Result<()> {
+    let triple = update_triple().context("auto-update isn't supported on this platform yet")?;
+    let current = env!("CARGO_PKG_VERSION");
+    println!("current: v{current}  ({triple})");
+
+    // Latest release tag from the GitHub API (via curl, like the installer).
+    let api = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
+    let out = std::process::Command::new("curl")
+        .args(["-fsSL", "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: revenant", &api])
+        .output()
+        .context("querying GitHub releases (is curl installed / are you online?)")?;
+    if !out.status.success() {
+        bail!("could not reach GitHub releases: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let tag = json_str(&body, "tag_name").context("no release tag in GitHub response")?;
+    let latest = tag.trim_start_matches('v');
+    println!("latest:  {tag}");
+
+    if latest == current {
+        println!("\n✅ already on the latest release.");
+        return Ok(());
+    }
+    println!("\n⬆️  update available: v{current} → {tag}");
+    if check {
+        println!("run `revenant update` to install it.");
+        return Ok(());
+    }
+
+    // Download tarball + checksums.
+    let tmp = std::env::temp_dir().join(format!("revenant-update-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp)?;
+    let base = format!("https://github.com/{UPDATE_REPO}/releases/download/{tag}");
+    let tarball = format!("revenant-{tag}-{triple}.tar.gz");
+    for f in [tarball.as_str(), "SHA256SUMS"] {
+        let dst = tmp.join(f);
+        let s = std::process::Command::new("curl")
+            .args(["-fsSL", "-o", &dst.to_string_lossy(), &format!("{base}/{f}")])
+            .status()
+            .context("downloading release asset")?;
+        if !s.success() {
+            bail!("download failed for {f}");
+        }
+    }
+
+    // Verify checksum before trusting a byte.
+    let sums = std::fs::read_to_string(tmp.join("SHA256SUMS"))?;
+    let want = sums
+        .lines()
+        .find(|l| l.trim_end().ends_with(&tarball))
+        .and_then(|l| l.split_whitespace().next())
+        .context("release checksum for this platform not found")?;
+    let got = sha256_file(&tmp.join(&tarball))?;
+    if !got.eq_ignore_ascii_case(want) {
+        bail!("checksum mismatch — refusing to install (want {want}, got {got})");
+    }
+    println!("✓ checksum verified");
+
+    let s = std::process::Command::new("tar")
+        .args(["-xzf", &tmp.join(&tarball).to_string_lossy(), "-C", &tmp.to_string_lossy()])
+        .status()
+        .context("extracting release")?;
+    if !s.success() {
+        bail!("extract failed");
+    }
+    let new_bin = tmp.join("revenant");
+    if !new_bin.exists() {
+        bail!("archive has no `revenant` binary");
+    }
+
+    // Atomic-ish swap with a restorable backup.
+    let exe = std::env::current_exe()?;
+    let bak = exe.with_extension("bak");
+    let _ = std::fs::remove_file(&bak);
+    std::fs::rename(&exe, &bak).context("backing up the current binary")?;
+    if let Err(e) = install_bin(&new_bin, &exe) {
+        let _ = std::fs::rename(&bak, &exe); // restore on failure
+        bail!("install failed (previous binary restored): {e}");
+    }
+    // Update the sibling TUI binary too, if the archive shipped one.
+    if let Some(dir) = exe.parent() {
+        let tui = tmp.join("revenant-tui");
+        if tui.exists() {
+            let _ = install_bin(&tui, &dir.join("revenant-tui"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    println!("\n✅ updated to {tag}. Restart to run it: `revenant up` (or restart the service).");
+    println!("   previous binary kept at {}", bak.display());
     Ok(())
 }
 
