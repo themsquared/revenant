@@ -2220,6 +2220,7 @@ dependencies = [
  "revenant-client",
  "revenant-control",
  "revenant-core",
+ "revenant-evals",
  "revenant-gateway",
  "revenant-llm",
  "revenant-loops",
@@ -2328,6 +2329,21 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "revenant-evals"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "regex",
+ "revenant-client",
+ "revenant-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

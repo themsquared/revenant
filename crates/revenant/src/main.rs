@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use revenant_core::config::{Config, GatewayMode};
 use revenant_core::home::Home;
 use std::io::Write;
+use std::path::PathBuf;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7717";
 
@@ -192,6 +193,18 @@ enum Command {
         /// install | uninstall
         action: String,
     },
+    /// Run the eval scorecard against the live daemon (proves the numbers).
+    Eval {
+        /// Directory of `*.toml` task files. Omit to use the embedded suite.
+        #[arg(long)]
+        suite: Option<PathBuf>,
+        /// Write the machine-readable JSON report here.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        /// Only run tasks carrying this tag (e.g. speed, memory).
+        #[arg(long)]
+        tag: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -222,8 +235,51 @@ fn main() -> Result<()> {
                 "uninstall" => service::uninstall(),
                 other => bail!("usage: revenant service install|uninstall (got '{other}')"),
             },
+            Command::Eval { suite, json, tag } => cmd_eval(suite, json, tag).await,
         }
     })
+}
+
+async fn cmd_eval(
+    suite_dir: Option<PathBuf>,
+    json_out: Option<PathBuf>,
+    tag: Option<String>,
+) -> Result<()> {
+    let home = Home::resolve();
+    let client = revenant_client::Client::from_env(&home)?;
+    // Fail fast with a clear message if the daemon isn't up — evals grade the
+    // live system, not a mock.
+    client
+        .health()
+        .await
+        .context("eval needs a running daemon — start it with `revenant up`")?;
+
+    let mut suite = match &suite_dir {
+        Some(dir) => revenant_evals::load_suite_dir(dir)?,
+        None => revenant_evals::default_suite(),
+    };
+    if let Some(t) = &tag {
+        suite.tasks.retain(|task| task.tags.iter().any(|x| x == t));
+    }
+    if suite.tasks.is_empty() {
+        bail!("no tasks to run (check --suite path / --tag filter)");
+    }
+
+    eprintln!("running {} eval task(s)…", suite.tasks.len());
+    let report = revenant_evals::run_suite(&client, &suite).await?;
+    println!("{}", report.markdown());
+
+    if let Some(path) = json_out {
+        std::fs::write(&path, serde_json::to_vec_pretty(&report.json())?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("wrote JSON report to {}", path.display());
+    }
+
+    // Non-zero exit when any task failed, so CI can gate on the scorecard.
+    if report.passed() < report.outcomes.len() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn cmd_open() -> Result<()> {
