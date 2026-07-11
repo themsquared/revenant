@@ -18,6 +18,8 @@ use std::time::Duration;
 
 /// The embedded default suite — runs out of the box with `revenant eval`.
 const DEFAULT_SUITE: &str = include_str!("../suites/default.toml");
+/// Agent-behaviour suite: tool trajectories, multi-turn memory, research.
+const AGENT_SUITE: &str = include_str!("../suites/agents.toml");
 
 /// Per-turn wall-clock ceiling. A turn that blocks (e.g. on an approval) fails
 /// the task instead of hanging the whole suite.
@@ -66,6 +68,10 @@ pub struct GradeSpec {
     /// A tool with this name must have been invoked during the turn.
     #[serde(default)]
     pub tool_used: Option<String>,
+    /// Every one of these tools must have been invoked (any order) — a
+    /// trajectory-coverage check for agent evals.
+    #[serde(default)]
+    pub tools_all: Vec<String>,
     /// At least this many tool calls must have occurred.
     #[serde(default)]
     pub min_tools: Option<usize>,
@@ -102,6 +108,11 @@ impl GradeSpec {
         if let Some(tool) = &self.tool_used {
             if !r.tools.iter().any(|t| t == tool) {
                 return Err(format!("tool {tool:?} was not used (used: {:?})", r.tools));
+            }
+        }
+        for tool in &self.tools_all {
+            if !r.tools.iter().any(|t| t == tool) {
+                return Err(format!("required tool {tool:?} not used (used: {:?})", r.tools));
             }
         }
         if let Some(min) = self.min_tools {
@@ -143,6 +154,11 @@ pub struct Report {
 /// Parse the embedded default suite.
 pub fn default_suite() -> Suite {
     toml::from_str(DEFAULT_SUITE).expect("embedded default suite parses")
+}
+
+/// The embedded agent-behaviour suite (tool use, multi-turn, research).
+pub fn agent_suite() -> Suite {
+    toml::from_str(AGENT_SUITE).expect("embedded agent suite parses")
 }
 
 /// Load and merge every `*.toml` file in a directory into one suite.

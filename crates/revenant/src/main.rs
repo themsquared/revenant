@@ -262,6 +262,9 @@ enum Command {
         /// Only run tasks carrying this tag (e.g. speed, memory).
         #[arg(long)]
         tag: Option<String>,
+        /// Run the agent-behaviour suite (tool use, multi-turn, research).
+        #[arg(long)]
+        agent: bool,
     },
 }
 
@@ -293,7 +296,7 @@ fn main() -> Result<()> {
                 "uninstall" => service::uninstall(),
                 other => bail!("usage: revenant service install|uninstall (got '{other}')"),
             },
-            Command::Eval { suite, json, tag } => cmd_eval(suite, json, tag).await,
+            Command::Eval { suite, json, tag, agent } => cmd_eval(suite, json, tag, agent).await,
             Command::Ascend { run, live, fix } => cmd_ascend(run, live, fix).await,
             Command::Necropolis { port, db } => cmd_necropolis(port, db).await,
             Command::Net { action } => cmd_net(action).await,
@@ -620,6 +623,7 @@ async fn cmd_eval(
     suite_dir: Option<PathBuf>,
     json_out: Option<PathBuf>,
     tag: Option<String>,
+    agent: bool,
 ) -> Result<()> {
     let home = Home::resolve();
     let client = revenant_client::Client::from_env(&home)?;
@@ -632,6 +636,7 @@ async fn cmd_eval(
 
     let mut suite = match &suite_dir {
         Some(dir) => revenant_evals::load_suite_dir(dir)?,
+        None if agent => revenant_evals::agent_suite(),
         None => revenant_evals::default_suite(),
     };
     if let Some(t) = &tag {

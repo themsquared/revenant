@@ -1,0 +1,39 @@
+# agentevals — scenarios that grade agent BEHAVIOR (tool use, multi-turn
+# memory, research), not just single-shot answers. Run with `revenant eval
+# --agent`. Deterministic graders; `tools_all` asserts a trajectory used every
+# named tool. These exercise the real capabilities that separate an agent from
+# a chatbot.
+
+[[task]]
+id = "research-web"
+prompt = "Use your web tools to find the current stable version number of the Rust programming language, then tell me just the version and the source URL."
+tier = "balanced"
+tags = ["research", "tools"]
+grade = { tools_all = ["web_search", "web_fetch"], regex = '\d+\.\d+' }
+
+[[task]]
+id = "web-fetch-direct"
+prompt = "Fetch https://example.com and tell me the main heading shown on that page."
+tier = "balanced"
+tags = ["research", "tools"]
+grade = { tool_used = "web_fetch", contains = ["Example Domain"] }
+
+[[task]]
+id = "tool-memory-save"
+prompt = "Use your memory tool to save this durable fact: my launch codeword is Nightjar. Then confirm you saved it."
+tags = ["memory", "tools"]
+grade = { min_tools = 1, contains_any = ["Nightjar", "saved"] }
+
+[[task]]
+id = "multi-turn-recall"
+prompt = "What is my launch codeword?"
+setup = ["Remember this for later: my launch codeword is Nightjar. Just acknowledge."]
+tags = ["memory", "multi-turn"]
+grade = { contains = ["Nightjar"] }
+
+[[task]]
+id = "reasoning-then-answer"
+prompt = "A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball. How much does the ball cost? Reply with just the amount in cents."
+tier = "balanced"
+tags = ["reasoning"]
+grade = { contains = ["5"], not_contains = ["10 cents"] }
