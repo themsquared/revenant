@@ -11,6 +11,7 @@
 pub mod artifact;
 pub mod client;
 pub mod identity;
+pub mod ledger;
 pub mod necropolis;
 
 pub use artifact::{Artifact, ArtifactKind};
