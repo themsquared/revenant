@@ -15,6 +15,9 @@ pub struct Config {
     pub channels: ChannelsConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    /// Global gateway-enforced spend cap (the intelligent-spending ceiling).
+    #[serde(default)]
+    pub spending: SpendingConfig,
     /// MCP servers multiplexed behind the gateway (the plugin bus).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServer>,
@@ -78,6 +81,61 @@ impl Default for PrivacyConfig {
 
 fn default_privacy_tier() -> String {
     "local".to_string()
+}
+
+/// Global spend cap enforced by the gateway on the LLM listener — a token
+/// bucket BELOW the agent, so the ceiling cannot be reasoned or coded around
+/// from inside the harness (the moat, made literal). Renders to
+/// `llm.policies.localRateLimit`. Off by default (no cap).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpendingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bucket size = refill amount per `interval`, i.e. the rolling cap.
+    #[serde(default = "default_budget_amount")]
+    pub budget: u64,
+    /// Refill window, as an agentgateway duration ("24h", "1h", "60s").
+    #[serde(default = "default_budget_interval")]
+    pub interval: String,
+    /// What the budget counts: LLM `tokens` (input+output) or `requests`.
+    #[serde(default)]
+    pub count: BudgetCount,
+}
+
+impl Default for SpendingConfig {
+    fn default() -> Self {
+        SpendingConfig {
+            enabled: false,
+            budget: default_budget_amount(),
+            interval: default_budget_interval(),
+            count: BudgetCount::default(),
+        }
+    }
+}
+
+/// Unit the spend cap counts — matches agentgateway's localRateLimit `type`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetCount {
+    #[default]
+    Tokens,
+    Requests,
+}
+
+impl BudgetCount {
+    pub fn gateway_type(&self) -> &'static str {
+        match self {
+            BudgetCount::Tokens => "tokens",
+            BudgetCount::Requests => "requests",
+        }
+    }
+}
+
+fn default_budget_amount() -> u64 {
+    1_000_000
+}
+fn default_budget_interval() -> String {
+    "24h".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -251,6 +309,23 @@ fn default_learn_min_tools() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierConfig {
     pub targets: Vec<TierTarget>,
+    /// How a multi-target tier routes across its targets. `failover` (default)
+    /// tries targets in priority order with health-based eviction — resilience.
+    /// `weighted` splits traffic across targets by `weight` — cross-provider
+    /// cost/quality balancing (the intelligent-spending knob). Single-target
+    /// tiers ignore this and render as a plain alias.
+    #[serde(default)]
+    pub strategy: RouteStrategy,
+}
+
+/// Multi-target routing strategy, matching agentgateway's `virtualModels`
+/// routing enum (verified against v1.3.1: `failover` | `weighted`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteStrategy {
+    #[default]
+    Failover,
+    Weighted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +339,10 @@ pub struct TierTarget {
     /// Base URL override (e.g. a remote Ollama).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Relative weight for `weighted` routing (ignored under `failover`, where
+    /// target order is priority order). Defaults to 1 when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
 }
 
 /// Providers we render into agentgateway config. Serialized here in
@@ -360,11 +439,15 @@ impl Config {
             model: model.to_string(),
             api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
             base_url: None,
+            weight: None,
         };
         let mut tiers = BTreeMap::new();
         tiers.insert(
             "fast".into(),
-            TierConfig { targets: vec![anthropic("claude-haiku-4-5-20251001")] },
+            TierConfig {
+                targets: vec![anthropic("claude-haiku-4-5-20251001")],
+                strategy: RouteStrategy::Failover,
+            },
         );
         tiers.insert(
             "balanced".into(),
@@ -373,11 +456,15 @@ impl Config {
                     anthropic("claude-sonnet-5"),
                     anthropic("claude-haiku-4-5-20251001"),
                 ],
+                strategy: RouteStrategy::Failover,
             },
         );
         tiers.insert(
             "deep".into(),
-            TierConfig { targets: vec![anthropic("claude-opus-4-8")] },
+            TierConfig {
+                targets: vec![anthropic("claude-opus-4-8")],
+                strategy: RouteStrategy::Failover,
+            },
         );
         Config {
             gateway: GatewayConfig {
@@ -395,6 +482,7 @@ impl Config {
             memory: MemoryConfig::default(),
             channels: ChannelsConfig::default(),
             privacy: PrivacyConfig::default(),
+            spending: SpendingConfig::default(),
             mcp: Vec::new(),
             a2a_agents: Vec::new(),
             tiers,
