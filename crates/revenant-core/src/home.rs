@@ -65,4 +65,8 @@ impl Home {
     pub fn models_dir(&self) -> PathBuf {
         self.root.join("models")
     }
+    /// Sandboxed dynamic WASM plugins (`*.wasm`) loaded at daemon startup.
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.root.join("plugins")
+    }
 }

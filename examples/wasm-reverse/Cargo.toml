@@ -1,0 +1,26 @@
+# Standalone (own workspace) so `cargo build` at the repo root never tries to
+# build this for the host. Build it for wasm:
+#   cargo build --release --target wasm32-unknown-unknown \
+#     --manifest-path examples/wasm-reverse/Cargo.toml
+# then drop target/wasm32-unknown-unknown/release/wasm_reverse.wasm into
+# ~/.revenant/plugins/ and restart the daemon.
+[workspace]
+
+[package]
+name = "wasm-reverse"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "wasm_reverse"
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
