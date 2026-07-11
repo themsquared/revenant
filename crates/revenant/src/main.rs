@@ -366,7 +366,9 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
     // durable Necropolis (or, for `sync`, an explicit peer given as an arg).
     let local_db = home.root().join("necropolis.db");
     match verb {
-        "verify" => {
+        // `verify` with NO argument = audit the local ledger. `verify <token>`
+        // = confirm an account email (handled in the client match below).
+        "verify" if action.get(1).is_none() => {
             let dir = revenant_net::Directory::open(&local_db.to_string_lossy())
                 .context("opening local Necropolis ledger")?;
             // Directory::open re-verifies the entire hash chain on load; reaching
@@ -535,14 +537,12 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             }
             println!("registered {email} — account key saved to ~/.revenant/account.key");
             match resp.get("verify_token").and_then(|t| t.as_str()) {
-                Some(tok) => println!(
-                    "DEV MODE (no email provider): confirm now with\n  revenant net confirm {tok}"
-                ),
-                None => println!("check your email for the token, then: revenant net confirm <token>"),
+                Some(tok) => println!("verify now with:\n  revenant net verify {tok}"),
+                None => println!("check your email for the token, then:\n  revenant net verify <token>"),
             }
         }
-        "confirm" => {
-            let token = action.get(1).context("usage: net confirm <token>")?;
+        "confirm" | "verify" => {
+            let token = action.get(1).context("usage: revenant net verify <token>")?;
             client.verify_account(token).await?;
             println!("✅ email confirmed. Now bind this agent: revenant net bind");
         }

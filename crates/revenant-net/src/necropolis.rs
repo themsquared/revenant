@@ -259,14 +259,20 @@ async fn account_register(
     if reg.already {
         return Ok(Json(serde_json::json!({ "ok": true, "status": "already verified" })));
     }
-    let _ = crate::email::send_verification(&req.email, &reg.verify_token).await;
+    // Try to email the token; if a provider isn't configured OR delivery
+    // fails, surface the token in the response so the flow never dead-ends.
+    let delivered = !crate::email::dev_mode()
+        && crate::email::send_verification(&req.email, &reg.verify_token).await.is_ok();
     let mut resp = serde_json::json!({
         "ok": true,
         "account_key": reg.account_key,
-        "status": "registered — verify the emailed token, then bind your agent",
+        "status": if delivered {
+            "registered — check your email for the token, then bind your agent"
+        } else {
+            "registered — email not delivered; use the token below directly"
+        },
     });
-    if crate::email::dev_mode() {
-        resp["dev_mode"] = serde_json::json!(true);
+    if !delivered {
         resp["verify_token"] = serde_json::json!(reg.verify_token);
     }
     Ok(Json(resp))
