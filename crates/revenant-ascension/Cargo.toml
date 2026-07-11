@@ -8,6 +8,8 @@ repository.workspace = true
 [dependencies]
 revenant-core.workspace = true
 revenant-evals.workspace = true
+revenant-client.workspace = true
+futures.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
