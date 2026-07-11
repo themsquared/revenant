@@ -146,7 +146,23 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/artifacts/:id/attest", post(attest))
         .route("/ledger/head", get(ledger_head))
         .route("/ledger/since/:seq", get(ledger_since))
+        // The catalog is public read — allow any origin so the static skills
+        // marketplace (Netlify) can fetch it cross-origin. Authenticity is the
+        // per-artifact signature, never the origin, so `*` is safe here.
+        .layer(axum::middleware::from_fn(cors))
         .with_state(dir)
+}
+
+/// Add a permissive CORS header so browser clients (the marketplace) can read
+/// the directory cross-origin. GET/POST here carry no custom headers, so these
+/// are "simple" requests needing no preflight.
+async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    resp
 }
 
 #[derive(Deserialize)]
