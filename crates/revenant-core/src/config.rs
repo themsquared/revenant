@@ -70,11 +70,48 @@ pub enum UpdateChannel {
     Manual,
 }
 
+/// What the background auto-updater does when a newer release is found on the
+/// configured channel. Default `Notify` — never swap a binary or restart
+/// without the owner opting in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoUpdate {
+    /// Don't even check in the background.
+    Off,
+    /// Check and tell the owner (event + Telegram + `revenant status`); the
+    /// owner runs `revenant update` when ready.
+    #[default]
+    Notify,
+    /// Check, download+verify+install automatically, then restart if running
+    /// under a service manager (otherwise ask the owner to restart).
+    Install,
+}
+
 /// How this box takes updates from the horde's improvement stream.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateConfig {
     #[serde(default)]
     pub channel: UpdateChannel,
+    /// Background auto-update behavior (default: notify).
+    #[serde(default)]
+    pub auto: AutoUpdate,
+    /// How often the daemon checks the channel, in seconds (default 6h).
+    #[serde(default = "default_update_interval")]
+    pub check_interval_secs: u64,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig {
+            channel: UpdateChannel::default(),
+            auto: AutoUpdate::default(),
+            check_interval_secs: default_update_interval(),
+        }
+    }
+}
+
+fn default_update_interval() -> u64 {
+    21600
 }
 
 /// An MCP server the gateway spawns/proxies. `cmd` = stdio server (spawned by

@@ -269,6 +269,8 @@ async fn events(
                 revenant_core::Event::SkillLearned { .. } => "skill_learned",
                 revenant_core::Event::PrivacyRouted { .. } => "privacy_routed",
                 revenant_core::Event::GatewayStatus { .. } => "gateway_status",
+                revenant_core::Event::UpdateAvailable { .. } => "update_available",
+                revenant_core::Event::UpdateInstalled { .. } => "update_installed",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())

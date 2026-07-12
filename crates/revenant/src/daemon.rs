@@ -220,6 +220,10 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         }
     }
 
+    // Background auto-update: checks the release channel on an interval and,
+    // per [update].auto, notifies the owner or installs + restarts. Fail-soft.
+    crate::autoupdate::spawn(home.clone(), cfg.clone(), manager.runtime().events.clone());
+
     Ok(Daemon {
         manager,
         gateway_handle,

@@ -5,6 +5,7 @@
 //! embedded session using the exact same runtime components.
 
 mod ascend_loop;
+mod autoupdate;
 mod daemon;
 mod repl;
 mod service;
@@ -1859,7 +1860,28 @@ fn cmd_update(check: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Download tarball + checksums.
+    let bak = perform_update(&home, triple, &tag)?;
+    println!("✓ checksum verified");
+    println!("\n✅ updated to {tag}. Restart to run it: `revenant up` (or restart the service).");
+    println!("   previous binary kept at {}", bak.display());
+    Ok(())
+}
+
+/// The tag currently installed (from `~/.revenant/release`), if any. Absent on
+/// a from-source build.
+pub(crate) fn installed_release_tag(home: &Home) -> Option<String> {
+    std::fs::read_to_string(home.root().join("release"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Download → checksum-verify → atomically swap the `revenant` (and sibling
+/// `revenant-tui`) binary to `tag`, recording it in `~/.revenant/release`.
+/// Returns the backup path of the previous binary. No stdout — safe to call
+/// from the daemon's background auto-updater as well as the CLI. On any failure
+/// the previous binary is restored before erroring.
+pub(crate) fn perform_update(home: &Home, triple: &str, tag: &str) -> Result<PathBuf> {
     let tmp = std::env::temp_dir().join(format!("revenant-update-{}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
     let base = format!("https://github.com/{UPDATE_REPO}/releases/download/{tag}");
@@ -1886,7 +1908,6 @@ fn cmd_update(check: bool) -> Result<()> {
     if !got.eq_ignore_ascii_case(want) {
         bail!("checksum mismatch — refusing to install (want {want}, got {got})");
     }
-    println!("✓ checksum verified");
 
     let s = std::process::Command::new("tar")
         .args(["-xzf", &tmp.join(&tarball).to_string_lossy(), "-C", &tmp.to_string_lossy()])
@@ -1917,11 +1938,9 @@ fn cmd_update(check: bool) -> Result<()> {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
-    // Record the installed release so the next `update` can compare CalVer.
-    let _ = std::fs::write(&release_marker, &tag);
-    println!("\n✅ updated to {tag}. Restart to run it: `revenant up` (or restart the service).");
-    println!("   previous binary kept at {}", bak.display());
-    Ok(())
+    // Record the installed release so the next check can compare CalVer.
+    let _ = std::fs::write(home.root().join("release"), tag);
+    Ok(bak)
 }
 
 async fn cmd_status() -> Result<()> {
@@ -1940,6 +1959,21 @@ async fn cmd_status() -> Result<()> {
             }
         }
         Err(_) => println!("daemon: not running (`revenant up`)"),
+    }
+    // The background auto-updater drops this marker when a newer release is on
+    // the channel (notify mode). Surface it here so it's not buried in logs.
+    if let Some(tag) = std::fs::read_to_string(home.root().join("update-available"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        let current = installed_release_tag(&home);
+        if installed_release_tag(&home).as_deref() != Some(tag.as_str()) {
+            println!(
+                "\n⬆️  update available: {} → {tag}  ·  run `revenant update`",
+                current.as_deref().unwrap_or("(source)")
+            );
+        }
     }
     Ok(())
 }

@@ -558,6 +558,29 @@ impl OutboundMirror {
                         }
                     }
                 }
+                // Auto-update news → every paired chat (the owner's pocket).
+                Event::UpdateAvailable { current, latest, channel } => {
+                    let from = current.unwrap_or_else(|| "source".into());
+                    let msg = format!(
+                        "⬆️ Update available: {from} → {latest} ({channel}).\nRun `revenant update` on the host to take it."
+                    );
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let _ = self.client.send_message(chat_id, &msg).await;
+                        }
+                    }
+                }
+                Event::UpdateInstalled { tag, restarting } => {
+                    let msg = format!(
+                        "✅ Auto-updated to {tag}.{}",
+                        if restarting { " Restarting now." } else { " Restart to apply." }
+                    );
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let _ = self.client.send_message(chat_id, &msg).await;
+                        }
+                    }
+                }
                 _ => {}
             }
         }

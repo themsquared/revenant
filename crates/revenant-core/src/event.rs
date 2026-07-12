@@ -80,6 +80,19 @@ pub enum Event {
         healthy: bool,
         detail: String,
     },
+    /// The background auto-updater found a newer release on the channel
+    /// (notify mode). The owner runs `revenant update` to take it.
+    UpdateAvailable {
+        current: Option<String>,
+        latest: String,
+        channel: String,
+    },
+    /// The background auto-updater installed a newer release (install mode).
+    /// A restart applies it (automatic under a service manager).
+    UpdateInstalled {
+        tag: String,
+        restarting: bool,
+    },
 }
 
 impl Event {
