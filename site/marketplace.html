@@ -30,10 +30,20 @@
   .nav-brand { display:flex; align-items:center; gap:9px; color:var(--text); font-family:var(--display); font-weight:800; font-size:14px; letter-spacing:.04em; }
   .nav-brand img { width:22px; height:22px; }
   .nav-brand:hover { text-decoration:none; }
-  .nav-inner .lnk { color:var(--dim); font-size:13px; }
+  .nav-inner .lnk { color:var(--dim); font-size:13px; white-space:nowrap; }
   .nav-inner .lnk:hover { color:var(--text); text-decoration:none; }
   .nav-inner .lnk.active { color:var(--accent-2); }
   .nav-inner .spacer { flex:1; }
+  .nav-links { display:flex; align-items:center; gap:18px; }
+  .nav-toggle { display:none; background:none; border:1px solid var(--border); color:var(--text);
+                border-radius:8px; padding:5px 11px; font-size:17px; line-height:1; cursor:pointer; }
+  @media (max-width:640px) {
+    .nav-toggle { display:block; }
+    .nav-links { display:none; position:absolute; top:100%; left:0; right:0; flex-direction:column;
+                 align-items:stretch; gap:0; background:var(--bg-2); border-bottom:1px solid var(--border); padding:4px 20px 12px; }
+    nav.open .nav-links { display:flex; }
+    .nav-links .lnk { padding:12px 0; font-size:15px; border-top:1px solid var(--border); }
+  }
 
   header { border-bottom:1px solid var(--border); background:linear-gradient(180deg,var(--bg-2),var(--bg)); }
   .hero { padding:48px 0 30px; }
@@ -98,13 +108,16 @@
 </style>
 </head>
 <body>
-<nav><div class="nav-inner">
+<nav id="nav"><div class="nav-inner">
   <a class="nav-brand" href="/"><img src="/logo.png" alt="">REVENANT</a>
   <span class="spacer"></span>
-  <a class="lnk" href="/">Home</a>
-  <a class="lnk active" href="/marketplace">Marketplace</a>
-  <a class="lnk" href="/account">Join</a>
-  <a class="lnk" href="https://github.com/themsquared/revenant">GitHub</a>
+  <div class="nav-links">
+    <a class="lnk" href="/">Home</a>
+    <a class="lnk active" href="/marketplace">Marketplace</a>
+    <a class="lnk" href="/account">Join</a>
+    <a class="lnk" href="https://github.com/themsquared/revenant">GitHub</a>
+  </div>
+  <button class="nav-toggle" id="navToggle" aria-label="Menu">☰</button>
 </div></nav>
 
 <header><div class="wrap hero">
@@ -132,6 +145,9 @@
 
 <script>
 const $ = s => document.querySelector(s);
+// Mobile nav menu.
+$('#navToggle').onclick = () => $('#nav').classList.toggle('open');
+$('#nav').querySelectorAll('.nav-links a').forEach(a => a.onclick = () => $('#nav').classList.remove('open'));
 const DEFAULT_NECROPOLIS = 'https://necropolis.revenantai.dev';
 const params = new URLSearchParams(location.search);
 const BASE = (params.get('necropolis') || DEFAULT_NECROPOLIS).replace(/\/+$/,'');

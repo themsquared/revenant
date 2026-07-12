@@ -98,6 +98,9 @@ nav a.lnk:hover { color: var(--accent-2); }
 }
 .gh-btn:hover { border-color: var(--accent); background: var(--accent-dim); }
 .gh-btn svg { width: 15px; height: 15px; fill: currentColor; }
+.nav-links { display: flex; align-items: center; gap: 20px; }
+.nav-toggle { display: none; background: none; border: 1px solid var(--border); color: var(--text);
+              border-radius: 8px; padding: 5px 11px; font-size: 17px; line-height: 1; cursor: pointer; }
 
 /* hero */
 header.hero { position: relative; padding: 90px 0 70px; text-align: center; overflow: hidden; }
@@ -362,7 +365,15 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
   .flow { flex-direction: column; }
   .flow-col + .flow-col { border-left: none; border-top: 1px solid var(--border); }
   .flow-arrow { transform: rotate(90deg); align-self: center; padding: 2px 0; }
-  nav .lnk { display: none; }
+  .nav-toggle { display: block; }
+  .nav-links {
+    display: none; position: absolute; top: 100%; left: 0; right: 0;
+    flex-direction: column; align-items: stretch; gap: 0;
+    background: var(--bg-2); border-bottom: 1px solid var(--border); padding: 6px 24px 14px;
+  }
+  nav.open .nav-links { display: flex; }
+  .nav-links .lnk, .nav-links .gh-btn { padding: 13px 0; font-size: 15px; border-top: 1px solid var(--border); }
+  .nav-links .gh-btn { border-left: 0; border-right: 0; border-radius: 0; justify-content: flex-start; }
 }
 @media (max-width: 560px) {
   .grid { grid-template-columns: 1fr; }
@@ -383,6 +394,8 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
 <nav>
   <div class="nav-inner">
     <a class="nav-brand" href="/"><img src="/logo.png" alt="Revenant logo"><span>REVENANT</span></a>
+    <span style="flex:1"></span>
+    <div class="nav-links">
     <a class="lnk" href="#gateway">Why gateway-native</a>
     <a class="lnk" href="#features">Features</a>
     <a class="lnk" href="#security">Security</a>
@@ -395,6 +408,8 @@ footer { border-top: 1px solid var(--border); padding: 44px 0 54px; background: 
       <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
       GitHub
     </a>
+    </div>
+    <button class="nav-toggle" id="navToggle" aria-label="Menu">☰</button>
   </div>
 </nav>
 
@@ -712,6 +727,12 @@ model    = <span class="st">"qwen3:0.6b"</span>
 </footer>
 
 <script>
+// Mobile nav menu.
+(function(){
+  var nav = document.querySelector('nav'), t = document.getElementById('navToggle');
+  if (t) { t.addEventListener('click', function(){ nav.classList.toggle('open'); });
+    nav.querySelectorAll('.nav-links a').forEach(function(a){ a.addEventListener('click', function(){ nav.classList.remove('open'); }); }); }
+})();
 document.getElementById('copy-install').addEventListener('click', async function () {
   const text = document.getElementById('install-cmd').textContent;
   let ok = false;
