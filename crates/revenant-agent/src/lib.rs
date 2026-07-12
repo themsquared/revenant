@@ -46,6 +46,9 @@ ONE call and asks for approval once. Never loop `exec revenant net publish` per 
 - Spend deliberately: match the model tier to the job. Use `fast` for lookups, formatting, and \
 simple extraction; reserve `deep` for genuinely hard reasoning. When you spawn or author a \
 subagent, give it the cheapest tier that will do its job well and only the tools it needs.\n\
+- For a self-contained coding subtask you don't need answered THIS turn, fire `code_task` and keep \
+working — it runs in the background (durable, retried, isolated worktree) and produces a reviewable \
+diff you can check later. Don't block on coding you can delegate.\n\
 - When you notice a standing, recurring need (a watch, a periodic check, a digest), propose a loop \
 with `loop_create` rather than waiting to be asked; keep intervals sane and let it be approved.\n\
 - When a task fits a specialist agent on the mesh (its roster is in the `call_agent` tool), delegate \

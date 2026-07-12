@@ -331,6 +331,10 @@ pub async fn cmd_up() -> Result<()> {
         home.clone(),
     );
 
+    // Durable background-job runner (async coding subtasks + other work items).
+    // Daemon-only (not embedded chat). Recovers in-flight jobs on startup.
+    std::sync::Arc::new(revenant_loops::jobs::JobRunner::new(daemon.manager.clone())).start();
+
     // Unattended Ascension loop: observe → actuate → gatekeep → publish, on a
     // timer, never merging. Off unless ascension.loop_enabled. Spawned after
     // build so the daemon is otherwise ready; its first tick waits 30s for the

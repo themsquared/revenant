@@ -209,6 +209,12 @@ enum Command {
         #[arg(long, default_value = "today")]
         window: String,
     },
+    /// Background jobs: list recent, or `show <id>` for detail (async coding etc).
+    Jobs {
+        /// (empty) to list · show <id>
+        #[arg(num_args = 0..=2)]
+        action: Vec<String>,
+    },
     /// Diagnose your setup in plain English — config, keys, credit, daemon,
     /// channels, network. Run this first if anything feels off.
     Doctor,
@@ -353,6 +359,7 @@ async fn run_command(command: Command) -> Result<()> {
             Command::Chat { tier } => repl::cmd_chat(tier).await,
             Command::Status => cmd_status().await,
             Command::Spend { window } => cmd_spend(window).await,
+            Command::Jobs { action } => cmd_jobs(action).await,
             Command::Doctor => cmd_doctor().await,
             Command::Update { check } => cmd_update(check),
             Command::Approvals { action } => cmd_approvals(action).await,
@@ -1659,6 +1666,53 @@ async fn cmd_spend(window: String) -> Result<()> {
             format!("{:?}", cfg.spending.count).to_lowercase(),
             cfg.spending.interval,
         );
+    }
+    Ok(())
+}
+
+async fn cmd_jobs(action: Vec<String>) -> Result<()> {
+    // Read-only view over the shared DB (WAL → safe alongside the daemon).
+    let home = Home::resolve();
+    let store = revenant_store::Store::open(&home.db_path())?;
+    match action.first().map(String::as_str) {
+        Some("show") => {
+            let id: i64 = action
+                .get(1)
+                .context("usage: revenant jobs show <id>")?
+                .parse()
+                .context("job id must be a number")?;
+            match store.job_get(id).await? {
+                Some(j) => {
+                    println!("job #{} [{}] · {}", j.id, j.kind, j.status);
+                    println!("  {}", j.label);
+                    println!("  attempts {}/{}", j.attempts, j.max_attempts);
+                    if let Some(e) = &j.error {
+                        println!("  error: {e}");
+                    }
+                    if let Some(r) = &j.result {
+                        println!("\n{r}");
+                    }
+                }
+                None => println!("no job #{id}"),
+            }
+        }
+        _ => {
+            let jobs = store.jobs_list(30).await?;
+            if jobs.is_empty() {
+                println!("no background jobs yet. The agent starts them with `code_task`.");
+                return Ok(());
+            }
+            for j in jobs {
+                let mark = match j.status.as_str() {
+                    "done" => "✅",
+                    "failed" => "❌",
+                    "running" => "▶ ",
+                    _ => "… ",
+                };
+                println!("{mark} #{:<4} {:<8} {}  (try {}/{})", j.id, j.status, j.label, j.attempts, j.max_attempts);
+            }
+            println!("\n`revenant jobs show <id>` for the diff/output.");
+        }
     }
     Ok(())
 }

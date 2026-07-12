@@ -51,6 +51,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(NetPublish { home: home.clone() }),
         Arc::new(SkillBrowse { home: home.clone(), skills: skills.clone() }),
         Arc::new(SkillAdopt { home: home.clone(), skills: skills.clone() }),
+        Arc::new(CodeTask { home: home.clone() }),
     ]
 }
 
@@ -1201,6 +1202,71 @@ impl Tool for NetPublish {
             ToolOutput::err(summary)
         } else {
             ToolOutput::ok(summary)
+        }
+    }
+}
+
+/// Kick off a background coding subtask (the "ninja coder") so the main agent
+/// keeps working in real time. Enqueues a durable `code` job — a jailed coder
+/// edits an isolated git worktree and produces a proposed diff — and returns a
+/// job id immediately. The daemon's job runner picks it up; reliability
+/// (persistence, retry, crash recovery) lives in the runner + store.
+struct CodeTask {
+    home: Home,
+}
+
+#[async_trait::async_trait]
+impl Tool for CodeTask {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "code_task",
+            "Start a background coding subtask and keep working — do NOT wait on it. A jailed coder edits an isolated worktree of a git repo and produces a proposed diff. Returns a job id immediately; the work runs off the hot path (durable: it survives restarts, retries on failure). Use for self-contained coding you can check on later, not for edits you need this turn.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "the coding task, self-contained (what to change and why)"},
+                    "root": {"type": "string", "description": "path to the target git repo (defaults to the configured ascension.repo_path)"},
+                    "tier": {"type": "string", "description": "model tier for the coder: fast | balanced | deep (default balanced)"}
+                },
+                "required": ["task"]
+            })
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Dangerous
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        let task = match arg_str(&args, "task") {
+            Ok(t) => t.to_string(),
+            Err(e) => return e,
+        };
+        // Root: explicit arg, else the configured self-improvement repo.
+        let root = args.get("root").and_then(|v| v.as_str()).map(String::from).or_else(|| {
+            std::fs::read_to_string(self.home.config_path())
+                .ok()
+                .and_then(|s| revenant_core::config::Config::from_toml(&s).ok())
+                .and_then(|c| c.ascension.repo_path)
+        });
+        let Some(root) = root else {
+            return ToolOutput::err(
+                "no `root` given and no ascension.repo_path configured — tell me which git repo to work in.",
+            );
+        };
+        if !std::path::Path::new(&root).join(".git").exists() {
+            return ToolOutput::err(format!("`{root}` is not a git repo — the coder needs one for a safe worktree."));
+        }
+        let tier = args.get("tier").and_then(|v| v.as_str()).unwrap_or("balanced");
+        let payload = json!({ "root": root, "task": task, "tier": tier }).to_string();
+        let label = format!("code: {}", task.chars().take(60).collect::<String>());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match cx.store.job_enqueue("code", &payload, &label, 2, now).await {
+            Ok(id) => ToolOutput::ok(format!(
+                "queued background coding job #{id} on {root}. It runs off the hot path — keep working; check it later (it produces a reviewable diff, retries on failure, and survives restarts)."
+            )),
+            Err(e) => ToolOutput::err(format!("couldn't queue the job: {e}")),
         }
     }
 }

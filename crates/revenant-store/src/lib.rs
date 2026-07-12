@@ -59,6 +59,25 @@ pub struct SpendRow {
     pub requests: i64,
 }
 
+/// A durable background job. Every job ends in `done` or `failed` — never
+/// silently dropped.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobRow {
+    pub id: i64,
+    pub kind: String,
+    pub payload: String,
+    pub label: String,
+    pub status: String,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub run_after: i64,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LoopRow {
     pub id: String,
@@ -771,6 +790,151 @@ impl Store {
         })
         .await
     }
+
+    // ---- durable background jobs ----------------------------------------
+
+    /// Enqueue a job. `run_after` is the earliest unix ts it may run (use
+    /// `unix_now()` for "as soon as possible"). Returns the new job id.
+    pub async fn job_enqueue(
+        &self,
+        kind: &str,
+        payload: &str,
+        label: &str,
+        max_attempts: i64,
+        run_after: i64,
+    ) -> Result<i64> {
+        let (kind, payload, label) = (kind.to_owned(), payload.to_owned(), label.to_owned());
+        self.with(move |conn| {
+            let now = unix_now();
+            conn.execute(
+                "INSERT INTO jobs (kind,payload,label,status,attempts,max_attempts,run_after,created_at,updated_at)
+                 VALUES (?1,?2,?3,'queued',0,?4,?5,?6,?6)",
+                rusqlite::params![kind, payload, label, max_attempts.max(1), run_after, now],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    /// Atomically claim the next due queued job (status → running, attempts+1).
+    /// Serialized through the single writer, so no two claims return the same
+    /// job. Returns None when nothing is due.
+    pub async fn job_claim_due(&self, now: i64) -> Result<Option<JobRow>> {
+        self.with(move |conn| {
+            use rusqlite::OptionalExtension;
+            let id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM jobs WHERE status='queued' AND run_after <= ?1 ORDER BY id LIMIT 1",
+                    [now],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(id) = id else { return Ok(None) };
+            conn.execute(
+                "UPDATE jobs SET status='running', attempts=attempts+1, started_at=?2, updated_at=?2
+                 WHERE id=?1 AND status='queued'",
+                rusqlite::params![id, now],
+            )?;
+            conn.query_row(&format!("SELECT {JOB_COLS} FROM jobs WHERE id=?1"), [id], map_job)
+                .optional()
+        })
+        .await
+    }
+
+    pub async fn job_complete(&self, id: i64, result: &str) -> Result<()> {
+        let result = result.to_owned();
+        self.with(move |conn| {
+            let now = unix_now();
+            conn.execute(
+                "UPDATE jobs SET status='done', result=?2, finished_at=?3, updated_at=?3 WHERE id=?1",
+                rusqlite::params![id, result, now],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Record a failure. Retries (back to `queued` after `backoff_secs`) while
+    /// attempts remain; otherwise terminal `failed`. Returns whether it will
+    /// retry. A job NEVER vanishes — it always lands in done or failed.
+    pub async fn job_fail(&self, id: i64, error: &str, now: i64, backoff_secs: i64) -> Result<bool> {
+        let error = error.to_owned();
+        self.with(move |conn| {
+            let (attempts, max): (i64, i64) = conn.query_row(
+                "SELECT attempts, max_attempts FROM jobs WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if attempts < max {
+                conn.execute(
+                    "UPDATE jobs SET status='queued', error=?2, run_after=?3, updated_at=?3 WHERE id=?1",
+                    rusqlite::params![id, error, now + backoff_secs.max(0)],
+                )?;
+                Ok(true)
+            } else {
+                conn.execute(
+                    "UPDATE jobs SET status='failed', error=?2, finished_at=?3, updated_at=?3 WHERE id=?1",
+                    rusqlite::params![id, error, now],
+                )?;
+                Ok(false)
+            }
+        })
+        .await
+    }
+
+    /// Crash recovery: any job left `running` when the daemon died is requeued
+    /// so it runs again on next startup (at-least-once). Returns the count.
+    pub async fn jobs_recover_running(&self, now: i64) -> Result<usize> {
+        self.with(move |conn| {
+            let n = conn.execute(
+                "UPDATE jobs SET status='queued', run_after=?1, updated_at=?1,
+                        error='requeued after daemon restart' WHERE status='running'",
+                [now],
+            )?;
+            Ok(n)
+        })
+        .await
+    }
+
+    pub async fn jobs_list(&self, limit: usize) -> Result<Vec<JobRow>> {
+        self.with(move |conn| {
+            let mut stmt =
+                conn.prepare(&format!("SELECT {JOB_COLS} FROM jobs ORDER BY id DESC LIMIT ?1"))?;
+            let rows = stmt.query_map([limit as i64], map_job)?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn job_get(&self, id: i64) -> Result<Option<JobRow>> {
+        self.with(move |conn| {
+            use rusqlite::OptionalExtension;
+            conn.query_row(&format!("SELECT {JOB_COLS} FROM jobs WHERE id=?1"), [id], map_job)
+                .optional()
+        })
+        .await
+    }
+}
+
+const JOB_COLS: &str =
+    "id,kind,payload,label,status,attempts,max_attempts,run_after,created_at,started_at,finished_at,result,error";
+
+fn map_job(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
+    Ok(JobRow {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        payload: row.get(2)?,
+        label: row.get(3)?,
+        status: row.get(4)?,
+        attempts: row.get(5)?,
+        max_attempts: row.get(6)?,
+        run_after: row.get(7)?,
+        created_at: row.get(8)?,
+        started_at: row.get(9)?,
+        finished_at: row.get(10)?,
+        result: row.get(11)?,
+        error: row.get(12)?,
+    })
 }
 
 fn map_loop(r: &rusqlite::Row<'_>) -> rusqlite::Result<LoopRow> {
@@ -1000,12 +1164,81 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 7 {
+        // Durable background jobs: one-shot work items (e.g. an async coding
+        // task) that must run reliably — persisted, crash-recovered, retried,
+        // and always ending in a terminal state (never silently dropped).
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE jobs (
+               id           INTEGER PRIMARY KEY AUTOINCREMENT,
+               kind         TEXT NOT NULL,        -- 'code' | ...
+               payload      TEXT NOT NULL,        -- JSON args
+               label        TEXT NOT NULL DEFAULT '',
+               status       TEXT NOT NULL,        -- queued | running | done | failed
+               attempts     INTEGER NOT NULL DEFAULT 0,
+               max_attempts INTEGER NOT NULL DEFAULT 3,
+               run_after    INTEGER NOT NULL,     -- earliest ts to (re)run
+               created_at   INTEGER NOT NULL,
+               updated_at   INTEGER NOT NULL,
+               started_at   INTEGER,
+               finished_at  INTEGER,
+               result       TEXT,
+               error        TEXT
+             );
+             CREATE INDEX idx_jobs_claim ON jobs(status, run_after);
+             PRAGMA user_version = 7;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The reliability contract for durable jobs: nothing is ever silently
+    // dropped, retries respect backoff + a cap, scheduled jobs wait, and a
+    // crash mid-run is recovered on restart.
+    #[tokio::test]
+    async fn jobs_state_machine_is_reliable() {
+        let dir = std::env::temp_dir().join(format!("rev-jobs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir.join("j.db")).unwrap();
+        let now = 1_000_000i64;
+
+        // enqueue → claim → complete → done.
+        let id = s.job_enqueue("code", "{}", "do a thing", 3, now).await.unwrap();
+        let c = s.job_claim_due(now).await.unwrap().expect("a job is due");
+        assert_eq!(c.id, id);
+        assert_eq!(c.status, "running");
+        assert_eq!(c.attempts, 1);
+        assert!(s.job_claim_due(now).await.unwrap().is_none(), "claimed job isn't re-claimable");
+        s.job_complete(id, "ok").await.unwrap();
+        assert_eq!(s.job_get(id).await.unwrap().unwrap().status, "done");
+
+        // retry with backoff, then terminal failed (max_attempts=2).
+        let id2 = s.job_enqueue("code", "{}", "flaky", 2, now).await.unwrap();
+        s.job_claim_due(now).await.unwrap().unwrap(); // attempt 1
+        assert!(s.job_fail(id2, "boom", now, 60).await.unwrap(), "attempt 1 should retry");
+        assert!(s.job_claim_due(now).await.unwrap().is_none(), "backoff not elapsed → not due yet");
+        let c2 = s.job_claim_due(now + 60).await.unwrap().expect("due after backoff"); // attempt 2
+        assert_eq!(c2.attempts, 2);
+        assert!(!s.job_fail(id2, "boom again", now + 60, 60).await.unwrap(), "attempts exhausted → failed");
+        assert_eq!(s.job_get(id2).await.unwrap().unwrap().status, "failed");
+
+        // scheduled job: not due until run_after.
+        let id3 = s.job_enqueue("code", "{}", "later", 3, now + 3600).await.unwrap();
+        assert!(s.job_claim_due(now).await.unwrap().is_none());
+        assert_eq!(s.job_claim_due(now + 3600).await.unwrap().unwrap().id, id3);
+
+        // crash recovery: a 'running' job (id3 is now running) is requeued.
+        let recovered = s.jobs_recover_running(now + 3600).await.unwrap();
+        assert_eq!(recovered, 1);
+        assert_eq!(s.job_get(id3).await.unwrap().unwrap().status, "queued");
+    }
 
     #[tokio::test]
     async fn round_trip() {

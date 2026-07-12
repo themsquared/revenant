@@ -6,6 +6,8 @@
 //! rails (min interval, per-day cap) are enforced here so a runaway loop
 //! can't drain the budget.
 
+pub mod jobs;
+
 use anyhow::Result;
 use revenant_agent::{SessionManager, SessionMsg};
 use revenant_core::loops::Schedule;
