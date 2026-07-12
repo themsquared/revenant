@@ -376,3 +376,59 @@ publish per-commit/main builds as prereleases; today only the `year_month` and
 `manual` paths have artifacts to pull. The four fitness axes are computed, but
 `detect()` still keys off failing-task / latency / token outliers rather than a
 direct composite-gradient search — a refinement, not a gap.
+
+## Roadmap: next subsystems (specced, partially built)
+
+Captured from an operator work-list. Each is scoped so it can be built and
+verified independently.
+
+### Sub-agent lifecycle management
+The pieces exist (`agent_create` drafts defs; `AgentRegistry` scans them; each
+def carries a tool allowlist + tier). What's missing is the *lifecycle*:
+- **Usage tracking.** Emit per-spawn metrics (already have `Event::Subagent*`);
+  persist `last_used_ts` + `run_count` per def in a small table. Cheap, enables
+  everything below.
+- **Correct model selection.** `agent_create` should choose the tier from the
+  job's difficulty, not a default: a critic/reviewer → `deep`; a fetch/format/
+  extract helper → `fast`. Encode this in the authoring prompt + a heuristic
+  fallback. (The identity prompt now nudges this; make it structural.)
+- **Least-privilege tools.** `agent_create` should scope the allowlist to the
+  capabilities it actually declares — never inherit-all. Validate the requested
+  tools exist at author time.
+- **Cleanup.** A reflection-loop leg that flags defs unused for N days and
+  proposes pruning (dry-run + owner confirm — never silent delete). CLI:
+  `revenant agents list|prune`.
+
+### Self-improvement: diagnose, then ascend (#3)
+Today `detect()` keys off crude signals (failing task / latency / token
+outliers). Make diagnosis first-class:
+- **OpenTelemetry export.** The event bus already models turns and tool calls;
+  wrap them as OTel spans (turn = root span, tool calls = child spans) and
+  export tokens/latency/cost as metrics. Gives real traces to reason over and
+  standard tooling to view them. New dep: `opentelemetry` + an OTLP exporter,
+  config-gated (off by default).
+- **Trace-based failure analysis.** A diagnosis pass (candidate: AgentEvals /
+  aevals.ai — validate their actual API before wiring; treat as pluggable) reads
+  traces + eval outcomes and produces structured "what's weak and why" findings
+  (e.g. "tool X retries 3× on inputs like Y", "deep tier used where fast would
+  pass"). Those become richer Ascension candidates than the current heuristics —
+  diagnose → ascend, closing the loop with evidence instead of guesses.
+
+### Token/spend, continued (#4)
+Shipped: `revenant spend` (tokens + $ + budget). Next:
+- **Complexity router.** Like the privacy router, but routes trivially-simple
+  turns to `fast` automatically (with an escape hatch), the biggest single spend
+  lever. Must be conservative — never downgrade a turn that needs reasoning.
+- **Budget alerts.** Warn at 75/90/100% of the gateway cap; surface in status +
+  Telegram.
+- **Per-session cost attribution** in the web UI Spend tab.
+
+### Other high-value items worth doing
+- **`revenant doctor` deepening**: cost/credit health, model-availability ping,
+  "is the autonomous loop configured safely" check.
+- **Overnight digest**: "here's what your agent did while you slept" (loops fired,
+  PRs opened, molts published, spend) to Telegram/email.
+- **Autonomous-loop rate limiting + backoff** on PR creation (belt for the
+  existing per-day cap).
+- **Signed releases / SBOM**: sign release artifacts + publish an SBOM so the
+  supply chain the horde installs from is itself verifiable.
