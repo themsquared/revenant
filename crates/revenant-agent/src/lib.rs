@@ -254,11 +254,17 @@ impl AgentRuntime {
 pass to a tool is relative to that root. Make the SMALLEST change that accomplishes the task and \
 keeps the workspace COMPILING.\n\
 Rules for not breaking the build:\n\
-- read_file the ENTIRE file before you edit it, and read it again after writing to confirm it is \
-still valid Rust (balanced braces/parens, imports present, no half-finished edits).\n\
+- read_file the ENTIRE file before you edit it (it returns the whole file; page with offset/limit \
+only if it says it was byte-capped).\n\
+- To CHANGE an existing file, use `edit_file` (exact string replace) — NOT write_file. write_file \
+re-emits the whole file, which silently truncates on large files and loses your edit; edit_file \
+changes only the region you name. Use write_file only to create a brand-new file. Copy old_string \
+verbatim (whitespace included) and include enough context that it's unique. After editing, read_file \
+the changed region to confirm it is still valid Rust.\n\
 - Be especially careful inside multi-line string literals, raw strings (r#\"...\"#), and macros — \
 preserve the exact delimiters and escaping; a stray quote or brace there breaks compilation.\n\
 - Prefer the narrowest edit that works; do not refactor unrelated code or reformat whole files.\n\
+- You MUST actually apply the change with a tool call — do not stop after only describing it.\n\
 - Do not run cargo (the harness builds and tests your change).\n\
 When finished, state briefly which files you changed and why.\n\nTask: {task}"
         );

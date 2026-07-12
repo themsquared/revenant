@@ -108,7 +108,18 @@ impl JobRunner {
         if !root.join(".git").exists() {
             bail!("code root {} is not a git repo (needed for a safe isolated worktree)", p.root);
         }
-        let tier: Tier = p.tier.as_deref().unwrap_or("balanced").parse().unwrap_or(Tier::Balanced);
+        // Escalate on retry: a first pass that produced nothing gets a stronger
+        // model next time (a cheap tier can narrate an edit without making it).
+        let base = p.tier.as_deref().unwrap_or("balanced");
+        let tier_name = if job.attempts >= 2 {
+            match base {
+                "fast" => "balanced",
+                _ => "deep",
+            }
+        } else {
+            base
+        };
+        let tier: Tier = tier_name.parse().unwrap_or(Tier::Balanced);
 
         // Build the worktree OUTSIDE the target repo so we never litter the
         // user's working tree or pollute their `git status`.
@@ -131,11 +142,13 @@ impl JobRunner {
         let _ = std::fs::remove_dir_all(&wt); // belt-and-suspenders
 
         let summary = coded?;
-        Ok(if diff.trim().is_empty() {
-            format!("{summary}\n\n(no file changes produced)")
-        } else {
-            format!("{summary}\n\n--- proposed diff ---\n{diff}")
-        })
+        // A coding task that produced ZERO changes did not do its job — fail so
+        // it retries (with an escalated tier), rather than reporting a hollow
+        // "done". This is what turned lazy no-op runs into silent successes.
+        if diff.trim().is_empty() {
+            bail!("coder produced no file changes (it may have described the edit without applying it). Summary: {}", summary.chars().take(300).collect::<String>());
+        }
+        Ok(format!("{summary}\n\n--- proposed diff ---\n{diff}"))
     }
 }
 

@@ -27,6 +27,7 @@ pub fn coder(root: &std::path::Path) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFile { jail: jail.clone() }),
         Arc::new(WriteFile { jail: jail.clone() }),
+        Arc::new(EditFile { jail: jail.clone() }),
         Arc::new(ListDir { jail }),
     ]
 }
@@ -37,6 +38,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadFile { jail: read_jail.clone() }),
         Arc::new(WriteFile { jail: write_jail.clone() }),
+        Arc::new(EditFile { jail: write_jail.clone() }),
         Arc::new(ListDir { jail: read_jail.clone() }),
         Arc::new(Exec { workspace: home.workspace_dir() }),
         Arc::new(Recall),
@@ -266,6 +268,77 @@ impl Tool for WriteFile {
             Ok(p)
         }) {
             Ok(p) => ToolOutput::ok(format!("wrote {} bytes to {}", content.len(), p.display())),
+            Err(err) => ToolOutput::err(format!("{err:#}")),
+        }
+    }
+}
+
+/// Surgical string-replace edit — the ONLY way to change a large file. A
+/// whole-file `write_file` requires the model to re-emit the entire file as its
+/// argument, which blows the output-token limit on big files (the file reads
+/// fine, but the edit gets truncated to nothing). `edit_file` emits only the
+/// changed region, so file size no longer bounds what can be edited.
+struct EditFile {
+    jail: Jail,
+}
+
+#[async_trait::async_trait]
+impl Tool for EditFile {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "edit_file",
+            "Edit an existing file by replacing an exact string — prefer this over write_file for anything but tiny/new files (write_file re-emits the whole file and hits the output limit on large ones). `old_string` must occur EXACTLY ONCE — include enough surrounding lines to make it unique — and is replaced by `new_string`. Set replace_all=true to change every occurrence. Copy `old_string` verbatim from read_file, whitespace included.",
+            json!({"type":"object","properties":{
+                "path":{"type":"string"},
+                "old_string":{"type":"string","description":"exact text to find (unique unless replace_all)"},
+                "new_string":{"type":"string","description":"replacement text"},
+                "replace_all":{"type":"boolean","description":"replace every occurrence (default false)"}
+            },"required":["path","old_string","new_string"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::WriteWorkspace
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let (path, old, new) = match (
+            arg_str(&args, "path"),
+            arg_str(&args, "old_string"),
+            arg_str(&args, "new_string"),
+        ) {
+            (Ok(p), Ok(o), Ok(n)) => (p, o, n),
+            (Err(e), ..) | (_, Err(e), _) | (_, _, Err(e)) => return e,
+        };
+        if old == new {
+            return ToolOutput::err("old_string and new_string are identical — nothing to do");
+        }
+        let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let content = match self.jail.resolve_read(path).and_then(|p| Ok(std::fs::read_to_string(p)?)) {
+            Ok(c) => c,
+            Err(err) => return ToolOutput::err(format!("{err:#}")),
+        };
+        let count = content.matches(old).count();
+        if count == 0 {
+            return ToolOutput::err(format!(
+                "old_string not found in {path} — read_file it and copy the exact text (whitespace included)."
+            ));
+        }
+        if count > 1 && !replace_all {
+            return ToolOutput::err(format!(
+                "old_string appears {count}× in {path} — add surrounding context to make it unique, or set replace_all=true."
+            ));
+        }
+        let updated = if replace_all { content.replace(old, new) } else { content.replacen(old, new, 1) };
+        let n = if replace_all { count } else { 1 };
+        match self.jail.resolve_write(path).and_then(|p| {
+            std::fs::write(&p, &updated)?;
+            Ok(p)
+        }) {
+            Ok(p) => ToolOutput::ok(format!(
+                "edited {} — {n} replacement{}, now {} bytes",
+                p.display(),
+                if n == 1 { "" } else { "s" },
+                updated.len()
+            )),
             Err(err) => ToolOutput::err(format!("{err:#}")),
         }
     }
