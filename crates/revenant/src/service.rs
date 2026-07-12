@@ -44,6 +44,49 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Restart the running service so it picks up a new binary/config — the missing
+/// third verb alongside install/uninstall. Reuses each platform's manager
+/// (unload+load on launchd, `systemctl restart` on systemd) rather than killing
+/// the process, so the gateway child is torn down and respawned cleanly.
+pub fn restart() -> Result<()> {
+    match std::env::consts::OS {
+        "macos" => {
+            let plist = launchd_path()?;
+            if !plist.exists() {
+                bail!("service not installed — run `revenant service install` first");
+            }
+            let plist_s = plist.to_string_lossy().to_string();
+            // unload is best-effort (may already be down); load must succeed.
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_s])
+                .status();
+            let status = std::process::Command::new("launchctl")
+                .args(["load", &plist_s])
+                .status()
+                .context("launchctl load")?;
+            if !status.success() {
+                bail!("launchctl load failed");
+            }
+            println!("restarted launchd agent {LABEL}");
+        }
+        "linux" => {
+            if !systemd_path()?.exists() {
+                bail!("service not installed — run `revenant service install` first");
+            }
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "restart", "revenant.service"])
+                .status()
+                .context("systemctl restart")?;
+            if !status.success() {
+                bail!("systemctl restart failed");
+            }
+            println!("restarted systemd unit revenant.service");
+        }
+        other => bail!("`service restart` is not supported on {other}"),
+    }
+    Ok(())
+}
+
 fn launchd_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("no home dir")?;
     Ok(home.join("Library/LaunchAgents").join(format!("{LABEL}.plist")))

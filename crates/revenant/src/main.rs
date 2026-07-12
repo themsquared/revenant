@@ -254,9 +254,9 @@ enum Command {
     /// Print the web UI URL with an embedded login token.
     Open,
     #[command(hide = true)]
-    /// Install/uninstall the always-on background service (launchd/systemd).
+    /// Manage the always-on background service (launchd/systemd).
     Service {
-        /// install | uninstall
+        /// install | uninstall | restart
         action: String,
     },
     /// Observe the eval scorecard and plan self-improvement candidates. With
@@ -366,7 +366,8 @@ async fn run_command(command: Command) -> Result<()> {
             Command::Service { action } => match action.as_str() {
                 "install" => service::install(),
                 "uninstall" => service::uninstall(),
-                other => bail!("usage: revenant service install|uninstall (got '{other}')"),
+                "restart" => service::restart(),
+                other => bail!("usage: revenant service install|uninstall|restart (got '{other}')"),
             },
             Command::Eval { suite, json, tag, agent } => cmd_eval(suite, json, tag, agent).await,
             Command::Ascend { run, live, fix, publish } => cmd_ascend(run, live, fix, publish).await,
