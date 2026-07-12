@@ -25,6 +25,13 @@ use tokio::sync::mpsc;
 
 /// Max tool calls dispatched concurrently within a single turn.
 const CONCURRENT_TOOLS: usize = 8;
+/// Past the configured (soft) tool budget, a turn keeps going while it's still
+/// making progress — up to this multiple of the soft budget. So the agent
+/// finishes long tasks on its own instead of stopping to ask "continue?".
+const ITERATION_CEILING_FACTOR: u32 = 3;
+/// …but if it makes NO progress (every tool call in a round errored) for this
+/// many rounds past the soft budget, stop — don't burn the ceiling spinning.
+const STALL_ROUNDS: u32 = 3;
 
 /// Layer 0: identity + rules. Byte-stable for future prompt caching.
 const IDENTITY: &str = "You are Revenant — a lean personal agent that runs anywhere and comes \
@@ -205,7 +212,11 @@ impl AgentRuntime {
     /// sanitize_history strips everything into an empty (400) request. So the
     /// floor scales with the iteration budget, regardless of max_history.
     fn history_limit(&self) -> usize {
-        self.max_history.max(self.max_iterations as usize * 2 + 8)
+        // Scale to the CEILING (not the soft budget): a turn may auto-continue
+        // up to soft×ITERATION_CEILING_FACTOR iterations, ~2 messages each, and
+        // the window must always still contain this turn's user anchor.
+        let ceiling = self.max_iterations as usize * ITERATION_CEILING_FACTOR as usize;
+        self.max_history.max(ceiling * 2 + 8)
     }
 
     /// A shallow clone with a different toolset — runs a turn against a
@@ -229,7 +240,7 @@ impl AgentRuntime {
             max_tokens: self.max_tokens,
             // Coding turns fan out over many files — always give them headroom
             // over the conversational budget, never less.
-            max_iterations: self.max_iterations.max(60),
+            max_iterations: self.max_iterations.max(80),
             learn: false,
             learn_min_tools: self.learn_min_tools,
             default_persona: self.default_persona.clone(),
@@ -397,7 +408,14 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         // Tool trajectory for the learning loop.
         let mut tools_used: Vec<String> = Vec::new();
 
-        for iteration in 1..=self.max_iterations {
+        // Soft budget = configured max_iterations; past it the turn auto-continues
+        // while it's still making progress, up to `ceiling`. This is what stops
+        // the agent from nagging "I hit N steps, continue?" mid-task.
+        let soft = self.max_iterations;
+        let ceiling = soft.saturating_mul(ITERATION_CEILING_FACTOR).max(soft);
+        let mut stalled_rounds = 0u32;
+
+        for iteration in 1..=ceiling {
             let history = self.store.history(session_id, self.history_limit()).await?;
             let messages: Vec<WireMessage> = history
                 .into_iter()
@@ -584,6 +602,29 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             self.store
                 .append_message(session_id, Role::User, &results, estimate(&results))
                 .await?;
+
+            // Past the soft budget: auto-continue only while progressing. A
+            // round that made at least one successful tool call is progress;
+            // reset the stall counter. Enough dead rounds in a row → stop and
+            // wrap up (don't spin the ceiling away). Under the soft budget we
+            // always continue.
+            if iteration >= soft {
+                let progressed = results
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { is_error: false, .. }));
+                if progressed {
+                    stalled_rounds = 0;
+                } else {
+                    stalled_rounds += 1;
+                    if stalled_rounds >= STALL_ROUNDS {
+                        tracing::info!(
+                            "session {session_id}: {stalled_rounds} rounds without progress past \
+                             soft budget {soft} — wrapping up"
+                        );
+                        break;
+                    }
+                }
+            }
         }
 
         // Budget exhausted. DON'T go silent: the loop ended on a tool_result
@@ -591,9 +632,8 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         // text reply. Make one tool-free call so the user gets a coherent
         // answer — what got done, any results, what's left — instead of an
         // aborted turn. Failing this fallback is the only case we bail.
-        tracing::warn!(
-            "session {session_id} hit the {}-iteration tool budget; forcing a final answer",
-            self.max_iterations
+        tracing::info!(
+            "session {session_id} reached the tool-iteration ceiling ({ceiling}); wrapping up"
         );
         let history = self.store.history(session_id, self.history_limit()).await?;
         let messages: Vec<WireMessage> = history
@@ -607,14 +647,14 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         }
         let finalize_system = revenant_llm::system_with_cache(
             &stable_system,
-            Some(&format!(
-                "[SYSTEM] You have reached this turn's tool-use budget ({} steps). Do NOT \
-                 request any more tools — none are available on this reply. Using only what \
-                 you have already gathered, give the user your best final answer now: what you \
-                 accomplished, any concrete results, and clearly flag anything left unfinished \
-                 so they can ask you to continue.",
-                self.max_iterations
-            )),
+            Some(
+                "[SYSTEM] Wrap up in a normal reply now — no tools on this message. Answer the \
+                 user directly with the result and what you found or did. Do NOT mention step/\
+                 tool budgets, iteration limits, or ask permission to continue — that plumbing \
+                 is not the user's problem. ONLY if something is genuinely still unfinished, end \
+                 with a single short line naming what's left and offer to keep going; otherwise \
+                 just give the answer as if this were a normal turn.",
+            ),
         );
         let request = MessagesRequest {
             model: tier.as_str().to_string(),
@@ -636,7 +676,7 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             })
             .await
             .map_err(|err| {
-                let e = format!("turn exceeded {} tool iterations and the wrap-up reply also failed: {err:#}", self.max_iterations);
+                let e = format!("turn reached the {ceiling}-iteration ceiling and the wrap-up reply also failed: {err:#}");
                 self.events.emit(Event::TurnFailed { session_id, error: e.clone() });
                 anyhow::anyhow!(e)
             })?;

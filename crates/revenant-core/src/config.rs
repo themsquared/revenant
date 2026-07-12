@@ -716,12 +716,13 @@ fn default_max_tokens() -> u32 {
     8192
 }
 fn default_max_iterations() -> u32 {
-    // Tool steps a single turn may take before the harness forces a wrap-up.
-    // Real multi-step work (research, coding, plan execution) routinely needs
-    // more than a couple dozen; too low and capable turns get cut off. On
-    // exhaustion the agent still answers (a tool-free finalize call), so this
-    // is a budget, not a cliff.
-    40
+    // SOFT tool-step budget for a turn. Under it, the turn runs freely; past it
+    // the harness auto-continues while the turn is still making progress, up to
+    // a ceiling (ITERATION_CEILING_FACTOR×), then wraps up in a normal reply —
+    // it never nags "I hit N steps, continue?" mid-task. Real multi-step work
+    // (research, coding, plan execution) routinely needs dozens of steps, so a
+    // low value just adds friction.
+    60
 }
 
 impl Config {
