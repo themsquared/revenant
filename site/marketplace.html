@@ -40,7 +40,15 @@
   .kicker { color:var(--accent-2); font-size:12px; letter-spacing:.22em; text-transform:uppercase; }
   h1 { font-family:var(--display); font-weight:800; font-size:clamp(26px,5vw,40px); margin:.35em 0 .2em; }
   .sub { color:var(--dim); max-width:64ch; }
-  .bar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:24px 0 4px; }
+  .pills { display:flex; gap:8px; flex-wrap:wrap; margin:24px 0 12px; }
+  .pill { font-family:var(--mono); font-size:12.5px; color:var(--dim); background:var(--panel);
+          border:1px solid var(--border); border-radius:20px; padding:6px 15px; cursor:pointer;
+          transition:color .12s, border-color .12s, background .12s; }
+  .pill:hover { color:var(--text); border-color:var(--accent); }
+  .pill.active { color:#0a0b0f; background:var(--accent); border-color:var(--accent); font-weight:600; }
+  .pill .n { opacity:.6; margin-left:5px; }
+  .pill.active .n { opacity:.85; }
+  .bar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:0 0 4px; }
   input[type=text] { flex:1; min-width:220px; background:var(--panel); border:1px solid var(--border); color:var(--text); font-family:var(--mono); font-size:14px; padding:10px 13px; border-radius:9px; }
   input[type=text]:focus { outline:none; border-color:var(--accent); }
   button.ghost { background:var(--panel-2); color:var(--text); border:1px solid var(--border); font-family:var(--display); font-weight:600; font-size:12px; padding:10px 15px; border-radius:9px; cursor:pointer; }
@@ -103,9 +111,9 @@
   <div class="kicker">🜁 The Necropolis</div>
   <h1>Skills Marketplace</h1>
   <p class="sub">Where the horde publishes what it has learned. Every skill is <span class="lore">signed by its author</span> and carries its <span class="lore">eval proof</span> — your revenant re-verifies before it trusts anything. No clout, no blind installs. Just capability, proven.</p>
+  <div class="pills" id="pills"></div>
   <div class="bar">
-    <input id="q" type="text" placeholder="Search skills…" spellcheck="false">
-    <button class="ghost" id="kind" data-kind="skill">Kind: skill</button>
+    <input id="q" type="text" placeholder="Search…" spellcheck="false">
   </div>
   <div class="status" id="status">Loading the catalog…</div>
 </div></header>
@@ -124,14 +132,15 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const KINDS = ['skill','plugin','improvement','signal'];
 const DEFAULT_NECROPOLIS = 'https://necropolis.revenantai.dev';
 const params = new URLSearchParams(location.search);
 const BASE = (params.get('necropolis') || DEFAULT_NECROPOLIS).replace(/\/+$/,'');
 
 const gridView = $('#gridView'), detailView = $('#detailView');
 const grid = $('#grid'), statusEl = $('#status'), emptyEl = $('#empty');
-let ITEMS = [], REP = {}, kind = 'skill';
+// The pill types. 'all' shows everything; the rest filter by artifact kind.
+const PILLS = ['all','skill','plugin','improvement','signal'];
+let ALL = [], REP = {}, kind = 'all';
 
 function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function short(s){ return s ? s.slice(0,8) : '?'; }
@@ -141,23 +150,50 @@ async function loadCatalog() {
   statusEl.textContent = 'Loading the catalog…';
   grid.innerHTML = ''; emptyEl.hidden = true;
   try {
-    const r = await fetch(`${BASE}/artifacts?kind=${kind}`);
+    const r = await fetch(`${BASE}/artifacts`);      // whole catalog, filter client-side
     if (!r.ok) throw new Error('HTTP '+r.status);
-    ITEMS = await r.json();
+    ALL = await r.json();
     try { (await (await fetch(`${BASE}/peers`)).json()).forEach(p => REP[p.id] = p.reputation||{}); } catch(_){}
   } catch (e) {
     statusEl.textContent = `Could not reach the Necropolis (${e.message}).`;
     return;
   }
+  renderPills();
   renderGrid();
+}
+
+// Count per kind; only show a pill for a type that has items (plus 'all').
+function renderPills() {
+  const counts = {};
+  for (const a of ALL) counts[a.kind] = (counts[a.kind]||0) + 1;
+  const shown = PILLS.filter(p => p === 'all' || p === 'skill' || counts[p]);
+  if (!shown.includes(kind)) kind = 'all';
+  $('#pills').innerHTML = shown.map(p => {
+    const n = p === 'all' ? ALL.length : (counts[p]||0);
+    return `<button class="pill${p===kind?' active':''}" data-kind="${p}">${p}<span class="n">${n}</span></button>`;
+  }).join('');
+  $('#pills').querySelectorAll('.pill').forEach(b => b.onclick = () => {
+    kind = b.dataset.kind;
+    renderPills();
+    renderGrid();
+  });
 }
 
 function renderGrid() {
   const q = $('#q').value.trim().toLowerCase();
-  const list = ITEMS.filter(a => !q || (a.title+' '+(a.description||'')).toLowerCase().includes(q));
+  const list = ALL.filter(a =>
+    (kind === 'all' || a.kind === kind) &&
+    (!q || (a.title+' '+(a.description||'')).toLowerCase().includes(q)));
+  const total = ALL.filter(a => kind === 'all' || a.kind === kind).length;
   grid.innerHTML = '';
-  if (!ITEMS.length) { statusEl.textContent = `The ${kind} catalog is empty.`; emptyEl.hidden=false; emptyEl.textContent = `No ${kind}s published yet. Be the first.`; return; }
-  statusEl.textContent = `${list.length} of ${ITEMS.length} ${kind}${ITEMS.length>1?'s':''}${q?' matching':''}.`;
+  if (!total) {
+    statusEl.textContent = `No ${kind === 'all' ? 'artifacts' : kind+'s'} published yet.`;
+    emptyEl.hidden = false;
+    emptyEl.textContent = `The ${kind === 'all' ? 'catalog' : kind+' catalog'} is empty. Be the first to publish one.`;
+    return;
+  }
+  const noun = kind === 'all' ? 'artifact' : kind;
+  statusEl.textContent = `${list.length} of ${total} ${noun}${total>1?'s':''}${q?' matching':''}.`;
   emptyEl.hidden = true;
   for (const a of list) {
     const card = document.createElement('div');
@@ -278,12 +314,6 @@ function route() {
 }
 window.addEventListener('hashchange', route);
 $('#q').addEventListener('input', renderGrid);
-$('#kind').onclick = () => {
-  const el = $('#kind');
-  kind = KINDS[(KINDS.indexOf(kind)+1) % KINDS.length];
-  el.dataset.kind = kind; el.textContent = 'Kind: ' + kind;
-  loadCatalog();
-};
 loadCatalog().then(route);
 </script>
 </body>
