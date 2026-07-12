@@ -35,7 +35,10 @@ header {
 
 .login-logo { width: 140px; height: auto; margin-bottom: 8px; }
 
-nav { display: flex; gap: 4px; }
+nav { display: flex; gap: 4px; align-items: center; }
+/* Advanced toggle: pushed to the right, dim until enabled. */
+.adv-toggle { margin-left: auto; font-size: 0.85em; opacity: 0.7; }
+.adv-toggle.on { opacity: 1; color: var(--accent-2); }
 
 .tab {
   background: none;

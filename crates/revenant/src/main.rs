@@ -4,6 +4,7 @@
 //! API). `chat` is an API client; with no daemon running it falls back to an
 //! embedded session using the exact same runtime components.
 
+mod ascend_loop;
 mod daemon;
 mod repl;
 mod service;
@@ -15,7 +16,7 @@ extern crate revenant_plugin_example as _;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use revenant_core::config::{Config, GatewayMode};
+use revenant_core::config::{Config, GatewayMode, UpdateChannel};
 use revenant_core::home::Home;
 use std::io::Write;
 use std::path::PathBuf;
@@ -178,14 +179,18 @@ const BUILTIN_PERSONAS: &[(&str, &str)] = &[
 ];
 
 #[derive(Parser)]
-#[command(name = "revenant", version, about = "The agent that comes back. Gateway-native Rust agent harness.")]
+#[command(name = "revenant", version, about = "The agent that comes back. Gateway-native Rust agent harness.",
+    after_help = "Run `revenant` with no command for guided setup, then chat.\n\nAdvanced commands (hidden above; run `revenant <cmd> --help`):\n  ascend, pr-review, net, necropolis, eval, memory, mcp, render, service, init")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Guided first-run setup, then drops you into chat. Safe to re-run.
+    Setup,
+    #[command(hide = true)]
     /// Create ~/.revenant, write default config, capture API keys.
     Init,
     /// Run the daemon: supervised gateway + agent runtime + control API.
@@ -213,13 +218,16 @@ enum Command {
         #[arg(num_args = 0..=2)]
         action: Vec<String>,
     },
+    #[command(hide = true)]
     /// Print the rendered agentgateway config (debug).
     Render,
+    #[command(hide = true)]
     /// Memory engine: reindex | status | search <query>
     Memory {
         #[arg(num_args = 1..=2)]
         action: Vec<String>,
     },
+    #[command(hide = true)]
     /// Manage MCP server plugins: list | add <name> <cmd> [args…] | add-url <name> <url> | remove <name>
     Mcp {
         #[arg(num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]
@@ -229,6 +237,7 @@ enum Command {
     Pair,
     /// Print the web UI URL with an embedded login token.
     Open,
+    #[command(hide = true)]
     /// Install/uninstall the always-on background service (launchd/systemd).
     Service {
         /// install | uninstall
@@ -236,6 +245,7 @@ enum Command {
     },
     /// Observe the eval scorecard and plan self-improvement candidates. With
     /// --run, drive the top candidate through the full actuator (isolate →
+    #[command(hide = true)]
     /// implement → prove → review → offer). PRs are dry-run unless --live.
     Ascend {
         #[arg(long)]
@@ -246,8 +256,21 @@ enum Command {
         /// candidate (e.g. "fix the clippy warning in crates/foo/src/bar.rs").
         #[arg(long)]
         fix: Option<String>,
+        /// Run the auto-publish leg once: sign + push landed (human-merged)
+        /// `ascension` PRs to the network as Improvement artifacts. Skips the
+        /// actuator entirely.
+        #[arg(long)]
+        publish: bool,
+    },
+    /// Cut a CalVer release: tag main with the next `vYEAR.MONTH.patch` and push
+    /// so CI builds + publishes it, bundling landed molts. --dry-run to preview.
+    #[command(hide = true)]
+    Promote {
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Gatekeeper: independently review open machine-authored (`ascension`) PRs
+    #[command(hide = true)]
     /// and label them ascension-approved / ascension-blocked for your merge.
     PrReview {
         #[arg(long)]
@@ -255,6 +278,7 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    #[command(hide = true)]
     /// Run a Necropolis directory server (the horde's muster point).
     Necropolis {
         #[arg(long, default_value_t = 7720)]
@@ -263,11 +287,13 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    #[command(hide = true)]
     /// Revenant-only network: register | peers | publish <kind> <file> | list [kind] | pull <id> | sync <peer-url> | verify
     Net {
         #[arg(num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]
         action: Vec<String>,
     },
+    #[command(hide = true)]
     /// Run the eval scorecard against the live daemon (proves the numbers).
     Eval {
         /// Directory of `*.toml` task files. Omit to use the embedded suite.
@@ -298,6 +324,24 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         match cli.command {
+            // Bare `revenant`: first run (no config) → the setup wizard;
+            // otherwise → straight into chat. The zero-friction default.
+            None => {
+                let home = Home::resolve();
+                if home.config_path().exists() {
+                    repl::cmd_chat(None).await
+                } else {
+                    cmd_setup().await
+                }
+            }
+            Some(cmd) => run_command(cmd).await,
+        }
+    })
+}
+
+async fn run_command(command: Command) -> Result<()> {
+    match command {
+            Command::Setup => cmd_setup().await,
             Command::Init => cmd_init().await,
             Command::Up => daemon::cmd_up().await,
             Command::Chat { tier } => repl::cmd_chat(tier).await,
@@ -316,12 +360,12 @@ fn main() -> Result<()> {
                 other => bail!("usage: revenant service install|uninstall (got '{other}')"),
             },
             Command::Eval { suite, json, tag, agent } => cmd_eval(suite, json, tag, agent).await,
-            Command::Ascend { run, live, fix } => cmd_ascend(run, live, fix).await,
+            Command::Ascend { run, live, fix, publish } => cmd_ascend(run, live, fix, publish).await,
+            Command::Promote { dry_run } => cmd_promote(dry_run).await,
             Command::PrReview { repo, limit } => cmd_pr_review(repo, limit).await,
             Command::Necropolis { port, db } => cmd_necropolis(port, db).await,
             Command::Net { action } => cmd_net(action).await,
-        }
-    })
+    }
 }
 
 async fn cmd_necropolis(port: u16, db: Option<PathBuf>) -> Result<()> {
@@ -335,7 +379,7 @@ async fn cmd_necropolis(port: u16, db: Option<PathBuf>) -> Result<()> {
     revenant_net::necropolis::serve(addr, Arc::new(Mutex::new(dir))).await
 }
 
-fn now_ts() -> i64 {
+pub(crate) fn now_ts() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -562,10 +606,20 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_ascend(run: bool, live: bool, fix: Option<String>) -> Result<()> {
+async fn cmd_ascend(run: bool, live: bool, fix: Option<String>, publish: bool) -> Result<()> {
     let home = Home::resolve();
     let cfg = load_config(&home)?;
     let asc = cfg.ascension.clone();
+
+    // --publish: run only the auto-publish leg (no daemon required — it just
+    // reads merged PRs via gh and signs artifacts to the network).
+    if publish {
+        println!("🜁 Publishing landed molts from {} to the network…", asc.pr_repo);
+        let n = ascend_loop::publish_landed_molts(&home, &asc, &cfg.network, true).await?;
+        println!("done — {n} new molt(s) published.");
+        return Ok(());
+    }
+
     let client = revenant_client::Client::from_env(&home)?;
     client
         .health()
@@ -649,9 +703,37 @@ async fn cmd_ascend(run: bool, live: bool, fix: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn gh_capture(args: &[&str]) -> Option<String> {
+pub(crate) fn gh_capture(args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("gh").args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+async fn cmd_promote(dry_run: bool) -> Result<()> {
+    let home = Home::resolve();
+    let cfg = load_config(&home)?;
+    if cfg.ascension.repo_path.is_none() {
+        // Fall back to cwd if it's a git repo — the manual invocation case.
+        let cwd = std::env::current_dir()?;
+        if !cwd.join(".git").exists() {
+            bail!("set ascension.repo_path (or run from the revenant git repo) to cut a release");
+        }
+    }
+    let asc = {
+        let mut a = cfg.ascension.clone();
+        if a.repo_path.is_none() {
+            a.repo_path = Some(std::env::current_dir()?.to_string_lossy().to_string());
+        }
+        a
+    };
+    println!("🜁 Promote — {} (repo {})", if dry_run { "dry-run" } else { "LIVE" }, asc.pr_repo);
+    match ascend_loop::promote_release(&home, &asc, dry_run).await? {
+        Some(msg) => println!("{msg}"),
+        None => println!(
+            "nothing to cut — fewer than {} merged-but-unreleased molt(s) since the last release.",
+            asc.release_min_molts
+        ),
+    }
+    Ok(())
 }
 
 async fn cmd_pr_review(repo: Option<String>, limit: Option<usize>) -> Result<()> {
@@ -663,83 +745,12 @@ async fn cmd_pr_review(repo: Option<String>, limit: Option<usize>) -> Result<()>
         .health()
         .await
         .context("pr-review needs a running daemon — start it with `revenant up`")?;
-    let repo = repo.unwrap_or_else(|| "themsquared/revenant".to_string());
-
-    // Ensure the verdict labels exist (idempotent).
-    for (name, color, desc) in [
-        ("ascension-approved", "0e8a16", "gatekeeper approved — ready for human merge"),
-        ("ascension-blocked", "b60205", "gatekeeper blocked — do not merge as-is"),
-    ] {
-        let _ = std::process::Command::new("gh")
-            .args(["label", "create", name, "--repo", &repo, "--color", color, "--description", desc, "--force"])
-            .output();
-    }
-
-    // Open, machine-authored PRs (the `ascension` label).
-    let list = gh_capture(&["pr", "list", "--repo", &repo, "--label", "ascension", "--state", "open", "--json", "number,title"])
-        .context("gh pr list failed (is gh authed?)")?;
-    let mut prs: Vec<serde_json::Value> = serde_json::from_str(&list).unwrap_or_default();
-    if let Some(n) = limit {
-        prs.truncate(n);
-    }
-    if prs.is_empty() {
-        println!("No open `ascension` PRs to review on {repo}.");
-        return Ok(());
-    }
-
-    println!("🜁 Gatekeeper — independently reviewing {} PR(s) on {repo}\n", prs.len());
-    let (mut approved, mut blocked) = (0, 0);
-    for pr in prs {
-        let n = pr["number"].as_i64().unwrap_or(0);
-        let title = pr["title"].as_str().unwrap_or("").to_string();
-        let ns = n.to_string();
-        let body = gh_capture(&["pr", "view", &ns, "--repo", &repo, "--json", "body", "-q", ".body"])
-            .unwrap_or_default();
-        let diff = gh_capture(&["pr", "diff", &ns, "--repo", &repo]).unwrap_or_default();
-        if diff.trim().is_empty() {
-            println!("  PR #{n} {title}\n    → skipped (no diff available)");
-            continue;
-        }
-        let verdict = revenant_ascension::review::review_pr(
-            &client, &asc.reviewer_tier, &title, &body, &diff, &asc.denylist,
-        )
-        .await?;
-        let (add, rm, mark) = if verdict.approved {
-            approved += 1;
-            ("ascension-approved", "ascension-blocked", "✅ APPROVED")
-        } else {
-            blocked += 1;
-            ("ascension-blocked", "ascension-approved", "🛑 CHANGES REQUESTED")
-        };
-        let reasons = verdict
-            .reasons
-            .iter()
-            .chain(verdict.concerns.iter())
-            .map(|r| format!("- {r}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let comment = format!(
-            "## 🜁 Ascension gatekeeper — {mark} (confidence {:.2})\n\n{reasons}\n\n_Independent owner-side review (Gate 2). A human still makes the final merge decision._",
-            verdict.confidence
-        );
-        let _ = std::process::Command::new("gh")
-            .args(["pr", "comment", &ns, "--repo", &repo, "--body", &comment])
-            .output();
-        let _ = std::process::Command::new("gh")
-            .args(["pr", "edit", &ns, "--repo", &repo, "--add-label", add])
-            .output();
-        let _ = std::process::Command::new("gh")
-            .args(["pr", "edit", &ns, "--repo", &repo, "--remove-label", rm])
-            .output();
-        println!("  PR #{n} {title}\n    → {mark} (conf {:.2}) · labeled `{add}`", verdict.confidence);
-    }
-    println!(
-        "\n{approved} approved · {blocked} blocked. Review the `ascension-approved` PRs and merge the ones you want:\n  gh pr list --repo {repo} --label ascension-approved"
-    );
+    let repo = repo.unwrap_or_else(|| asc.pr_repo.clone());
+    ascend_loop::gatekeep_open_prs(&client, &asc, &repo, limit, true).await?;
     Ok(())
 }
 
-fn ascend_run_cfg(
+pub(crate) fn ascend_run_cfg(
     asc: &revenant_core::config::AscensionConfig,
     live: bool,
 ) -> revenant_ascension::run::RunConfig {
@@ -752,6 +763,7 @@ fn ascend_run_cfg(
         denylist: asc.denylist.clone(),
         max_repair: 5,
         live,
+        materiality: asc.materiality,
     }
 }
 
@@ -1008,8 +1020,11 @@ pub async fn shutdown_signal() {
     }
 }
 
-async fn cmd_init() -> Result<()> {
-    let home = Home::resolve();
+/// Create the runtime tree, ship bundled skills/subagents/personas, write the
+/// default config + bearer token. Idempotent. Returns whether the config was
+/// freshly created (i.e. this looks like a first run). Shared by `init` and the
+/// first-run `setup` wizard.
+fn scaffold_fs(home: &Home) -> Result<bool> {
     std::fs::create_dir_all(home.root())?;
     std::fs::create_dir_all(home.gateway_bin_dir())?;
     std::fs::create_dir_all(home.workspace_dir())?;
@@ -1024,7 +1039,6 @@ async fn cmd_init() -> Result<()> {
     if !creator_dir.join("SKILL.md").exists() {
         std::fs::create_dir_all(&creator_dir)?;
         std::fs::write(creator_dir.join("SKILL.md"), SKILL_CREATOR)?;
-        println!("installed skill: skill-creator");
     }
 
     // Ship the loop-engineering skill + a critic subagent so nested quality
@@ -1033,13 +1047,11 @@ async fn cmd_init() -> Result<()> {
     if !loop_skill_dir.join("SKILL.md").exists() {
         std::fs::create_dir_all(&loop_skill_dir)?;
         std::fs::write(loop_skill_dir.join("SKILL.md"), QUALITY_LOOP_SKILL)?;
-        println!("installed skill: quality-loop");
     }
     let critic_path = home.agents_dir().join("critic.md");
     if !critic_path.exists() {
         std::fs::create_dir_all(home.agents_dir())?;
         std::fs::write(&critic_path, CRITIC_AGENT)?;
-        println!("installed subagent: critic");
     }
 
     // Ship the autoresearch skill so web_search + web_fetch are used with a
@@ -1048,49 +1060,22 @@ async fn cmd_init() -> Result<()> {
     if !research_dir.join("SKILL.md").exists() {
         std::fs::create_dir_all(&research_dir)?;
         std::fs::write(research_dir.join("SKILL.md"), AUTORESEARCH_SKILL)?;
-        println!("installed skill: autoresearch");
     }
 
-    // Ship a few built-in personalities (voice layer). Users edit or add
-    // their own; the agent can draft new ones with persona_create.
+    // Ship a few built-in personalities (voice layer). Idempotent: add any
+    // missing built-in (so upgrades get new voices) without clobbering edits.
     let pdir = home.personalities_dir();
     std::fs::create_dir_all(&pdir)?;
-    let mut installed = 0;
     for (file, body) in BUILTIN_PERSONAS {
-        // Idempotent: add any missing built-in (so upgrades get new voices)
-        // without clobbering ones the user has edited.
         if !pdir.join(file).exists() {
             std::fs::write(pdir.join(file), body)?;
-            installed += 1;
         }
-    }
-    if installed > 0 {
-        println!("installed {installed} personalities (try: /persona revenant)");
     }
 
     let config_path = home.config_path();
-    if config_path.exists() {
-        println!("config already exists at {} — leaving it alone", config_path.display());
-    } else {
+    let fresh = !config_path.exists();
+    if fresh {
         std::fs::write(&config_path, Config::default_config().to_toml())?;
-        println!("wrote {}", config_path.display());
-    }
-
-    let secrets_path = home.secrets_path();
-    if !secrets_path.exists() {
-        print!("Anthropic API key (sk-ant-..., blank to skip): ");
-        std::io::stdout().flush()?;
-        let mut key = String::new();
-        std::io::stdin().read_line(&mut key)?;
-        let key = key.trim();
-        let body = if key.is_empty() {
-            "# Add provider keys here, e.g.\n# ANTHROPIC_API_KEY=sk-ant-...\n".to_string()
-        } else {
-            format!("ANTHROPIC_API_KEY={key}\n")
-        };
-        std::fs::write(&secrets_path, body)?;
-        set_mode_0600(&secrets_path)?;
-        println!("wrote {} (0600)", secrets_path.display());
     }
 
     // Control-plane bearer token: required even on loopback.
@@ -1101,22 +1086,156 @@ async fn cmd_init() -> Result<()> {
         rand::thread_rng().fill_bytes(&mut bytes);
         std::fs::write(&token_path, hex::encode(bytes))?;
         set_mode_0600(&token_path)?;
-        println!("wrote {} (0600)", token_path.display());
     }
+    Ok(fresh)
+}
 
-    let cfg = load_config(&home)?;
+/// Fetch the one-time heavy assets: the supervised gateway binary and (if
+/// memory uses the built-in embedder) the ~35MB embedding model. Both are
+/// checksum-verified and cached; re-running is cheap.
+async fn ensure_downloads(home: &Home, cfg: &Config) -> Result<()> {
     if cfg.gateway.mode == GatewayMode::Bundled {
-        let bin = revenant_gateway::ensure_binary(&home, &cfg).await?;
+        let bin = revenant_gateway::ensure_binary(home, cfg).await?;
         println!("gateway binary ready: {}", bin.display());
     }
-    if cfg.memory.enabled
-        && cfg.memory.embedder == revenant_core::config::EmbedderKind::Builtin
-    {
+    if cfg.memory.enabled && cfg.memory.embedder == revenant_core::config::EmbedderKind::Builtin {
         let dir = revenant_memory::embed::ensure_builtin_model(&home.models_dir()).await?;
         println!("embedding model ready: {}", dir.display());
     }
+    Ok(())
+}
+
+/// True once a usable Anthropic key is present in secrets.env.
+fn has_anthropic_key(home: &Home) -> bool {
+    std::fs::read_to_string(home.secrets_path())
+        .map(|s| {
+            s.lines().any(|l| {
+                let l = l.trim();
+                !l.starts_with('#')
+                    && l.starts_with("ANTHROPIC_API_KEY=")
+                    && l.trim_end().len() > "ANTHROPIC_API_KEY=".len() + 3
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Read one line from stdin with a prompt; returns the trimmed input.
+fn prompt(msg: &str) -> Result<String> {
+    print!("{msg}");
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    Ok(buf.trim().to_string())
+}
+
+async fn cmd_init() -> Result<()> {
+    let home = Home::resolve();
+    scaffold_fs(&home)?;
+    println!("wrote {}", home.config_path().display());
+
+    let secrets_path = home.secrets_path();
+    if !secrets_path.exists() {
+        let key = prompt("Anthropic API key (sk-ant-..., blank to skip): ")?;
+        let body = if key.is_empty() {
+            "# Add provider keys here, e.g.\n# ANTHROPIC_API_KEY=sk-ant-...\n".to_string()
+        } else {
+            format!("ANTHROPIC_API_KEY={key}\n")
+        };
+        std::fs::write(&secrets_path, body)?;
+        set_mode_0600(&secrets_path)?;
+        println!("wrote {} (0600)", secrets_path.display());
+    }
+
+    let cfg = load_config(&home)?;
+    ensure_downloads(&home, &cfg).await?;
     println!("\n\x1b[1;35mrevenant\x1b[0m is raised. `revenant chat` to give it its first words,\n`revenant up` to bind it to the machine, `revenant open` for the web UI.\nFor the full house voice: `/persona revenant` in chat. It does not sleep.");
     Ok(())
+}
+
+/// The turnkey first-run experience: `revenant` (bare) on a fresh box, or
+/// `revenant setup` any time. Asks only what can't be inferred — how you'll pay
+/// — writes everything, fetches the one-time assets, and drops you straight
+/// into your first conversation. No TOML, no docs, no daemon to babysit.
+async fn cmd_setup() -> Result<()> {
+    let home = Home::resolve();
+    println!(
+        "\n\x1b[1;35m🜁 revenant\x1b[0m — the agent that comes back.\n\
+         Let's get you talking to it. This takes about a minute, once.\n"
+    );
+
+    let fresh = scaffold_fs(&home)?;
+    if fresh {
+        println!("✓ created {}", home.root().display());
+    } else {
+        println!("✓ using existing setup at {}", home.root().display());
+    }
+
+    // The one real decision: how does it think? Everything else is inferred.
+    if !has_anthropic_key(&home) {
+        println!(
+            "\n\x1b[1mHow should your revenant think?\x1b[0m\n\
+             \x20 1) Anthropic (Claude) — recommended, most capable\n\
+             \x20 2) Skip for now — add a key later; chat will tell you what's missing\n"
+        );
+        let choice = prompt("Choose [1]: ")?;
+        let mut body =
+            "# Provider keys. Keep this file private (0600).\n".to_string();
+        if choice != "2" {
+            println!(
+                "\nGrab a key (starts with sk-ant-) at:\n  \x1b[4mhttps://console.anthropic.com/settings/keys\x1b[0m\n"
+            );
+            let key = prompt("Paste your Anthropic API key (or blank to skip): ")?;
+            if key.is_empty() {
+                body.push_str("# ANTHROPIC_API_KEY=sk-ant-...\n");
+                println!("No key yet — that's fine. Run `revenant setup` again when you have one.");
+            } else {
+                body.push_str(&format!("ANTHROPIC_API_KEY={key}\n"));
+                println!("✓ key saved");
+            }
+        } else {
+            body.push_str("# ANTHROPIC_API_KEY=sk-ant-...\n");
+        }
+        std::fs::write(home.secrets_path(), body)?;
+        set_mode_0600(&home.secrets_path())?;
+    } else {
+        println!("✓ provider key already set");
+    }
+
+    // Progressive disclosure: pick how much surface to show by default. Novice
+    // → clean web UI + everyday CLI; power user → advanced tabs revealed. The
+    // web toggle still overrides per-browser; this just sets the starting point.
+    println!(
+        "\n\x1b[1mHow will you use it?\x1b[0m\n\
+         \x20 1) Just chatting — keep it simple (recommended)\n\
+         \x20 2) Power user — show loops, subagents, spend, memory, ascension up front\n"
+    );
+    let power_user = prompt("Choose [1]: ")? == "2";
+    {
+        let mut cfg = load_config(&home)?;
+        cfg.experience.power_user = power_user;
+        std::fs::write(home.config_path(), cfg.to_toml())?;
+    }
+    println!("✓ {}", if power_user { "power-user mode — everything visible" } else { "simple mode — advanced features are one toggle away" });
+
+    let cfg = load_config(&home)?;
+    println!("\nFetching the gateway and memory model (one-time)…");
+    ensure_downloads(&home, &cfg).await?;
+
+    if !has_anthropic_key(&home) {
+        println!(
+            "\n\x1b[1;33mHeads up:\x1b[0m no provider key yet, so replies won't work until you add one.\n\
+             Run \x1b[1mrevenant setup\x1b[0m again, or put ANTHROPIC_API_KEY in {}.",
+            home.secrets_path().display()
+        );
+        println!("\nWhen you're ready: \x1b[1mrevenant\x1b[0m starts chatting.");
+        return Ok(());
+    }
+
+    println!(
+        "\n\x1b[1;32m✓ You're set.\x1b[0m Starting your first conversation — just type.\n\
+         (Tips: /help for commands · /persona revenant for the full house voice · Ctrl-C to leave.)\n"
+    );
+    repl::cmd_chat(None).await
 }
 
 pub fn set_mode_0600(path: &std::path::Path) -> Result<()> {
@@ -1255,13 +1374,6 @@ fn update_triple() -> Option<&'static str> {
 }
 
 /// Pull a `"key":"value"` string out of a JSON blob without a full parser.
-fn json_str(body: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let after = &body[body.find(&pat)? + pat.len()..];
-    let rest = after[after.find(':')? + 1..].trim_start().strip_prefix('"')?;
-    Some(rest[..rest.find('"')?].to_string())
-}
-
 fn sha256_file(path: &std::path::Path) -> Result<String> {
     let run = |cmd: &str, args: &[&str]| -> Option<String> {
         let out = std::process::Command::new(cmd).args(args).arg(path).output().ok()?;
@@ -1287,13 +1399,43 @@ fn install_bin(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_update(check: bool) -> Result<()> {
-    let triple = update_triple().context("auto-update isn't supported on this platform yet")?;
-    let current = env!("CARGO_PKG_VERSION");
-    println!("current: v{current}  ({triple})");
+/// Parse a CalVer tag (`2026.7.0`, `v2026.7`, `2026.7.1`) into (year,month,patch).
+/// Requires a plausible year+month so a stray semver tag (0.1.0) never matches.
+///
+/// Any SemVer-style prerelease/build suffix is stripped before parsing, so a
+/// rolling `main`-channel tag like `v2026.7.412-main.abc1234` parses to its
+/// core `(2026, 7, 412)` — the same shape as a stable tag. Rolling builds carry
+/// a monotonic commit-count patch (see the main-prerelease workflow) so two
+/// builds in the same month compare as distinct, which is what lets
+/// `resolve_update_target`/`cmd_update` detect a newer rolling build.
+pub(crate) fn parse_calver(tag: &str) -> Option<(u32, u32, u32)> {
+    let core = tag.trim().trim_start_matches('v');
+    // Drop `-prerelease` / `+build` metadata; the CalVer core is what orders.
+    let core = core.split(['-', '+']).next().unwrap_or(core);
+    let mut it = core.split('.');
+    let year: u32 = it.next()?.parse().ok()?;
+    let month: u32 = it.next()?.parse().ok()?;
+    let patch: u32 = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    if (2024..=2100).contains(&year) && (1..=12).contains(&month) {
+        Some((year, month, patch))
+    } else {
+        None
+    }
+}
 
-    // Latest release tag from the GitHub API (via curl, like the installer).
-    let api = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
+fn channel_label(c: UpdateChannel) -> &'static str {
+    match c {
+        UpdateChannel::YearMonth => "year.month (stable)",
+        UpdateChannel::Main => "main (rolling)",
+        UpdateChannel::Manual => "manual",
+    }
+}
+
+/// Resolve the newest release tag for a channel. year_month/manual take the
+/// highest STABLE CalVer release; main also considers prereleases (where
+/// main-branch/nightly builds land). Drafts are ignored.
+fn resolve_update_target(channel: UpdateChannel) -> Result<Option<String>> {
+    let api = format!("https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=50");
     let out = std::process::Command::new("curl")
         .args(["-fsSL", "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: revenant", &api])
         .output()
@@ -1301,16 +1443,61 @@ fn cmd_update(check: bool) -> Result<()> {
     if !out.status.success() {
         bail!("could not reach GitHub releases: {}", String::from_utf8_lossy(&out.stderr));
     }
-    let body = String::from_utf8_lossy(&out.stdout);
-    let tag = json_str(&body, "tag_name").context("no release tag in GitHub response")?;
-    let latest = tag.trim_start_matches('v');
-    println!("latest:  {tag}");
+    let rels: Vec<serde_json::Value> =
+        serde_json::from_slice(&out.stdout).context("parsing GitHub releases list")?;
+    Ok(select_update_target(&rels, channel))
+}
 
-    if latest == current {
-        println!("\n✅ already on the latest release.");
+/// Pick the newest eligible release tag from a GitHub releases payload.
+/// Drafts are always ignored; stable channels also skip prereleases, while
+/// `main` rides them (that's where per-commit rolling builds land). Highest
+/// CalVer wins — for `main` the monotonic commit-count patch orders the builds.
+fn select_update_target(rels: &[serde_json::Value], channel: UpdateChannel) -> Option<String> {
+    let mut best: Option<((u32, u32, u32), String)> = None;
+    for r in rels {
+        if r["draft"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let prerelease = r["prerelease"].as_bool().unwrap_or(false);
+        // Stable channels skip prereleases; main rides them.
+        if channel != UpdateChannel::Main && prerelease {
+            continue;
+        }
+        let tag = r["tag_name"].as_str().unwrap_or("");
+        if let Some(cv) = parse_calver(tag) {
+            if best.as_ref().is_none_or(|(b, _)| cv > *b) {
+                best = Some((cv, tag.to_string()));
+            }
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+fn cmd_update(check: bool) -> Result<()> {
+    let triple = update_triple().context("auto-update isn't supported on this platform yet")?;
+    let home = Home::resolve();
+    let channel = load_config(&home).map(|c| c.update.channel).unwrap_or_default();
+    // The installed release is recorded in ~/.revenant/release on each update;
+    // absent on a from-source build, in which case any release is an upgrade.
+    let release_marker = home.root().join("release");
+    let current_tag = std::fs::read_to_string(&release_marker)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let current_cv = current_tag.as_deref().and_then(parse_calver).unwrap_or((0, 0, 0));
+    println!("channel: {}  ({triple})", channel_label(channel));
+    println!("current: {}", current_tag.as_deref().unwrap_or("(built from source / no channel release yet)"));
+
+    let Some(tag) = resolve_update_target(channel)? else {
+        println!("\nno releases on the {} channel yet.", channel_label(channel));
+        return Ok(());
+    };
+    println!("latest:  {tag}");
+    if parse_calver(&tag).unwrap_or((0, 0, 0)) <= current_cv {
+        println!("\n✅ already on the latest {} release.", channel_label(channel));
         return Ok(());
     }
-    println!("\n⬆️  update available: v{current} → {tag}");
+    println!("\n⬆️  update available: {} → {tag}", current_tag.as_deref().unwrap_or("(source)"));
     if check {
         println!("run `revenant update` to install it.");
         return Ok(());
@@ -1374,6 +1561,8 @@ fn cmd_update(check: bool) -> Result<()> {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
+    // Record the installed release so the next `update` can compare CalVer.
+    let _ = std::fs::write(&release_marker, &tag);
     println!("\n✅ updated to {tag}. Restart to run it: `revenant up` (or restart the service).");
     println!("   previous binary kept at {}", bak.display());
     Ok(())
@@ -1419,4 +1608,71 @@ async fn cmd_approvals(action: Vec<String>) -> Result<()> {
         other => bail!("usage: revenant approvals [approve|deny <id>], got {other:?}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_calver, select_update_target};
+    use revenant_core::config::UpdateChannel;
+
+    // A GitHub /releases payload shaped like what the API returns: newest first,
+    // a stable release plus two rolling `-main.<sha>` prereleases and a draft.
+    fn sample_releases() -> Vec<serde_json::Value> {
+        serde_json::json!([
+            {"tag_name": "v2026.7.500-main.ffffff0", "prerelease": true, "draft": true},
+            {"tag_name": "v2026.7.412-main.bbbbbbb", "prerelease": true, "draft": false},
+            {"tag_name": "v2026.7.410-main.aaaaaaa", "prerelease": true, "draft": false},
+            {"tag_name": "v2026.7.0", "prerelease": false, "draft": false},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn main_channel_offers_newest_rolling_prerelease() {
+        // The task's E2E requirement: on the main channel, update resolution
+        // finds the latest rolling prerelease (not the stable release, not the draft).
+        let got = select_update_target(&sample_releases(), UpdateChannel::Main);
+        assert_eq!(got.as_deref(), Some("v2026.7.412-main.bbbbbbb"));
+    }
+
+    #[test]
+    fn stable_channels_ignore_rolling_prereleases() {
+        for chan in [UpdateChannel::YearMonth, UpdateChannel::Manual] {
+            let got = select_update_target(&sample_releases(), chan);
+            assert_eq!(got.as_deref(), Some("v2026.7.0"), "channel {chan:?} should skip prereleases");
+        }
+    }
+
+    #[test]
+    fn parses_stable_calver() {
+        assert_eq!(parse_calver("v2026.7.0"), Some((2026, 7, 0)));
+        assert_eq!(parse_calver("2026.7.3"), Some((2026, 7, 3)));
+        assert_eq!(parse_calver("v2026.7"), Some((2026, 7, 0))); // implicit patch 0
+    }
+
+    #[test]
+    fn parses_rolling_main_prerelease() {
+        // v<YEAR>.<MONTH>.<COUNT>-main.<shortsha> from the main-prerelease workflow.
+        assert_eq!(parse_calver("v2026.7.412-main.abc1234"), Some((2026, 7, 412)));
+        // Build metadata (`+`) is stripped too.
+        assert_eq!(parse_calver("v2026.7.0-main.deadbee+ci"), Some((2026, 7, 0)));
+    }
+
+    #[test]
+    fn rolling_builds_order_monotonically_within_a_month() {
+        // The whole point of the commit-count patch: two same-month rolling
+        // builds must compare as distinct so `update --check` sees the newer one.
+        let older = parse_calver("v2026.7.411-main.aaaaaaa").unwrap();
+        let newer = parse_calver("v2026.7.412-main.bbbbbbb").unwrap();
+        assert!(newer > older);
+    }
+
+    #[test]
+    fn rejects_non_calver_tags() {
+        assert_eq!(parse_calver("v0.1.0"), None); // year 0 out of range
+        assert_eq!(parse_calver("main"), None);
+        assert_eq!(parse_calver("v2026.13.0"), None); // month out of range
+    }
 }

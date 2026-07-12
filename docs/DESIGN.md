@@ -269,3 +269,110 @@ Concrete flows:
 Target the ARD v1.0 spec, not one vendor's API, so revenant federates with any
 compliant registry. Strategically: revenant becomes the personal-scale
 reference deployment of Solo's agentgateway + kagent + Agent Registry mesh.
+
+## Ascension: the unattended self-improvement loop
+
+Manual `revenant ascend` runs the rite once, by hand. The **unattended loop**
+runs it on a timer inside the daemon with no human in the loop up to the pull
+request — and *never* past it. One tick does up to three legs, each
+independently gated:
+
+1. **Actuate.** Observe the live eval scorecard → detect candidates → drive the
+   top one through an isolated git worktree (implement via a jailed `/code`
+   subagent → build/test/clippy proof → author-side reviewer, Gate 1) → open a
+   PR labeled `ascension` (Gate 1 pass only). Requires `ascension.repo_path`
+   (the daemon has no cwd); absent it, this leg is skipped.
+2. **Gatekeep.** Independent owner-side reviewer (Gate 2, `reviewer_tier`) over
+   every open `ascension` PR → comment the verdict → label
+   `ascension-approved` / `ascension-blocked`. Same code path as
+   `revenant pr-review`.
+3. **Publish.** Sign + push *landed* molts — PRs a human actually merged
+   (Gate 3) — to the Necropolis as `Improvement` artifacts. Only human-merged
+   changes teach the horde. Idempotent via `~/.revenant/ascension/published.json`.
+
+**The four gates, never fewer:** proof(0) → author reviewer(1) → owner
+gatekeeper(2) → **human merge(3)**, with branch protection as the backstop. The
+engine opens PRs; it cannot merge them. The wards (`denylist`:
+security/gateway/wasm/ascension/CI) are off-limits to autonomous change and are
+hard-rejected at both review gates.
+
+**Off by default, behind two switches.** `ascension.enabled` unlocks the manual
+command; `ascension.loop_enabled` is the *stronger* opt-in that lets the daemon
+run unattended. Config (`[ascension]`):
+
+```toml
+[ascension]
+enabled = true            # unlocks `revenant ascend`
+loop_enabled = true       # the unattended daemon loop (default false)
+interval_secs = 21600     # tick cadence (6h); floored at 300s
+repo_path = "/home/me/revenant"   # git checkout the actuator edits
+autonomy = "upstream"     # propose | staging | upstream (anything but propose opens a PR)
+reviewer_tier = "deep"    # Gate 1 + Gate 2 model tier
+max_prs_per_day = 3       # hard rate limit on machine-authored PRs
+gatekeep = true           # run the owner-side gatekeeper each tick
+pr_repo = "themsquared/revenant"
+
+[network]
+auto_publish = true       # publish landed molts to the Necropolis each tick
+```
+
+Manual triggers mirror the legs: `revenant ascend --run --live` (actuate),
+`revenant pr-review` (gatekeep), `revenant ascend --publish` (publish).
+
+## The self-improvement supply chain
+
+The Ascension loop is one stage of a longer pipeline that turns a single agent's
+proven wins into fleet-wide upgrades. End to end:
+
+```
+OBSERVE → BUILD → JUDGE(materiality) → PR(4 gates) → PROMOTE(CalVer) → CONSUME(channel)
+```
+
+**Observe — multi-axis fitness.** The eval scorecard scores four axes, each
+normalized 0–1 (higher better): **accuracy** (task pass rate), **capability**
+(breadth — fraction of tag categories with a pass), **speed** (from p50
+latency), **cost** (from mean tokens/task), plus a weighted **composite**
+(0.40·accuracy + 0.25·capability + 0.20·speed + 0.15·cost). accuracy+capability
+= *do more*; speed+cost = *faster / with less*. `detect()` targets the weakest
+axis and refuses candidates that regress any other. Exposed in
+`revenant eval`'s JSON + markdown (`Report::scorecard()`), so release notes and
+the materiality judge cite real deltas.
+
+**Judge — materiality (Gate 1.5).** A build/test/eval-proven change isn't
+automatically worth the horde's attention. Between the author reviewer and the
+PR, a judge (`materiality.rs`) rules on (1) **generalizable** — helps any
+revenant, not this owner's box (rejects hard-coded config, personal data,
+one-offs) — and (2) **material** — meaningfully moves a fitness axis. Only
+changes that pass both are auto-PR'd; owner-specific-but-proven changes are kept
+local. Fails **closed** to keep-local. Gated by `ascension.materiality`.
+
+**Promote — agent-cut CalVer releases.** Versions are calendar-based:
+`vYEAR.MONTH.PATCH` (`v2026.7.0`, `.1`…), a new patch within a month, a new
+month otherwise. When `release_min_molts` merged-but-unreleased molts have landed
+on `main`, the agent tags `main` and pushes — the existing `v*`-triggered CI
+builds + publishes the assets. Safe because everything in a release already
+cleared the four gates **and** a human merge. Idempotent via `released.json`.
+`revenant promote [--dry-run]`, or loop leg 4 under `ascension.auto_release`.
+
+**Consume — update channels (pinning).** Each box follows one stream, set by
+`[update].channel`:
+- `year_month` (**default**) — agent-promoted monthly CalVer releases. Stable,
+  curated; the novice default.
+- `main` — every merged core improvement as it lands (published as prereleases;
+  the power-user edge).
+- `manual` — never auto-update; `revenant update` on demand.
+
+`revenant update` resolves its target by channel (`parse_calver` +
+`resolve_update_target`), verifies the checksum, swaps atomically with a
+restorable backup, and records the installed tag in `~/.revenant/release`.
+
+**Locked defaults** (chosen with the operator): year.month default channel ·
+agent auto-cuts releases · materiality judge = generalizable + threshold. Config
+lives under `[ascension]` (`materiality`, `auto_release`, `release_min_molts`)
+and `[update]` (`channel`).
+
+**Still to wire (infra, non-blocking):** the `main` channel needs the CI to
+publish per-commit/main builds as prereleases; today only the `year_month` and
+`manual` paths have artifacts to pull. The four fitness axes are computed, but
+`detect()` still keys off failing-task / latency / token outliers rather than a
+direct composite-gradient search — a refinement, not a gap.

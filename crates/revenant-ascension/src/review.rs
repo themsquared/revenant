@@ -178,7 +178,7 @@ fn parse_verdict(reply: &str) -> ReviewVerdict {
 
 /// Minimal one-shot turn: create a session, send the prompt, return the final
 /// assistant text. Mirrors the eval runner's turn drive.
-async fn ask(client: &Client, prompt: &str, tier: &str) -> Result<String> {
+pub(crate) async fn ask(client: &Client, prompt: &str, tier: &str) -> Result<String> {
     let session_id = client.create_session("ascension:review").await?;
     let mut stream = client.events().await?;
     client.send_message(session_id, prompt, Some(tier)).await?;

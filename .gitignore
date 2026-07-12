@@ -14,3 +14,7 @@ dist/
 # Nested workspaces (e.g. wasm example plugins) have their own target dirs
 examples/**/target/
 **/target/
+.claude/settings.local.json
+
+# Stray root fly.toml from `fly launch` — real deploy config is deploy/necropolis/fly.toml
+/fly.toml

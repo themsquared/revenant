@@ -166,6 +166,7 @@ pub fn router(dir: SharedDir) -> Router {
         .route("/account/register", post(account_register))
         .route("/account/verify", post(account_verify))
         .route("/account/bind", post(account_bind))
+        .route("/account/agents", get(account_agents))
         // The catalog is public read — allow any origin so the static skills
         // marketplace (Netlify) can fetch it cross-origin. Authenticity is the
         // per-artifact signature, never the origin, so `*` is safe here.
@@ -173,15 +174,29 @@ pub fn router(dir: SharedDir) -> Router {
         .with_state(dir)
 }
 
-/// Add a permissive CORS header so browser clients (the marketplace) can read
-/// the directory cross-origin. GET/POST here carry no custom headers, so these
-/// are "simple" requests needing no preflight.
+/// Permissive CORS so browser clients (the marketplace catalog + the account
+/// onboarding page on Netlify) can talk to the directory cross-origin. The
+/// account page POSTs `application/json`, which is NOT a CORS-safelisted
+/// content type, so the browser sends a preflight `OPTIONS` first — we must
+/// answer it (with the allowed methods + headers) or the real request never
+/// fires. Authenticity is the per-artifact signature and the account key,
+/// never the origin, so `*` is safe here.
 async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
-    let mut resp = next.run(req).await;
-    resp.headers_mut().insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        axum::http::HeaderValue::from_static("*"),
-    );
+    use axum::http::{header, HeaderValue, Method};
+    use axum::response::IntoResponse;
+    let is_preflight = req.method() == Method::OPTIONS;
+    let mut resp = if is_preflight {
+        // Short-circuit the preflight with a 204 — don't fall through to the
+        // router (which has no OPTIONS route and would 405, failing the check).
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(req).await
+    };
+    let h = resp.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("content-type"));
+    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
     resp
 }
 
@@ -308,6 +323,20 @@ async fn account_bind(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     dir.lock().unwrap().accounts.bind(&req.account_key, &req.pubkey, &req.sig).map_err(bad)?;
     Ok(Json(serde_json::json!({ "ok": true, "bound": req.pubkey })))
+}
+
+#[derive(Deserialize)]
+struct AgentsQuery {
+    key: String,
+}
+
+/// List the agents bound to the account holding `key` (web dashboard).
+async fn account_agents(
+    State(dir): State<SharedDir>,
+    Query(q): Query<AgentsQuery>,
+) -> Json<serde_json::Value> {
+    let agents = dir.lock().unwrap().accounts.agents_for(&q.key);
+    Json(serde_json::json!({ "agents": agents }))
 }
 
 #[derive(Deserialize)]

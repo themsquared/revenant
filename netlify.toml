@@ -9,6 +9,12 @@
   to = "/marketplace.html"
   status = 200
 
+# Human account onboarding: register / verify / see your bound agents.
+[[redirects]]
+  from = "/account"
+  to = "/account.html"
+  status = 200
+
 [[headers]]
   for = "/*"
   [headers.values]

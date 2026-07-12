@@ -42,12 +42,15 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(UseSkill { skills: skills.clone() }),
         Arc::new(FindSkill { skills: skills.clone() }),
         Arc::new(ReadSkillFile { skills: skills.clone() }),
-        Arc::new(SkillWrite { skills }),
+        Arc::new(SkillWrite { skills: skills.clone() }),
         Arc::new(LoopCreate),
         Arc::new(LoopControl),
         Arc::new(LoopUpdate),
         Arc::new(WebSearch { http: web_client() }),
         Arc::new(WebFetch { http: web_client() }),
+        Arc::new(NetPublish { home: home.clone() }),
+        Arc::new(SkillBrowse { home: home.clone(), skills: skills.clone() }),
+        Arc::new(SkillAdopt { home: home.clone(), skills: skills.clone() }),
     ]
 }
 
@@ -1023,6 +1026,339 @@ impl Tool for WebFetch {
             body
         };
         ToolOutput::ok(truncate_result(format!("{url}\n\n{text}")))
+    }
+}
+
+/// Publish local skills/plugins to the revenant network (the Necropolis) in a
+/// SINGLE call — signs each artifact under this node's identity and pushes it.
+/// One tool turn, one approval, N artifacts: the fix for shelling out `revenant
+/// net publish` once per file (which fanned out across dozens of tool turns).
+/// Resolve the network directory URL: `REVENANT_NECROPOLIS` override, else the
+/// configured `network.necropolis_url` (only when the network is enabled).
+/// Shared by every network-facing tool.
+fn necropolis_url(home: &Home) -> Option<String> {
+    if let Ok(u) = std::env::var("REVENANT_NECROPOLIS") {
+        if !u.trim().is_empty() {
+            return Some(u);
+        }
+    }
+    let raw = std::fs::read_to_string(home.config_path()).ok()?;
+    let cfg = revenant_core::config::Config::from_toml(&raw).ok()?;
+    if !cfg.network.enabled {
+        return None;
+    }
+    cfg.network.necropolis_url
+}
+
+/// Filesystem-safe slug for an adopted artifact's install path.
+fn net_slug(title: &str) -> String {
+    let s: String = title
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    if s.is_empty() {
+        "artifact".to_string()
+    } else {
+        s
+    }
+}
+
+struct NetPublish {
+    home: Home,
+}
+
+impl NetPublish {
+    /// Collect (title, payload_bytes) for the requested kind, honoring an
+    /// optional name filter. Skills = `<skills_dir>/<name>/SKILL.md`; plugins =
+    /// `<plugins_dir>/*.wasm`.
+    fn collect(&self, kind: &str, names: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let want = |n: &str| names.is_empty() || names.iter().any(|x| x == n);
+        let mut out = Vec::new();
+        match kind {
+            "skill" => {
+                let dir = self.home.skills_dir();
+                let entries = std::fs::read_dir(&dir)
+                    .map_err(|e| format!("reading skills dir {}: {e}", dir.display()))?;
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let manifest = entry.path().join("SKILL.md");
+                    if manifest.is_file() && want(&name) {
+                        match std::fs::read(&manifest) {
+                            Ok(bytes) => out.push((name, bytes)),
+                            Err(e) => return Err(format!("reading {}: {e}", manifest.display())),
+                        }
+                    }
+                }
+            }
+            "plugin" => {
+                let dir = self.home.plugins_dir();
+                let entries = std::fs::read_dir(&dir)
+                    .map_err(|e| format!("reading plugins dir {}: {e}", dir.display()))?;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
+                        continue;
+                    }
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                    if want(&stem) {
+                        match std::fs::read(&path) {
+                            Ok(bytes) => out.push((stem, bytes)),
+                            Err(e) => return Err(format!("reading {}: {e}", path.display())),
+                        }
+                    }
+                }
+            }
+            other => return Err(format!("unknown kind '{other}' (expected 'skill' or 'plugin')")),
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for NetPublish {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "net_publish",
+            "Publish your local skills or plugins to the revenant network (the Necropolis) so other revenants can adopt them. Publishes ALL of the chosen kind in one call (or a subset via `names`) — do NOT call it once per item. Signs each artifact under your identity. The owner is asked to approve once for the whole batch; a denial is a normal outcome. Requires the network enabled and this node bound to a verified account.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["skill", "plugin"], "description": "What to publish (default: skill)."},
+                    "names": {"type": "array", "items": {"type": "string"}, "description": "Optional: only publish these skill/plugin names. Omit to publish all."}
+                }
+            })
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Publish
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("skill");
+        let names: Vec<String> = args
+            .get("names")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let Some(url) = necropolis_url(&self.home) else {
+            return ToolOutput::err(
+                "network publishing is unavailable — set [network].enabled = true and network.necropolis_url in config (or REVENANT_NECROPOLIS).",
+            );
+        };
+        let items = match self.collect(kind, &names) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
+        if items.is_empty() {
+            return ToolOutput::ok(format!("nothing to publish — no {kind}s matched."));
+        }
+        let id = match revenant_net::Identity::load_or_create(&self.home.identity_dir()) {
+            Ok(i) => i,
+            Err(e) => return ToolOutput::err(format!("loading identity: {e}")),
+        };
+        let art_kind = if kind == "plugin" {
+            revenant_net::ArtifactKind::Plugin
+        } else {
+            revenant_net::ArtifactKind::Skill
+        };
+        let client = revenant_net::NecropolisClient::new(&url);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let (mut ok, mut failed) = (0usize, 0usize);
+        let mut lines = Vec::new();
+        for (title, bytes) in items {
+            let artifact =
+                revenant_net::Artifact::create(&id, art_kind, title.clone(), "", &bytes, None, now);
+            match client.publish(&artifact).await {
+                Ok(aid) => {
+                    ok += 1;
+                    lines.push(format!("✅ {title} → {}", &aid[..12.min(aid.len())]));
+                }
+                Err(e) => {
+                    failed += 1;
+                    lines.push(format!("❌ {title} — {e}"));
+                }
+            }
+        }
+        let summary = format!(
+            "published {ok} {kind}(s){} to {url}\n{}",
+            if failed > 0 { format!(", {failed} failed") } else { String::new() },
+            lines.join("\n"),
+        );
+        // A total failure (e.g. 403: node not bound to a verified account) is an
+        // error result so the model surfaces it rather than claiming success.
+        if ok == 0 {
+            ToolOutput::err(summary)
+        } else {
+            ToolOutput::ok(summary)
+        }
+    }
+}
+
+/// Browse skills available to adopt from the network. Discovery is free (no
+/// approval): it only READS the public catalog. Marks the ones already
+/// installed so the agent doesn't re-adopt.
+struct SkillBrowse {
+    home: Home,
+    skills: Arc<SkillIndex>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SkillBrowse {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "skill_browse",
+            "List skills available to adopt from the revenant network (the marketplace). Optional `query` filters by title/description. Shows each skill's id, title, author, and whether you already have it. Use this when the owner asks what skills exist or wants to add a capability, then adopt one with skill_adopt.",
+            json!({"type":"object","properties":{
+                "query":{"type":"string","description":"optional filter matched against title"}
+            }})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let Some(url) = necropolis_url(&self.home) else {
+            return ToolOutput::err(
+                "the network isn't configured — set [network].enabled = true and network.necropolis_url in config.",
+            );
+        };
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+        let client = revenant_net::NecropolisClient::new(&url);
+        let items = match client.list(Some("skill")).await {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(format!("couldn't reach the network: {e}")),
+        };
+        let installed: std::collections::HashSet<String> =
+            self.skills.list().into_iter().map(|s| s.name).collect();
+        let mut lines = Vec::new();
+        for a in &items {
+            let title = a["title"].as_str().unwrap_or("");
+            if !query.is_empty() && !title.to_lowercase().contains(&query) {
+                continue;
+            }
+            let id = a["id"].as_str().unwrap_or("");
+            let author = a["author"].as_str().unwrap_or("");
+            let have = installed.contains(&net_slug(title));
+            lines.push(format!(
+                "- {}  \"{title}\"  by {}{}",
+                &id[..12.min(id.len())],
+                &author[..8.min(author.len())],
+                if have { "  [installed]" } else { "" },
+            ));
+        }
+        if lines.is_empty() {
+            return ToolOutput::ok(if query.is_empty() {
+                "no skills published to the network yet.".to_string()
+            } else {
+                format!("no skills on the network match \"{query}\".")
+            });
+        }
+        ToolOutput::ok(format!(
+            "{} skill(s) on the network — adopt one with skill_adopt <id or title>:\n{}",
+            lines.len(),
+            lines.join("\n")
+        ))
+    }
+}
+
+/// Adopt a skill from the network. Activation IS gated (Dangerous → the owner
+/// approves): it pulls the artifact, verifies the author's signature + content
+/// hash inside `pull`, installs the SKILL.md, and re-indexes so it's usable
+/// immediately. Refuses anything that fails verification.
+struct SkillAdopt {
+    home: Home,
+    skills: Arc<SkillIndex>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SkillAdopt {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "skill_adopt",
+            "Adopt a skill from the network by its id (from skill_browse) or its exact title. Pulls it, verifies the author's signature and content hash, installs it, and indexes it so you can use_skill it right away. The owner is asked to approve.",
+            json!({"type":"object","properties":{
+                "id":{"type":"string","description":"the skill's id, or its exact title"}
+            },"required":["id"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Dangerous
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let key = match arg_str(&args, "id") {
+            Ok(k) => k.trim().to_string(),
+            Err(e) => return e,
+        };
+        let Some(url) = necropolis_url(&self.home) else {
+            return ToolOutput::err("the network isn't configured (see config [network]).");
+        };
+        let client = revenant_net::NecropolisClient::new(&url);
+
+        // Resolve to a FULL artifact id. Only a complete 64-hex string is used
+        // directly; anything else (a title, or the SHORT id that skill_browse
+        // displays) is matched against the catalog by exact title or id prefix.
+        // This closes the trap where the browsed 12-char id can't be pulled.
+        let full = key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit());
+        let id = if full {
+            key.clone()
+        } else {
+            match client.list(Some("skill")).await {
+                Ok(items) => {
+                    let hit = items.iter().find(|a| {
+                        let title = a["title"].as_str().unwrap_or("");
+                        let aid = a["id"].as_str().unwrap_or("");
+                        title.eq_ignore_ascii_case(&key) || aid.starts_with(&key)
+                    });
+                    match hit {
+                        Some(a) => a["id"].as_str().unwrap_or("").to_string(),
+                        None => return ToolOutput::err(format!(
+                            "no skill matching \"{key}\" on the network (by title or id) — try skill_browse."
+                        )),
+                    }
+                }
+                Err(e) => return ToolOutput::err(format!("couldn't reach the network: {e}")),
+            }
+        };
+
+        // pull() verifies signature + content hash; a forgery is an error.
+        let artifact = match client.pull(&id).await {
+            Ok(a) => a,
+            Err(e) => return ToolOutput::err(format!("adopt refused: {e}")),
+        };
+        if artifact.kind != revenant_net::ArtifactKind::Skill {
+            return ToolOutput::err(format!(
+                "artifact {} is a {:?}, not a skill — use the right tool for it.",
+                &id[..12.min(id.len())],
+                artifact.kind
+            ));
+        }
+        let payload = match artifact.payload() {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::err(format!("bad payload: {e}")),
+        };
+        let slug = net_slug(&artifact.title);
+        let dir = self.home.skills_dir().join(&slug);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return ToolOutput::err(format!("couldn't create skill dir: {e}"));
+        }
+        if let Err(e) = std::fs::write(dir.join("SKILL.md"), &payload) {
+            return ToolOutput::err(format!("couldn't write skill: {e}"));
+        }
+        // Re-index so use_skill sees it now.
+        let _ = self.skills.scan();
+        // Best-effort: attest the adoption so the horde's reputation reflects it.
+        if let Ok(idk) = revenant_net::Identity::load_or_create(&self.home.identity_dir()) {
+            let _ = client.attest(&id, &idk.id(), true).await;
+        }
+        ToolOutput::ok(format!(
+            "adopted \"{}\" (signature verified) → installed as skill `{slug}`. use_skill {slug} to load it.",
+            artifact.title
+        ))
     }
 }
 

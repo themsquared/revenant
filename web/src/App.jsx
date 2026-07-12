@@ -1,13 +1,20 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api, eventStream, getToken, setToken } from './api.js'
 
-const TABS = ['chat', 'approvals', 'skills', 'tools', 'subagents', 'personalities', 'loops', 'spend', 'memory', 'settings']
+// Progressive disclosure: novices see a clean, small surface; power users
+// flip "Advanced" to reveal the deep tabs. The split is by who needs it, not
+// by how hard it is — everyday use (talk, approve, add skills, pick a voice)
+// stays visible; the machinery (tools, subagents, loops, spend, memory) hides
+// until asked for.
+const SIMPLE_TABS = ['chat', 'approvals', 'skills', 'personalities', 'settings']
+const ADVANCED_TABS = ['tools', 'subagents', 'loops', 'spend', 'memory']
 
 export default function App() {
   const [authed, setAuthed] = useState(false)
   const [tab, setTab] = useState('chat')
   const [pendingCount, setPendingCount] = useState(0)
   const [banner, setBanner] = useState(null)
+  const [advanced, setAdvanced] = useState(() => localStorage.getItem('rev_advanced') === '1')
 
   useEffect(() => {
     if (!getToken()) return
@@ -17,7 +24,24 @@ export default function App() {
       .catch(() => setAuthed(false))
   }, [])
 
+  // If the user hasn't chosen a surface yet, adopt the wizard's default
+  // (config.power_user). Once they flip the toggle, localStorage wins forever.
+  useEffect(() => {
+    if (!authed || localStorage.getItem('rev_advanced') !== null) return
+    api.config().then((c) => { if (c.power_user) setAdvanced(true) }).catch(() => {})
+  }, [authed])
+
+  const toggleAdvanced = () => {
+    const next = !advanced
+    setAdvanced(next)
+    localStorage.setItem('rev_advanced', next ? '1' : '0')
+    // If we're hiding the tab we're on, fall back to chat.
+    if (!next && ADVANCED_TABS.includes(tab)) setTab('chat')
+  }
+
   if (!authed) return <Login onAuthed={() => setAuthed(true)} />
+
+  const tabs = advanced ? [...SIMPLE_TABS, ...ADVANCED_TABS] : SIMPLE_TABS
 
   return (
     <div className="shell">
@@ -25,7 +49,7 @@ export default function App() {
         <img className="brand-logo" src="/logo.png" alt="" />
         <span className="brand">revenant</span>
         <nav>
-          {TABS.map((name) => (
+          {tabs.map((name) => (
             <button
               key={name}
               className={tab === name ? 'tab active' : 'tab'}
@@ -37,6 +61,13 @@ export default function App() {
               )}
             </button>
           ))}
+          <button
+            className={advanced ? 'tab adv-toggle on' : 'tab adv-toggle'}
+            onClick={toggleAdvanced}
+            title={advanced ? 'Hide advanced tabs' : 'Show advanced tabs (tools, subagents, loops, spend, memory)'}
+          >
+            {advanced ? '⚙ advanced ✓' : '⚙ advanced'}
+          </button>
         </nav>
       </header>
       {banner && (

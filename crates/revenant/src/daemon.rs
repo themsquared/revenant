@@ -331,6 +331,19 @@ pub async fn cmd_up() -> Result<()> {
         home.clone(),
     );
 
+    // Unattended Ascension loop: observe → actuate → gatekeep → publish, on a
+    // timer, never merging. Off unless ascension.loop_enabled. Spawned after
+    // build so the daemon is otherwise ready; its first tick waits 30s for the
+    // control plane + gateway to settle.
+    if crate::ascend_loop::AscendScheduler::new(home.clone(), cfg.clone()).start() {
+        tracing::info!(
+            "🜁 unattended Ascension loop ON — ticks every {}s (autonomy={}, repo={:?})",
+            cfg.ascension.interval_secs,
+            cfg.ascension.autonomy,
+            cfg.ascension.repo_path,
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(crate::DEFAULT_BIND)
         .await
         .with_context(|| format!("binding control plane on {}", crate::DEFAULT_BIND))?;

@@ -295,7 +295,18 @@ async fn session_create(
     State(state): State<AppState>,
     Json(body): Json<SessionCreate>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let peer = body.peer.unwrap_or_else(|| "local".to_string());
+    // No explicit peer → mint a UNIQUE one so each call starts a NEW
+    // conversation (POST = create). ensure_session upserts on
+    // (channel, peer, kind), so a fixed default would forever return the same
+    // session — which is exactly the "can't start a second chat" bug. An
+    // explicit peer still addresses a stable session (channel integrations).
+    let peer = body.peer.unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("web-{nanos:x}")
+    });
     let id = state
         .manager
         .runtime()
@@ -350,6 +361,15 @@ async fn message_send(
         Some(t) => t.parse::<Tier>().map_err(ApiError::bad_request)?,
         None => state.default_tier,
     };
+    // Reject unknown sessions up front — otherwise the turn 202-accepts and
+    // then dies on a FK constraint in the background, with no error to the
+    // client. Create a session with POST /v1/sessions first.
+    if !state.manager.runtime().store.session_exists(id).await? {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("no session {id} — create one with POST /v1/sessions"),
+        });
+    }
     state
         .manager
         .submit(id, SessionMsg::UserInput { content: body.text, tier })
@@ -633,6 +653,7 @@ async fn config_get(State(state): State<AppState>) -> Result<Json<serde_json::Va
         "default_tier": cfg.agent.default_tier,
         "embedder": format!("{:?}", cfg.memory.embedder).to_lowercase(),
         "keys_present": present.into_iter().collect::<Vec<_>>(),
+        "power_user": cfg.experience.power_user,
     })))
 }
 

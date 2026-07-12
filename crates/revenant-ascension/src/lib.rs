@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub mod config;
+pub mod materiality;
 pub mod offer;
 pub mod review;
 pub mod run;
@@ -361,6 +362,23 @@ impl Drop for Worktree {
     }
 }
 
+fn median_u128(v: &[u128]) -> u128 {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    s[s.len() / 2]
+}
+fn median_u64(v: &[u64]) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    s[s.len() / 2]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,19 +550,3 @@ mod tests {
     }
 }
 
-fn median_u128(v: &[u128]) -> u128 {
-    if v.is_empty() {
-        return 0;
-    }
-    let mut s = v.to_vec();
-    s.sort_unstable();
-    s[s.len() / 2]
-}
-fn median_u64(v: &[u64]) -> u64 {
-    if v.is_empty() {
-        return 0;
-    }
-    let mut s = v.to_vec();
-    s.sort_unstable();
-    s[s.len() / 2]
-}

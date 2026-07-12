@@ -9,6 +9,7 @@ revenant-core = { workspace = true }
 revenant-store = { workspace = true }
 revenant-skills = { workspace = true }
 revenant-memory = { workspace = true }
+revenant-net = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 inventory = { workspace = true }

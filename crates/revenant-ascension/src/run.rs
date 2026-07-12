@@ -23,6 +23,10 @@ pub struct RunConfig {
     pub max_repair: usize,
     /// false → offer is a dry-run (no push / no PR).
     pub live: bool,
+    /// Apply the materiality judge before offering: only auto-PR changes that
+    /// are generalizable + material for the horde. When false, any
+    /// reviewer-approved change is offered (owner-specific tweaks included).
+    pub materiality: bool,
 }
 
 #[derive(Debug)]
@@ -147,6 +151,34 @@ pub async fn run_candidate(
     let verdict = review::review(client, &cfg.reviewer_tier, &evidence, &diff, &cfg.denylist).await?;
     let approved = verdict.approved;
 
+    // Materiality gate (Gate 1.5): even a reviewer-approved change is only
+    // auto-PR'd if it's worth the HORDE's attention — generalizable + material.
+    // Owner-specific-but-proven changes are kept local (not offered). Only
+    // runs when the change would otherwise be offered.
+    if approved && cfg.materiality {
+        match crate::materiality::judge_materiality(client, &cfg.reviewer_tier, &evidence, &diff).await {
+            Ok(m) if !m.horde_worthy => {
+                notes.push(format!(
+                    "kept local (not horde-material): {} [axis={}]",
+                    m.reasons.first().map(String::as_str).unwrap_or("owner-specific or marginal"),
+                    m.axis,
+                ));
+                return Ok(RunOutcome {
+                    candidate,
+                    build_ok,
+                    test_ok,
+                    clippy_ok,
+                    changed_files,
+                    reviewer_approved: Some(approved),
+                    offer: Some("kept-local (not horde-material)".to_string()),
+                    notes,
+                });
+            }
+            Ok(m) => notes.push(format!("horde-material [axis={}] — offering", m.axis)),
+            Err(e) => notes.push(format!("materiality judge errored ({e:#}) — proceeding to offer")),
+        }
+    }
+
     // Offer: gated on the verdict; dry-run unless live.
     let offered = offer::offer(
         &wt,
@@ -212,17 +244,54 @@ path without changing behaviour.",
     }
 }
 
-/// Resolve the cargo binary. `cargo` is often NOT on the daemon/CLI PATH
-/// (rustup installs it at ~/.cargo/bin), so fall back to that explicitly —
-/// otherwise the prove step fails to spawn and looks like a compile failure.
+/// Resolve the cargo binary. `cargo` is often NOT on the daemon/CLI PATH.
+/// Two rustup layouts are common:
+///   - a shim at `~/.cargo/bin/cargo` (most installs), or
+///   - no shim at all, with the real binary living under
+///     `~/.rustup/toolchains/<host-triple>/bin/cargo` (seen on this box).
+///
+/// So we check both, plus `RUSTUP_HOME`/`CARGO_HOME` overrides, before
+/// falling back to bare `cargo` on PATH. Getting this wrong makes the prove
+/// step fail to spawn and look like a compile failure.
 fn cargo_bin() -> String {
-    if let Ok(c) = std::env::var("CARGO") {
+    let cargo_env = std::env::var("CARGO").ok();
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cargo")));
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".rustup")));
+    resolve_cargo_bin(cargo_env, cargo_home, rustup_home)
+}
+
+/// Pure resolution logic, factored out so it can be unit-tested without
+/// mutating process-global env vars (which races under parallel tests).
+/// Priority: `$CARGO` override > `<cargo_home>/bin/cargo` (the common rustup
+/// shim) > the first `<rustup_home>/toolchains/*/bin/cargo` found (the
+/// no-shim layout seen on some boxes) > bare `cargo` on PATH.
+fn resolve_cargo_bin(
+    cargo_env: Option<String>,
+    cargo_home: Option<std::path::PathBuf>,
+    rustup_home: Option<std::path::PathBuf>,
+) -> String {
+    if let Some(c) = cargo_env {
         return c;
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = std::path::Path::new(&home).join(".cargo/bin/cargo");
+    if let Some(home) = &cargo_home {
+        let p = home.join("bin/cargo");
         if p.exists() {
             return p.to_string_lossy().into_owned();
+        }
+    }
+    if let Some(home) = &rustup_home {
+        let toolchains = home.join("toolchains");
+        if let Ok(entries) = std::fs::read_dir(&toolchains) {
+            for entry in entries.flatten() {
+                let p = entry.path().join("bin/cargo");
+                if p.exists() {
+                    return p.to_string_lossy().into_owned();
+                }
+            }
         }
     }
     "cargo".to_string()
@@ -282,5 +351,55 @@ mod tests {
     fn tail_bounds_output() {
         assert_eq!(tail("abcdef", 3), "def");
         assert_eq!(tail("ab", 5), "ab");
+    }
+
+    #[test]
+    fn cargo_bin_prefers_env_override() {
+        let got = resolve_cargo_bin(
+            Some("/explicit/cargo".to_string()),
+            Some(std::path::PathBuf::from("/whatever")),
+            Some(std::path::PathBuf::from("/whatever")),
+        );
+        assert_eq!(got, "/explicit/cargo");
+    }
+
+    #[test]
+    fn cargo_bin_finds_cargo_home_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("cargo"), b"").unwrap();
+        let got = resolve_cargo_bin(None, Some(dir.path().to_path_buf()), None);
+        assert_eq!(got, bin_dir.join("cargo").to_string_lossy());
+    }
+
+    #[test]
+    fn cargo_bin_falls_back_to_rustup_toolchain_layout() {
+        // No ~/.cargo/bin/cargo shim (some installs only have this), but a real
+        // binary under ~/.rustup/toolchains/<triple>/bin/cargo — the layout
+        // that caused "cargo failed to spawn" until this fix.
+        let cargo_home = tempfile::tempdir().unwrap(); // exists but has no bin/cargo
+        let rustup_home = tempfile::tempdir().unwrap();
+        let toolchain_bin = rustup_home.path().join("toolchains/stable-aarch64-apple-darwin/bin");
+        std::fs::create_dir_all(&toolchain_bin).unwrap();
+        std::fs::write(toolchain_bin.join("cargo"), b"").unwrap();
+        let got = resolve_cargo_bin(
+            None,
+            Some(cargo_home.path().to_path_buf()),
+            Some(rustup_home.path().to_path_buf()),
+        );
+        assert_eq!(got, toolchain_bin.join("cargo").to_string_lossy());
+    }
+
+    #[test]
+    fn cargo_bin_falls_back_to_bare_cargo_when_nothing_found() {
+        let cargo_home = tempfile::tempdir().unwrap();
+        let rustup_home = tempfile::tempdir().unwrap();
+        let got = resolve_cargo_bin(
+            None,
+            Some(cargo_home.path().to_path_buf()),
+            Some(rustup_home.path().to_path_buf()),
+        );
+        assert_eq!(got, "cargo");
     }
 }

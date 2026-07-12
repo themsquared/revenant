@@ -18,12 +18,10 @@ fn model_available() -> Option<std::path::PathBuf> {
         std::env::var("REVENANT_TEST_MODEL_DIR").ok().map(std::path::PathBuf::from),
         dirs::home_dir().map(|h| h.join(".revenant/models")),
     ];
-    for candidate in candidates.into_iter().flatten() {
-        if candidate.join("potion-retrieval-32M/model.safetensors").exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.join("potion-retrieval-32M/model.safetensors").exists())
 }
 
 fn entity_note(uid: &str, kind: &str, title: &str, facts: &[&str], relations: &[(&str, &str)]) -> String {
@@ -63,7 +61,8 @@ async fn retrieval_accuracy_and_latency() {
 
     // ---- fixture vault: 10 themed entities + 15 synthetic = 25 ----
     let vault = dir.join("workspace/memory/entities");
-    let themed: Vec<(&str, &str, &str, Vec<&str>, Vec<(&str, &str)>)> = vec![
+    type ThemedEntity<'a> = (&'a str, &'a str, &'a str, Vec<&'a str>, Vec<(&'a str, &'a str)>);
+    let themed: Vec<ThemedEntity> = vec![
         ("e-owner", "person", "Alex Chen",
          vec!["Works at Nimbus Labs as a platform engineer",
               "Allergic to peanuts",

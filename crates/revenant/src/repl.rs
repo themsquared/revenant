@@ -142,7 +142,7 @@ pub async fn cmd_chat(tier_arg: Option<String>) -> Result<()> {
     });
 
     let my_session = backend.session_id();
-    println!("\x1b[1;35mrevenant\x1b[0m raised · tier {tier} — /quit · /tier <t> · /persona <name|off>");
+    println!("\x1b[1;35mrevenant\x1b[0m raised · tier {tier} — just type · /help for commands · /quit to leave");
 
     'repl: loop {
         print!("\x1b[1myou>\x1b[0m ");
@@ -157,6 +157,18 @@ pub async fn cmd_chat(tier_arg: Option<String>) -> Result<()> {
         }
         if line == "/quit" || line == "/exit" {
             break;
+        }
+        if line == "/help" || line == "/?" {
+            println!(
+                "Just talk to me — ask for anything and I'll use tools, memory, and skills as needed.\n\
+                 Commands:\n\
+                 \x20 /tier <fast|balanced|deep|local>  switch model tier for the next replies\n\
+                 \x20 /persona <name|off>               change my voice (try: revenant)\n\
+                 \x20 /quit                              leave\n\
+                 Power features (loops, subagents, the network, self-improvement) live in the web UI\n\
+                 (`revenant open`) and the advanced CLI commands (`revenant --help`)."
+            );
+            continue;
         }
         if let Some(t) = line.strip_prefix("/tier ") {
             match t.trim().parse::<Tier>() {

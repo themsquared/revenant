@@ -17,6 +17,12 @@ pub enum PermissionTier {
     /// Arbitrary execution or capability expansion. Always needs approval
     /// unless a standing session grant exists.
     Dangerous,
+    /// Publishing to the public revenant network under your identity — an
+    /// outward, effectively irreversible act (others can pull what you push).
+    /// Its own tier above Dangerous so it ALWAYS crosses the approval broker as
+    /// a distinct "publish to the horde" prompt, and a standing `exec` grant
+    /// never silently covers it. The gate is `>= Dangerous`, so this is caught.
+    Publish,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,5 +46,21 @@ impl ToolOutput {
     }
     pub fn err(content: impl Into<String>) -> Self {
         ToolOutput { content: content.into(), is_error: true }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PermissionTier::*;
+
+    /// The dispatcher gates approval on `>= Dangerous`. Publishing to the public
+    /// network must ALWAYS prompt, so it has to sit at or above that line —
+    /// while ordinary outbound Network stays below it (auto-allowed, e.g. web
+    /// fetch). This encodes the security contract behind the `Publish` tier.
+    #[test]
+    fn publish_always_crosses_the_approval_gate() {
+        assert!(Publish >= Dangerous, "publish must route through approval");
+        assert!(Network < Dangerous, "plain network stays auto-allowed");
+        assert!(ReadOnly < WriteWorkspace && WriteWorkspace < Network);
     }
 }

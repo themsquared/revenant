@@ -80,7 +80,7 @@ async fn apply_extraction_end_to_end() {
     // Round 2: duplicate (skipped) + supersession of the Denver fact.
     let denver_uid = {
         let memories = engine.recall("where does Dana live", 5).await.unwrap();
-        let m = memories.iter().find(|m| m.text.contains("Denver")).expect("denver fact retrievable");
+        let _m = memories.iter().find(|m| m.text.contains("Denver")).expect("denver fact retrievable");
         // Extract uid from the note file for the supersedes reference.
         let line = note.lines().find(|l| l.contains("Denver")).unwrap();
         line.split("f:").nth(1).unwrap().split_whitespace().next().unwrap().to_string()

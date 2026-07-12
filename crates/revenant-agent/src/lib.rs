@@ -38,7 +38,11 @@ Rules:\n\
 - Call tools directly when a task needs them — never ask permission in prose. Dangerous tools \
 (like exec) automatically prompt the owner for approval when you call them; a denial is an \
 answer, not an obstacle to work around.\n\
-- Consult the skills index and `use_skill` when a task matches an installed skill.\n\
+- Consult the skills index and `use_skill` when a task matches an installed skill. If none fits and \
+the owner wants a capability, `skill_browse` the network and offer to `skill_adopt` a good match \
+before building one from scratch.\n\
+- To share skills or plugins with the network, use `net_publish` — it publishes the whole set in \
+ONE call and asks for approval once. Never loop `exec revenant net publish` per file.\n\
 - When you notice a standing, recurring need (a watch, a periodic check, a digest), propose a loop \
 with `loop_create` rather than waiting to be asked; keep intervals sane and let it be approved.\n\
 - When a task fits a specialist agent on the mesh (its roster is in the `call_agent` tool), delegate \
@@ -185,6 +189,16 @@ impl AgentRuntime {
         self.run_turn_inner(session_id, tier, user_content, 0, None).await
     }
 
+    /// How many recent messages to pull for the context window. Must be large
+    /// enough to always contain the CURRENT turn's anchoring user message —
+    /// otherwise a long tool-using turn (up to ~2 messages per iteration) fills
+    /// the window with tool plumbing, the user anchor is truncated out, and
+    /// sanitize_history strips everything into an empty (400) request. So the
+    /// floor scales with the iteration budget, regardless of max_history.
+    fn history_limit(&self) -> usize {
+        self.max_history.max(self.max_iterations as usize * 2 + 8)
+    }
+
     /// A shallow clone with a different toolset — runs a turn against a
     /// sandboxed (e.g. worktree-jailed) registry without disturbing the live
     /// runtime. Learning is off and the iteration budget is raised for coding.
@@ -204,7 +218,9 @@ impl AgentRuntime {
             memory: None,
             max_history: self.max_history,
             max_tokens: self.max_tokens,
-            max_iterations: self.max_iterations.max(40),
+            // Coding turns fan out over many files — always give them headroom
+            // over the conversational budget, never less.
+            max_iterations: self.max_iterations.max(60),
             learn: false,
             learn_min_tools: self.learn_min_tools,
             learn_budget: self.learn_budget.clone(),
@@ -364,7 +380,7 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         let mut tools_used: Vec<String> = Vec::new();
 
         for iteration in 1..=self.max_iterations {
-            let history = self.store.history(session_id, self.max_history).await?;
+            let history = self.store.history(session_id, self.history_limit()).await?;
             let messages: Vec<WireMessage> = history
                 .into_iter()
                 .filter(|m| !m.content.is_empty())
@@ -375,6 +391,13 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             // tool_result AND a dangling tool_use left by a turn that died
             // before persisting its tool_result. Either one is a hard 400.
             let mut messages = sanitize_history(messages);
+            // Never send an empty messages array (a hard "at least one message
+            // is required" 400). If the window truncated mid-tool-exchange and
+            // sanitize stripped everything, re-anchor on THIS turn's user
+            // message — it's always a valid, non-empty starting point.
+            if messages.is_empty() {
+                messages = vec![WireMessage::new(Role::User, user_content.clone())];
+            }
             // Moving breakpoint on the newest message: each iteration/turn
             // extends the prefix, so the provider re-reads history from
             // cache. Applied at request build only — never persisted.
@@ -541,9 +564,107 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
                 .await?;
         }
 
-        let err = format!("turn exceeded {} tool iterations — aborted", self.max_iterations);
-        self.events.emit(Event::TurnFailed { session_id, error: err.clone() });
-        bail!(err);
+        // Budget exhausted. DON'T go silent: the loop ended on a tool_result
+        // (a user message), so the window is structurally valid for a final
+        // text reply. Make one tool-free call so the user gets a coherent
+        // answer — what got done, any results, what's left — instead of an
+        // aborted turn. Failing this fallback is the only case we bail.
+        tracing::warn!(
+            "session {session_id} hit the {}-iteration tool budget; forcing a final answer",
+            self.max_iterations
+        );
+        let history = self.store.history(session_id, self.history_limit()).await?;
+        let messages: Vec<WireMessage> = history
+            .into_iter()
+            .filter(|m| !m.content.is_empty())
+            .map(|m| WireMessage::new(m.role, m.content))
+            .collect();
+        let mut messages = sanitize_history(messages);
+        if messages.is_empty() {
+            messages = vec![WireMessage::new(Role::User, user_content.clone())];
+        }
+        let finalize_system = revenant_llm::system_with_cache(
+            &stable_system,
+            Some(&format!(
+                "[SYSTEM] You have reached this turn's tool-use budget ({} steps). Do NOT \
+                 request any more tools — none are available on this reply. Using only what \
+                 you have already gathered, give the user your best final answer now: what you \
+                 accomplished, any concrete results, and clearly flag anything left unfinished \
+                 so they can ask you to continue.",
+                self.max_iterations
+            )),
+        );
+        let request = MessagesRequest {
+            model: tier.as_str().to_string(),
+            max_tokens: self.max_tokens,
+            system: Some(finalize_system),
+            messages,
+            tools: Vec::new(), // no tools → the model must answer in text
+            tool_choice: None,
+            stream: true,
+        };
+        let events = self.events.clone();
+        let outcome = self
+            .llm
+            .stream_message(&request, |delta| {
+                events.emit(Event::TurnDelta { session_id, text: delta.to_string() });
+            })
+            .await
+            .map_err(|err| {
+                let e = format!("turn exceeded {} tool iterations and the wrap-up reply also failed: {err:#}", self.max_iterations);
+                self.events.emit(Event::TurnFailed { session_id, error: e.clone() });
+                anyhow::anyhow!(e)
+            })?;
+        total_usage.merge(&outcome.usage);
+        routed_model = outcome.routed_model.clone().or(routed_model);
+        final_text = if outcome.text.is_empty() {
+            format!(
+                "I reached this turn's {}-step tool budget before finishing. Ask me to continue and I'll pick up where I left off.",
+                self.max_iterations
+            )
+        } else {
+            outcome.text.clone()
+        };
+        let assistant_content = vec![ContentBlock::text(final_text.clone())];
+        let last_id = self
+            .store
+            .append_message(session_id, Role::Assistant, &assistant_content, estimate(&assistant_content))
+            .await?;
+        self.store
+            .record_spend(session_id, tier.as_str(), outcome.routed_model.as_deref(), outcome.usage)
+            .await?;
+        if let Some(memory) = &self.memory {
+            memory.observe(revenant_memory::Episode {
+                session_id,
+                user_message_id,
+                assistant_message_id: last_id,
+                user_text: user_text.clone(),
+                assistant_text: final_text.clone(),
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            });
+        }
+        if !active_hooks.is_empty() {
+            let hcx = HookCx { session_id, user_text: user_text.clone() };
+            for hook in &active_hooks {
+                hook.post_turn(&hcx, &final_text).await;
+            }
+        }
+        self.events.emit(Event::TurnCompleted {
+            session_id,
+            text: final_text.clone(),
+            input_tokens: total_usage.input_tokens,
+            output_tokens: total_usage.output_tokens,
+            routed_model: routed_model.clone(),
+        });
+        Ok(TurnStats {
+            usage: total_usage,
+            routed_model,
+            iterations: self.max_iterations,
+            final_text,
+        })
     }
 
     async fn dispatch(
@@ -1373,5 +1494,22 @@ mod history_tests {
         let out = sanitize_history(msgs);
         assert_eq!(out.len(), 3);
         assert!(well_formed(&out));
+    }
+
+    // The bug behind the "at least one message is required" 400: when the
+    // history window begins mid-tool-exchange (a turn longer than the window,
+    // so the anchoring user message was truncated off), sanitize legitimately
+    // strips EVERYTHING. The turn loop must detect this empty result and
+    // re-anchor rather than send it. This test pins the trigger so the loop's
+    // guard stays load-bearing.
+    #[test]
+    fn all_tool_plumbing_window_sanitizes_to_empty() {
+        let msgs = vec![
+            WireMessage::new(Role::User, vec![tres("A")]),   // anchor user-text is gone
+            WireMessage::new(Role::Assistant, vec![tuse("B")]),
+            WireMessage::new(Role::User, vec![tres("B")]),
+        ];
+        let out = sanitize_history(msgs);
+        assert!(out.is_empty(), "expected empty (all plumbing), got {out:?}");
     }
 }

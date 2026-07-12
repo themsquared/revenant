@@ -142,6 +142,22 @@ impl Accounts {
         Ok(())
     }
 
+    /// The agent pubkeys bound to the account holding `account_key` (for the
+    /// web dashboard: "your agents"). Empty if the key is unknown.
+    pub fn agents_for(&self, account_key: &str) -> Vec<String> {
+        let c = self.conn.lock().unwrap();
+        let Some((id, _)) = self.account_id_for_key(&c, account_key) else {
+            return vec![];
+        };
+        let mut stmt = match c.prepare("SELECT pubkey FROM agent_bindings WHERE account_id = ?1") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([id], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
     /// May this agent publish? True iff its pubkey is bound to a verified account.
     pub fn is_authorized(&self, pubkey: &str) -> bool {
         let c = self.conn.lock().unwrap();

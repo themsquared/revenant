@@ -487,10 +487,26 @@ impl OutboundMirror {
                     if let Some(state) = streams.remove(&session_id) {
                         let final_text =
                             if text.is_empty() { state.buffer.clone() } else { text.clone() };
-                        let _ = self
-                            .client
-                            .edit_message(state.chat_id, state.message_id, &clip(&final_text, 4000))
-                            .await;
+                        if final_text.is_empty() {
+                            // Neither the final text nor any streamed deltas had
+                            // content — editing to an empty string is rejected
+                            // by the Telegram API (400 "message text is empty").
+                            // Leave a terse placeholder instead of a silent
+                            // failed edit call.
+                            let _ = self
+                                .client
+                                .edit_message(state.chat_id, state.message_id, "(no response)")
+                                .await;
+                        } else {
+                            let _ = self
+                                .client
+                                .edit_message(
+                                    state.chat_id,
+                                    state.message_id,
+                                    &clip(&final_text, 4000),
+                                )
+                                .await;
+                        }
                     } else if let Some(chat_id) =
                         self.chat_for(&runtime, &mut chats, session_id).await
                     {

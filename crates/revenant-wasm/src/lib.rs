@@ -162,6 +162,7 @@ fn parse_permission(s: &str) -> PermissionTier {
         "write_workspace" => PermissionTier::WriteWorkspace,
         "network" => PermissionTier::Network,
         "dangerous" => PermissionTier::Dangerous,
+        "publish" => PermissionTier::Publish,
         _ => PermissionTier::ReadOnly,
     }
 }

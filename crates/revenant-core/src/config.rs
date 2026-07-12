@@ -24,6 +24,12 @@ pub struct Config {
     /// The revenant-only network (the horde): Necropolis directory + P2P.
     #[serde(default)]
     pub network: NetworkConfig,
+    /// How much surface to expose (progressive disclosure across UI + CLI).
+    #[serde(default)]
+    pub experience: ExperienceConfig,
+    /// Update channel: year_month (stable CalVer) | main (rolling) | manual.
+    #[serde(default)]
+    pub update: UpdateConfig,
     /// MCP servers multiplexed behind the gateway (the plugin bus).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServer>,
@@ -32,6 +38,38 @@ pub struct Config {
     pub a2a_agents: Vec<A2aAgent>,
     /// Tier name ("fast"/"balanced"/"deep"/"local") -> targets.
     pub tiers: BTreeMap<String, TierConfig>,
+}
+
+/// Progressive disclosure. `power_user` seeds the default surface: the web UI
+/// starts with advanced tabs revealed, and future CLI/first-run flows lead with
+/// the deeper features. Novices (false) get the clean surface; the web toggle
+/// still overrides per-browser. Set by the setup wizard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExperienceConfig {
+    #[serde(default)]
+    pub power_user: bool,
+}
+
+/// Which stream of the self-improvement supply chain this box follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    /// Agent-promoted monthly CalVer releases (2026.7.x). Stable, curated —
+    /// the default for a fresh install.
+    #[default]
+    YearMonth,
+    /// Every merged core improvement as soon as it lands on `main`. Freshest,
+    /// most churn — the power-user edge.
+    Main,
+    /// Never auto-update; the owner runs `revenant update` deliberately.
+    Manual,
+}
+
+/// How this box takes updates from the horde's improvement stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    #[serde(default)]
+    pub channel: UpdateChannel,
 }
 
 /// An MCP server the gateway spawns/proxies. `cmd` = stdio server (spawned by
@@ -181,6 +219,42 @@ pub struct AscensionConfig {
     /// Path prefixes the self-improver may never modify (the wards).
     #[serde(default = "default_ascension_denylist")]
     pub denylist: Vec<String>,
+    /// UNATTENDED loop switch — a stronger opt-in than `enabled` (which only
+    /// unlocks manual `revenant ascend`). When true, the daemon runs the whole
+    /// rite on a timer with no human in the loop up to the PR. Still cannot
+    /// merge: the four gates and branch protection hold. Off by default.
+    #[serde(default)]
+    pub loop_enabled: bool,
+    /// How often the unattended loop ticks (observe → actuate → gatekeep →
+    /// publish). Default 6h.
+    #[serde(default = "default_ascension_interval")]
+    pub interval_secs: u64,
+    /// The git checkout the unattended actuator edits. Required for the
+    /// actuator leg to run in the daemon (which has no meaningful cwd); if
+    /// unset, the loop still gatekeeps + publishes but raises no new PRs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
+    /// Run the owner-side gatekeeper over open machine-authored PRs each tick.
+    #[serde(default = "default_true")]
+    pub gatekeep: bool,
+    /// The GitHub repo (`owner/name`) PRs are opened in, gatekept, and whose
+    /// landed molts get published.
+    #[serde(default = "default_pr_repo")]
+    pub pr_repo: String,
+    /// Materiality gate: only auto-PR changes a judge rates generalizable +
+    /// material for the horde (do more / faster / with less). Owner-specific
+    /// but proven changes are kept local. On by default.
+    #[serde(default = "default_true")]
+    pub materiality: bool,
+    /// Let the agent auto-cut CalVer releases (tag main → CI builds + publishes)
+    /// once enough landed molts have accumulated. Safe: everything in a release
+    /// already cleared the 4 gates + human merge. Only fires under loop_enabled.
+    #[serde(default = "default_true")]
+    pub auto_release: bool,
+    /// How many merged-but-unreleased molts must accumulate before the agent
+    /// cuts the next release.
+    #[serde(default = "default_release_min_molts")]
+    pub release_min_molts: u32,
 }
 
 impl Default for AscensionConfig {
@@ -195,8 +269,27 @@ impl Default for AscensionConfig {
             proof_runs: default_proof_runs(),
             min_gain_pct: default_min_gain(),
             denylist: default_ascension_denylist(),
+            loop_enabled: false,
+            interval_secs: default_ascension_interval(),
+            repo_path: None,
+            gatekeep: true,
+            pr_repo: default_pr_repo(),
+            materiality: true,
+            auto_release: true,
+            release_min_molts: default_release_min_molts(),
         }
     }
+}
+
+fn default_release_min_molts() -> u32 {
+    3
+}
+
+fn default_ascension_interval() -> u64 {
+    21_600 // 6h
+}
+fn default_pr_repo() -> String {
+    "themsquared/revenant".to_string()
 }
 
 fn default_autonomy() -> String {
@@ -535,7 +628,12 @@ fn default_max_tokens() -> u32 {
     8192
 }
 fn default_max_iterations() -> u32 {
-    25
+    // Tool steps a single turn may take before the harness forces a wrap-up.
+    // Real multi-step work (research, coding, plan execution) routinely needs
+    // more than a couple dozen; too low and capable turns get cut off. On
+    // exhaustion the agent still answers (a tool-free finalize call), so this
+    // is a budget, not a cliff.
+    40
 }
 
 impl Config {
@@ -600,6 +698,8 @@ impl Config {
             spending: SpendingConfig::default(),
             ascension: AscensionConfig::default(),
             network: NetworkConfig::default(),
+            experience: ExperienceConfig::default(),
+            update: UpdateConfig::default(),
             mcp: Vec::new(),
             a2a_agents: Vec::new(),
             tiers,

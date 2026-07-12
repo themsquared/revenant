@@ -1,0 +1,18 @@
+# flyctl launch added from .gitignore
+target
+**/**/*.rs.bk
+**/.DS_Store
+**/web/node_modules
+
+# Never commit secrets — keys live in ~/.revenant/secrets.env (0600)
+**/secrets.env
+**/*.env
+!**/*.example.env
+
+# release artifacts
+**/dist
+
+# Nested workspaces (e.g. wasm example plugins) have their own target dirs
+**/examples/**/target
+**/**/target
+fly.toml

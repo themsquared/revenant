@@ -369,6 +369,19 @@ impl Store {
 
     // ---- session personality ----
 
+    /// True if a session row exists. Used to reject messages to unknown
+    /// sessions up front (else the append fails a FK constraint mid-turn,
+    /// after the client already got a 202).
+    pub async fn session_exists(&self, session_id: i64) -> Result<bool> {
+        self.with(move |conn| {
+            use rusqlite::OptionalExtension;
+            conn.query_row("SELECT 1 FROM sessions WHERE id = ?1", [session_id], |_| Ok(()))
+                .optional()
+                .map(|opt| opt.is_some())
+        })
+        .await
+    }
+
     pub async fn session_get_persona(&self, session_id: i64) -> Result<Option<String>> {
         self.with(move |conn| {
             use rusqlite::OptionalExtension;

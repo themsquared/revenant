@@ -283,7 +283,79 @@ pub async fn run_suite(client: &Client, suite: &Suite) -> Result<Report> {
     Ok(Report { outcomes })
 }
 
+/// The four fitness axes, each normalized to 0..1 (higher is better), plus a
+/// weighted composite. This is the machine-readable expression of "do more,
+/// faster, with less": accuracy + capability = *do more*; speed + cost =
+/// *faster / with less*. The normalizations are heuristic and monotonic —
+/// meant for RELATIVE comparison (before vs after a change, run over run), not
+/// as absolute grades. Self-improvement aims at the weakest axis; release notes
+/// and the materiality judge cite the deltas.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Scorecard {
+    pub accuracy: f64,
+    pub speed: f64,
+    pub cost: f64,
+    pub capability: f64,
+    pub composite: f64,
+}
+
+impl Scorecard {
+    /// The single weakest axis by score — what self-improvement should target.
+    pub fn weakest_axis(&self) -> &'static str {
+        let axes = [
+            ("accuracy", self.accuracy),
+            ("capability", self.capability),
+            ("speed", self.speed),
+            ("cost", self.cost),
+        ];
+        axes.iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|(n, _)| *n).unwrap_or("accuracy")
+    }
+}
+
 impl Report {
+    /// Compute the fitness scorecard. Empty reports score 0 across the board.
+    pub fn scorecard(&self) -> Scorecard {
+        let n = self.outcomes.len();
+        if n == 0 {
+            return Scorecard { accuracy: 0.0, speed: 0.0, cost: 0.0, capability: 0.0, composite: 0.0 };
+        }
+        // accuracy: fraction of graded tasks that passed.
+        let accuracy = self.passed() as f64 / n as f64;
+
+        // speed: monotonic in p50 latency (seconds). 1s→0.5, 3s→0.25, 0→1.
+        let lat = self.latencies();
+        let p50_s = Self::pctl(&lat, 50.0) as f64 / 1000.0;
+        let speed = 1.0 / (1.0 + p50_s);
+
+        // cost: monotonic in mean tokens/task (per 1k). 1k→0.5, 3k→0.25.
+        let mean_tok = self.total_tokens() as f64 / n as f64;
+        let cost = 1.0 / (1.0 + mean_tok / 1000.0);
+
+        // capability: breadth — fraction of distinct tags with ≥1 passing task
+        // (does it work ACROSS categories, not just on a few). Untagged suites
+        // fall back to accuracy.
+        let mut all_tags = std::collections::BTreeSet::new();
+        let mut passed_tags = std::collections::BTreeSet::new();
+        for o in &self.outcomes {
+            for t in &o.tags {
+                all_tags.insert(t.clone());
+                if o.passed {
+                    passed_tags.insert(t.clone());
+                }
+            }
+        }
+        let capability = if all_tags.is_empty() {
+            accuracy
+        } else {
+            passed_tags.len() as f64 / all_tags.len() as f64
+        };
+
+        // Composite: "do more" (accuracy+capability) weighted above "faster/less"
+        // (speed+cost). Correctness leads; efficiency refines.
+        let composite = 0.40 * accuracy + 0.25 * capability + 0.20 * speed + 0.15 * cost;
+        Scorecard { accuracy, speed, cost, capability, composite }
+    }
+
     fn latencies(&self) -> Vec<u128> {
         let mut v: Vec<u128> = self.outcomes.iter().map(|o| o.result.latency_ms).collect();
         v.sort_unstable();
@@ -311,10 +383,19 @@ impl Report {
     pub fn json(&self) -> serde_json::Value {
         let lat = self.latencies();
         let n = self.outcomes.len().max(1);
+        let sc = self.scorecard();
         serde_json::json!({
             "tasks": self.outcomes.len(),
             "passed": self.passed(),
             "pass_rate": self.passed() as f64 / n as f64,
+            "fitness": {
+                "accuracy": sc.accuracy,
+                "speed": sc.speed,
+                "cost": sc.cost,
+                "capability": sc.capability,
+                "composite": sc.composite,
+                "weakest_axis": sc.weakest_axis(),
+            },
             "latency_ms": {
                 "p50": Self::pctl(&lat, 50.0),
                 "p95": Self::pctl(&lat, 95.0),
@@ -363,6 +444,11 @@ impl Report {
             self.total_tokens(),
             self.total_tokens() / n as u64,
         ));
+        let sc = self.scorecard();
+        out.push_str(&format!(
+            "\n**fitness** (0–1, higher better) · accuracy {:.2} · capability {:.2} · speed {:.2} · cost {:.2} → **composite {:.2}** · weakest: _{}_\n",
+            sc.accuracy, sc.capability, sc.speed, sc.cost, sc.composite, sc.weakest_axis(),
+        ));
         out
     }
 }
@@ -381,6 +467,39 @@ mod tests {
             model: Some("fast".into()),
             failed: None,
         }
+    }
+
+    fn outcome(id: &str, tags: &[&str], passed: bool) -> TaskOutcome {
+        TaskOutcome {
+            id: id.into(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            passed,
+            reason: if passed { "ok".into() } else { "fail".into() },
+            result: res("x", &[]),
+        }
+    }
+
+    #[test]
+    fn scorecard_axes_and_weakest() {
+        // All pass, one tag → accuracy & capability perfect; weakest is a
+        // perf axis. A failing task must drop accuracy below capability.
+        let perfect = Report { outcomes: vec![outcome("a", &["mem"], true), outcome("b", &["mem"], true)] };
+        let sc = perfect.scorecard();
+        assert!((sc.accuracy - 1.0).abs() < 1e-9);
+        assert!((sc.capability - 1.0).abs() < 1e-9);
+        assert!(sc.composite > 0.0 && sc.composite <= 1.0);
+
+        let mixed = Report {
+            outcomes: vec![outcome("a", &["mem"], true), outcome("b", &["speed"], false)],
+        };
+        let m = mixed.scorecard();
+        assert!(m.accuracy < 1.0, "a failing task must lower accuracy");
+        // One of two tags still has a pass → capability 0.5.
+        assert!((m.capability - 0.5).abs() < 1e-9);
+
+        // Empty report is all-zero, no panic.
+        let empty = Report { outcomes: vec![] };
+        assert_eq!(empty.scorecard().composite, 0.0);
     }
 
     #[test]
