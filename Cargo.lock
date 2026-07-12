@@ -2692,6 +2692,7 @@ dependencies = [
  "revenant-net",
  "revenant-skills",
  "revenant-store",
+ "rusqlite",
  "serde_json",
  "tokio",
  "tracing",

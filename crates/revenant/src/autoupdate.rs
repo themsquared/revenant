@@ -30,11 +30,10 @@ pub fn spawn(home: Home, cfg: Config, events: EventBus) {
     tokio::spawn(async move {
         // Don't slow startup; let the daemon settle first.
         tokio::time::sleep(Duration::from_secs(30)).await;
-        let mut last_acted: Option<String> = None;
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
-            if let Err(err) = check_once(&home, triple, &cfg, &events, &mut last_acted).await {
+            if let Err(err) = check_once(&home, triple, &cfg, &events).await {
                 tracing::warn!("auto-update check failed (will retry): {err:#}");
             }
         }
@@ -46,7 +45,6 @@ async fn check_once(
     triple: &'static str,
     cfg: &Config,
     events: &EventBus,
-    last_acted: &mut Option<String>,
 ) -> anyhow::Result<()> {
     let channel = cfg.update.channel;
     // resolve_update_target shells out to curl (blocking) — keep it off the
@@ -58,26 +56,32 @@ async fn check_once(
         return Ok(()); // no release on this channel yet
     };
 
+    let marker = home.root().join("update-available");
     let current = crate::installed_release_tag(home);
     let current_cv = current.as_deref().and_then(crate::parse_calver).unwrap_or((0, 0, 0));
     if crate::parse_calver(&latest).unwrap_or((0, 0, 0)) <= current_cv {
-        return Ok(()); // already current
-    }
-    // Only act once per newly-seen version (don't re-notify every tick).
-    if last_acted.as_deref() == Some(latest.as_str()) {
+        // Caught up (updated). Clear a stale banner so `status` stops nagging.
+        let _ = std::fs::remove_file(&marker);
         return Ok(());
     }
-    *last_acted = Some(latest.clone());
     let channel_str = crate::channel_label(channel).to_string();
 
     match cfg.update.auto {
         AutoUpdate::Notify => {
+            // Tell the owner ONCE per version, then never again — dedup on the
+            // on-disk marker so it survives daemon restarts (the in-memory guard
+            // reset on every restart, which made this feel spammy). The marker
+            // also drives the `revenant status` banner (persists until updated).
+            let already =
+                std::fs::read_to_string(&marker).ok().map(|s| s.trim().to_string());
+            if already.as_deref() == Some(latest.as_str()) {
+                return Ok(()); // already announced this version
+            }
+            let _ = std::fs::write(&marker, &latest);
             tracing::warn!(
                 "update available: {} → {latest} ({channel_str})",
                 current.as_deref().unwrap_or("source")
             );
-            // A marker `revenant status` reads to surface the banner locally.
-            let _ = std::fs::write(home.root().join("update-available"), &latest);
             events.emit(Event::UpdateAvailable { current, latest, channel: channel_str });
         }
         AutoUpdate::Install => {
@@ -100,8 +104,6 @@ async fn check_once(
                     events.emit(Event::UpdateInstalled { tag: latest, restarting: false });
                 }
                 Err(e) => {
-                    // Reset so the next tick retries this version.
-                    *last_acted = None;
                     tracing::warn!("auto-update install failed (will retry): {e:#}");
                 }
             }

@@ -41,6 +41,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(EditFile { jail: write_jail.clone() }),
         Arc::new(ListDir { jail: read_jail.clone() }),
         Arc::new(Exec { workspace: home.workspace_dir() }),
+        Arc::new(DbQuery),
         Arc::new(Recall),
         Arc::new(MemorySave),
         Arc::new(MemoryRead { home: home.clone() }),
@@ -394,7 +395,7 @@ impl Tool for Exec {
     fn spec(&self) -> ToolSpec {
         spec!(
             "exec",
-            "Run a shell command in the workspace (60s timeout, output capped). Call it directly — the system handles any needed owner approval.",
+            "Run a shell command in the workspace (60s timeout, output capped). Call it directly — the system handles any needed owner approval. To read your own state DB, use `db_query` instead (read-only, no approval) — don't shell out to sqlite3.",
             json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})
         )
     }
@@ -440,6 +441,94 @@ impl Tool for Exec {
                     ToolOutput::err(format!("exit code {status}\n{body}"))
                 }
             }
+        }
+    }
+}
+
+// ---- db_query: read-only introspection of the agent's own state ----
+
+/// Read-only SQL over revenant's own SQLite store (sessions, messages, spend,
+/// jobs, loops, memory index…). ReadOnly tier → never needs owner approval:
+/// reading your own state is safe, and the query is refused unless SQLite
+/// itself reports it as read-only (so no INSERT/UPDATE/DELETE/DDL can slip in).
+/// This is the sanctioned way to "check the DB" — don't shell out to `sqlite3`.
+struct DbQuery;
+
+#[async_trait::async_trait]
+impl Tool for DbQuery {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "db_query",
+            "Run a READ-ONLY SQL query (SELECT/PRAGMA/EXPLAIN) against your own revenant state DB — sessions, messages, spend, jobs, loops, memory index. Returns rows as JSON (capped). No approval needed. Use this instead of shelling out to sqlite3.",
+            json!({"type":"object","properties":{"sql":{"type":"string","description":"a single read-only statement"}},"required":["sql"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::ReadOnly
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        let sql = match arg_str(&args, "sql") {
+            Ok(s) => s.to_string(),
+            Err(e) => return e,
+        };
+        const MAX_ROWS: usize = 500;
+        let outcome = cx
+            .store
+            .with(move |conn| {
+                let mut stmt = match conn.prepare(&sql) {
+                    Ok(s) => s,
+                    Err(e) => return Ok(Err(format!("SQL error: {e}"))),
+                };
+                // The hard guarantee: only queries SQLite classifies as
+                // read-only run. No parsing heuristics to fool.
+                if !stmt.readonly() {
+                    return Ok(Err(
+                        "refused: only read-only queries (SELECT / PRAGMA / EXPLAIN) are allowed"
+                            .to_string(),
+                    ));
+                }
+                let cols: Vec<String> =
+                    stmt.column_names().into_iter().map(String::from).collect();
+                let ncol = cols.len();
+                let mut rows_out: Vec<serde_json::Value> = Vec::new();
+                let mut truncated = false;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    if rows_out.len() >= MAX_ROWS {
+                        truncated = true;
+                        break;
+                    }
+                    let mut obj = serde_json::Map::new();
+                    for (i, name) in cols.iter().enumerate().take(ncol) {
+                        let v = match row.get_ref(i)? {
+                            rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                            rusqlite::types::ValueRef::Integer(n) => serde_json::json!(n),
+                            rusqlite::types::ValueRef::Real(f) => serde_json::json!(f),
+                            rusqlite::types::ValueRef::Text(t) => {
+                                serde_json::Value::String(String::from_utf8_lossy(t).into_owned())
+                            }
+                            rusqlite::types::ValueRef::Blob(b) => {
+                                serde_json::json!(format!("<blob {} bytes>", b.len()))
+                            }
+                        };
+                        obj.insert(name.clone(), v);
+                    }
+                    rows_out.push(serde_json::Value::Object(obj));
+                }
+                Ok(Ok((rows_out, truncated)))
+            })
+            .await;
+        match outcome {
+            Ok(Ok((rows, truncated))) => {
+                let mut body = serde_json::to_string_pretty(&rows)
+                    .unwrap_or_else(|_| "[]".to_string());
+                if truncated {
+                    body.push_str(&format!("\n… (capped at {MAX_ROWS} rows)"));
+                }
+                ToolOutput::ok(truncate_result(body))
+            }
+            Ok(Err(msg)) => ToolOutput::err(msg),
+            Err(e) => ToolOutput::err(format!("db_query failed: {e:#}")),
         }
     }
 }
@@ -1670,6 +1759,43 @@ fn decode_entities(s: &str) -> String {
         .replace("&nbsp;", " ")
         .replace("&mdash;", "—")
         .replace("&ndash;", "–")
+}
+
+#[cfg(test)]
+mod dbquery_tests {
+    use super::*;
+    use revenant_store::Store;
+
+    #[tokio::test]
+    async fn db_query_reads_ok_and_refuses_writes() {
+        let dir = std::env::temp_dir().join(format!("rev-dbq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        let cx = ToolCx {
+            session_id: 1,
+            home: revenant_core::home::Home::resolve(),
+            store,
+            memory: None,
+        };
+
+        // A read-only query returns rows.
+        let read = DbQuery.invoke(&cx, json!({ "sql": "SELECT 1 AS one" })).await;
+        assert!(!read.is_error, "read should succeed: {}", read.content);
+        assert!(read.content.contains("\"one\""), "got: {}", read.content);
+
+        // Anything SQLite classifies as a write is refused — no approval, no
+        // mutation.
+        for bad in [
+            "CREATE TABLE evil (x)",
+            "INSERT INTO sessions (id) VALUES (99)",
+            "DELETE FROM sessions",
+            "UPDATE sessions SET peer = 'x'",
+        ] {
+            let out = DbQuery.invoke(&cx, json!({ "sql": bad })).await;
+            assert!(out.is_error, "write must be refused: {bad}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
