@@ -1,6 +1,0 @@
-# revenant — https://revenantai.dev
-User-agent: *
-Allow: /
-
-# AI crawlers welcome — this project is meant to be discovered and adopted.
-Sitemap: https://revenantai.dev/sitemap.xml

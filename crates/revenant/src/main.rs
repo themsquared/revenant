@@ -16,8 +16,11 @@ extern crate revenant_plugin_example as _;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use revenant_core::config::{Config, GatewayMode, UpdateChannel};
+use revenant_core::config::{
+    Config, GatewayMode, Provider, RouteStrategy, TierConfig, TierTarget, UpdateChannel,
+};
 use revenant_core::home::Home;
+use revenant_core::providers::{self, ProviderChoice};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -180,7 +183,7 @@ const BUILTIN_PERSONAS: &[(&str, &str)] = &[
 
 #[derive(Parser)]
 #[command(name = "revenant", version, about = "The agent that comes back. Gateway-native Rust agent harness.",
-    after_help = "Run `revenant` with no command for guided setup, then chat.\n\nAdvanced commands (hidden above; run `revenant <cmd> --help`):\n  ascend, pr-review, net, necropolis, eval, memory, mcp, render, service, init")]
+    after_help = "Run `revenant` with no command for guided setup, then chat.\n\nAdvanced commands (hidden above; run `revenant <cmd> --help`):\n  ascend, pr-review, net, eval, memory, mcp, render, service, init")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -291,15 +294,6 @@ enum Command {
         limit: Option<usize>,
     },
     #[command(hide = true)]
-    /// Run a Necropolis directory server (the horde's muster point).
-    Necropolis {
-        #[arg(long, default_value_t = 7720)]
-        port: u16,
-        /// Ledger file (durable, hash-linked). Defaults to ~/.revenant/necropolis.db.
-        #[arg(long)]
-        db: Option<PathBuf>,
-    },
-    #[command(hide = true)]
     /// Revenant-only network: register | peers | publish <kind> <file> | list [kind] | pull <id> | sync <peer-url> | verify
     Net {
         #[arg(num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]
@@ -377,20 +371,8 @@ async fn run_command(command: Command) -> Result<()> {
             Command::Ascend { run, live, fix, publish } => cmd_ascend(run, live, fix, publish).await,
             Command::Promote { dry_run } => cmd_promote(dry_run).await,
             Command::PrReview { repo, limit } => cmd_pr_review(repo, limit).await,
-            Command::Necropolis { port, db } => cmd_necropolis(port, db).await,
             Command::Net { action } => cmd_net(action).await,
     }
-}
-
-async fn cmd_necropolis(port: u16, db: Option<PathBuf>) -> Result<()> {
-    use std::sync::{Arc, Mutex};
-    let home = Home::resolve();
-    let db_path = db.unwrap_or_else(|| home.root().join("necropolis.db"));
-    let dir = revenant_net::necropolis::Directory::open(&db_path.to_string_lossy())
-        .context("opening Necropolis ledger")?;
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    println!("🜁 Necropolis — the horde musters at http://{addr} (ledger: {})", db_path.display());
-    revenant_net::necropolis::serve(addr, Arc::new(Mutex::new(dir))).await
 }
 
 pub(crate) fn now_ts() -> i64 {
@@ -427,34 +409,43 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
         // `verify` with NO argument = audit the local ledger. `verify <token>`
         // = confirm an account email (handled in the client match below).
         "verify" if action.get(1).is_none() => {
-            let dir = revenant_net::Directory::open(&local_db.to_string_lossy())
+            // Audit this node's local ledger mirror using the shared Ledger
+            // primitive (verify_chain recomputes and confirms every hash link).
+            let ledger = revenant_net::Ledger::open(&local_db.to_string_lossy())
                 .context("opening local Necropolis ledger")?;
-            // Directory::open re-verifies the entire hash chain on load; reaching
-            // here means the audit passed.
+            let n = ledger.verify_chain().context("ledger audit FAILED")?;
             println!(
                 "🜁 ledger VERIFIED — {} entries, head seq {}  ({})",
-                dir.ledger_len()?,
-                dir.head_seq()?,
+                n,
+                ledger.head_seq()?,
                 local_db.display()
             );
             return Ok(());
         }
         "sync" => {
+            // Mirror a peer's ledger into this node's local copy, re-verifying
+            // every entry against our own head as it lands (append_verified fails
+            // closed on any break). Ledger-level sync — the server derives its
+            // catalog by replaying the log; a node just needs the verified chain.
             let peer_url = action.get(1).context("usage: net sync <peer-url>")?;
-            let mut dir = revenant_net::Directory::open(&local_db.to_string_lossy())
+            let ledger = revenant_net::Ledger::open(&local_db.to_string_lossy())
                 .context("opening local Necropolis ledger")?;
             let peer = revenant_net::NecropolisClient::new(peer_url);
             let peer_head = peer.ledger_head().await.context("reading peer ledger head")?;
-            let since = dir.head_seq()?;
+            let since = ledger.head_seq()?;
             let incoming = peer.ledger_since(since).await.context("pulling peer ledger")?;
             let fetched = incoming.len();
-            let applied = dir
-                .apply_remote(&incoming)
-                .context("applying peer entries (chain re-verified locally)")?;
+            let mut applied = 0usize;
+            for e in &incoming {
+                ledger
+                    .append_verified(e)
+                    .with_context(|| format!("applying peer entry seq {} (chain re-verified locally)", e.seq))?;
+                applied += 1;
+            }
             println!(
                 "🜁 synced from {peer_url}\n   peer head: seq {} · local head: seq {}\n   fetched {fetched}, applied {applied} new entr{} — every hash re-verified on this box",
                 peer_head.seq,
-                dir.head_seq()?,
+                ledger.head_seq()?,
                 if applied == 1 { "y" } else { "ies" },
             );
             return Ok(());
@@ -1127,19 +1118,6 @@ async fn ensure_downloads(home: &Home, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// True once a usable Anthropic key is present in secrets.env.
-fn has_anthropic_key(home: &Home) -> bool {
-    std::fs::read_to_string(home.secrets_path())
-        .map(|s| {
-            s.lines().any(|l| {
-                let l = l.trim();
-                !l.starts_with('#')
-                    && l.starts_with("ANTHROPIC_API_KEY=")
-                    && l.trim_end().len() > "ANTHROPIC_API_KEY=".len() + 3
-            })
-        })
-        .unwrap_or(false)
-}
 
 /// Read one line from stdin with a prompt; returns the trimmed input.
 fn prompt(msg: &str) -> Result<String> {
@@ -1174,90 +1152,444 @@ async fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-/// The turnkey first-run experience: `revenant` (bare) on a fresh box, or
-/// `revenant setup` any time. Asks only what can't be inferred — how you'll pay
-/// — writes everything, fetches the one-time assets, and drops you straight
-/// into your first conversation. No TOML, no docs, no daemon to babysit.
+// ---------------------------------------------------------------------------
+// Guided setup wizard (`revenant`, bare, on a fresh box · or `revenant setup`).
+// Five short steps — brain, voice, reach, skills, name — then it fetches the
+// one-time assets and drops you into your first conversation. Safe to re-run:
+// every step shows what's already set and lets you keep it with Enter.
+// ---------------------------------------------------------------------------
+
+// ANSI helpers kept terse and local so the wizard reads like a script.
+const B: &str = "\x1b[1m"; // bold
+const P: &str = "\x1b[1;35m"; // revenant magenta
+const G: &str = "\x1b[1;32m"; // green
+const Y: &str = "\x1b[1;33m"; // yellow
+const D: &str = "\x1b[2m"; // dim
+const U: &str = "\x1b[4m"; // underline
+const X: &str = "\x1b[0m"; // reset
+
+fn step_header(n: u8, of: u8, title: &str) {
+    println!("\n{P}Step {n}/{of}{X}  {B}{title}{X}");
+}
+
+/// Read a line, returning `default` when the user just hits Enter.
+fn prompt_default(msg: &str, default: &str) -> Result<String> {
+    let got = prompt(msg)?;
+    Ok(if got.is_empty() { default.to_string() } else { got })
+}
+
+/// True when `key` is present in secrets.env with a non-trivial value.
+fn secret_present(home: &Home, key: &str) -> bool {
+    std::fs::read_to_string(home.secrets_path())
+        .map(|s| {
+            s.lines().any(|l| {
+                let l = l.trim();
+                !l.starts_with('#')
+                    && l.starts_with(&format!("{key}="))
+                    && l.trim_end().len() > key.len() + 4
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Insert-or-replace a `KEY=value` line in secrets.env, preserving the rest of
+/// the file and keeping it 0600. Never logs the value.
+fn upsert_secret(home: &Home, key: &str, value: &str) -> Result<()> {
+    let path = home.secrets_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = if existing.trim().is_empty() {
+        vec!["# Provider keys & tokens. Keep this file private (0600).".to_string()]
+    } else {
+        existing.lines().map(str::to_string).collect()
+    };
+    let entry = format!("{key}={value}");
+    let mut replaced = false;
+    for l in lines.iter_mut() {
+        let t = l.trim_start();
+        if !t.starts_with('#') && t.starts_with(&format!("{key}=")) {
+            *l = entry.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.push(entry);
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
+    std::fs::write(&path, body)?;
+    set_mode_0600(&path)?;
+    Ok(())
+}
+
+/// Point the fast/balanced/deep tiers at the chosen provider, always keeping a
+/// free `local` Ollama tier for $0 testing. Cloud providers default to
+/// `balanced`; a local-only setup defaults to `local`.
+fn apply_provider(cfg: &mut Config, choice: &ProviderChoice) {
+    let mut tiers = choice.tiers();
+    tiers.entry("local".to_string()).or_insert_with(|| TierConfig {
+        targets: vec![TierTarget {
+            provider: Provider::Ollama,
+            model: "qwen2.5-coder:14b".to_string(),
+            api_key_env: None,
+            base_url: None,
+            weight: None,
+        }],
+        strategy: RouteStrategy::Failover,
+    });
+    cfg.tiers = tiers;
+    cfg.agent.default_tier =
+        if choice.key == "ollama" { "local".to_string() } else { "balanced".to_string() };
+}
+
+/// A minimal slug for a network skill's install directory (mirrors the tools
+/// crate's `net_slug` so the wizard and the agent agree on names).
+fn wizard_slug(title: &str) -> String {
+    let s: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.chars() {
+        if c == '-' {
+            if !dash {
+                out.push('-');
+            }
+            dash = true;
+        } else {
+            out.push(c);
+            dash = false;
+        }
+    }
+    if out.is_empty() { "skill".to_string() } else { out }
+}
+
 async fn cmd_setup() -> Result<()> {
     let home = Home::resolve();
     println!(
-        "\n\x1b[1;35m🜁 revenant\x1b[0m — the agent that comes back.\n\
-         Let's get you talking to it. This takes about a minute, once.\n"
+        "\n{P}🜁 revenant{X} — the agent that comes back.\n\
+         {D}Five quick steps: a brain, a voice, a way to reach it, some skills, your name.{X}\n\
+         {D}Everything here is editable later. Press Enter to accept a default.{X}"
     );
 
     let fresh = scaffold_fs(&home)?;
-    if fresh {
-        println!("✓ created {}", home.root().display());
-    } else {
-        println!("✓ using existing setup at {}", home.root().display());
-    }
-
-    // The one real decision: how does it think? Everything else is inferred.
-    if !has_anthropic_key(&home) {
-        println!(
-            "\n\x1b[1mHow should your revenant think?\x1b[0m\n\
-             \x20 1) Anthropic (Claude) — recommended, most capable\n\
-             \x20 2) Skip for now — add a key later; chat will tell you what's missing\n"
-        );
-        let choice = prompt("Choose [1]: ")?;
-        let mut body =
-            "# Provider keys. Keep this file private (0600).\n".to_string();
-        if choice != "2" {
-            println!(
-                "\nGrab a key (starts with sk-ant-) at:\n  \x1b[4mhttps://console.anthropic.com/settings/keys\x1b[0m\n"
-            );
-            let key = prompt("Paste your Anthropic API key (or blank to skip): ")?;
-            if key.is_empty() {
-                body.push_str("# ANTHROPIC_API_KEY=sk-ant-...\n");
-                println!("No key yet — that's fine. Run `revenant setup` again when you have one.");
-            } else {
-                body.push_str(&format!("ANTHROPIC_API_KEY={key}\n"));
-                println!("✓ key saved");
-            }
-        } else {
-            body.push_str("# ANTHROPIC_API_KEY=sk-ant-...\n");
-        }
-        std::fs::write(home.secrets_path(), body)?;
-        set_mode_0600(&home.secrets_path())?;
-    } else {
-        println!("✓ provider key already set");
-    }
-
-    // Progressive disclosure: pick how much surface to show by default. Novice
-    // → clean web UI + everyday CLI; power user → advanced tabs revealed. The
-    // web toggle still overrides per-browser; this just sets the starting point.
     println!(
-        "\n\x1b[1mHow will you use it?\x1b[0m\n\
-         \x20 1) Just chatting — keep it simple (recommended)\n\
-         \x20 2) Power user — show loops, subagents, spend, memory, ascension up front\n"
+        "  {G}✓{X} {}",
+        if fresh {
+            format!("created {}", home.root().display())
+        } else {
+            format!("using {}", home.root().display())
+        }
     );
-    let power_user = prompt("Choose [1]: ")? == "2";
-    {
-        let mut cfg = load_config(&home)?;
-        cfg.experience.power_user = power_user;
-        std::fs::write(home.config_path(), cfg.to_toml())?;
-    }
-    println!("✓ {}", if power_user { "power-user mode — everything visible" } else { "simple mode — advanced features are one toggle away" });
 
-    let cfg = load_config(&home)?;
-    println!("\nFetching the gateway and memory model (one-time)…");
+    let mut cfg = load_config(&home)?;
+
+    let chosen = setup_step_llm(&home, &mut cfg)?;
+    setup_step_voice(&home, &mut cfg)?;
+    setup_step_comms(&home, &mut cfg)?;
+    setup_step_skills(&home, &mut cfg).await;
+    // Persist all config mutations at once, before the download step (and
+    // anything the agent reads) needs them. Owner name only touches MEMORY.md.
+    std::fs::write(home.config_path(), cfg.to_toml())?;
+    setup_step_owner(&home)?;
+
+    // One-time heavy assets (gateway binary + embedding model).
+    println!("\n{P}Fetching the gateway and memory model{X} {D}(one-time; cached after this){X}…");
     ensure_downloads(&home, &cfg).await?;
 
-    if !has_anthropic_key(&home) {
+    // Is the chosen brain actually usable yet? (local needs no key.)
+    let ready = chosen.key == "ollama"
+        || chosen.key_env.map(|e| secret_present(&home, e)).unwrap_or(false);
+    if !ready {
         println!(
-            "\n\x1b[1;33mHeads up:\x1b[0m no provider key yet, so replies won't work until you add one.\n\
-             Run \x1b[1mrevenant setup\x1b[0m again, or put ANTHROPIC_API_KEY in {}.",
+            "\n{Y}Almost there.{X} No API key for {B}{}{X} yet, so replies won't work until you add one.\n\
+             Re-run {B}revenant setup{X}, or put {} in {}.",
+            chosen.label,
+            chosen.key_env.unwrap_or("your key"),
             home.secrets_path().display()
         );
-        println!("\nWhen you're ready: \x1b[1mrevenant\x1b[0m starts chatting.");
+        println!("\nWhen you're ready: {B}revenant{X} starts chatting.");
         return Ok(());
     }
 
     println!(
-        "\n\x1b[1;32m✓ You're set.\x1b[0m Starting your first conversation — just type.\n\
-         (Tips: /help for commands · /persona revenant for the full house voice · Ctrl-C to leave.)\n"
+        "\n{G}✓ You're set.{X} Starting your first conversation — just type.\n\
+         {D}(/help for commands · /persona to switch voice · Ctrl-C to leave.){X}\n"
     );
     repl::cmd_chat(None).await
+}
+
+/// Step 1 — the brain. Pick a provider from the catalog; capture its key (or
+/// note Ollama needs none), and write the fast/balanced/deep tiers.
+fn setup_step_llm(home: &Home, cfg: &mut Config) -> Result<ProviderChoice> {
+    step_header(1, 5, "How should it think? (model provider)");
+    let catalog = providers::catalog();
+
+    // If a provider key is already set, offer to keep the current brain.
+    let current = catalog
+        .iter()
+        .find(|c| c.key_env.map(|e| secret_present(home, e)).unwrap_or(false))
+        .cloned();
+    if let Some(cur) = &current {
+        println!("  {D}current: {} — Enter to keep, or pick another below.{X}", cur.label);
+    }
+
+    for (i, c) in catalog.iter().enumerate() {
+        println!("  {B}{}){X} {:<26} {D}{}{X}", i + 1, c.label, c.blurb);
+    }
+    let default_idx = current
+        .as_ref()
+        .and_then(|cur| catalog.iter().position(|c| c.key == cur.key))
+        .unwrap_or(0);
+    let pick = loop {
+        let raw = prompt_default(&format!("Choose [{}]: ", default_idx + 1), &(default_idx + 1).to_string())?;
+        match raw.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= catalog.len() => break catalog[n - 1].clone(),
+            _ => println!("  {Y}enter a number 1–{}{X}", catalog.len()),
+        }
+    };
+
+    apply_provider(cfg, &pick);
+
+    if pick.key == "ollama" {
+        println!(
+            "  {G}✓{X} local models (free). {D}Great for chat; cloud keys work best for coding/agentic runs.{X}"
+        );
+        // A friendly nudge if Ollama isn't obviously installed.
+        if which_ollama().is_none() {
+            println!(
+                "  {Y}!{X} Ollama not found on PATH. Install it (https://ollama.com) and pull a model:\n     {D}ollama pull {}{X}",
+                pick.balanced
+            );
+        } else {
+            println!("     {D}make sure you've pulled a model, e.g.  ollama pull {}{X}", pick.balanced);
+        }
+        return Ok(pick);
+    }
+
+    // Cloud provider: capture the key.
+    let env = pick.key_env.unwrap_or("API_KEY");
+    if secret_present(home, env) {
+        let keep = prompt_default(&format!("A {} key is already set — replace it? [y/N]: ", pick.label), "n")?;
+        if !keep.eq_ignore_ascii_case("y") {
+            println!("  {G}✓{X} keeping existing {}", pick.label);
+            return Ok(pick);
+        }
+    }
+    println!("\n  Get a key at:  {U}{}{X}", pick.key_url);
+    let key = prompt(&format!("  Paste your {} key ({env}, blank to skip): ", pick.label))?;
+    if key.is_empty() {
+        println!("  {Y}!{X} no key yet — tiers are set; add {env} to {} when ready.", home.secrets_path().display());
+    } else {
+        upsert_secret(home, env, &key)?;
+        println!("  {G}✓{X} key saved to secrets.env (0600)");
+    }
+    Ok(pick)
+}
+
+/// Step 2 — the voice. Choose a default personality (or none). Applies to every
+/// new session; a per-session `/persona` still wins.
+fn setup_step_voice(home: &Home, cfg: &mut Config) -> Result<()> {
+    step_header(2, 5, "What voice should it have?");
+    let reg = revenant_agent::PersonalityRegistry::new(home.personalities_dir());
+    let _ = reg.scan();
+    let mut voices = reg.list();
+    voices.sort_by(|a, b| a.name.cmp(&b.name));
+
+    println!("  {B}0){X} {:<12} {D}plain — no styling, just the assistant{X}", "none");
+    for (i, p) in voices.iter().enumerate() {
+        println!("  {B}{}){X} {} {:<10} {D}{}{X}", i + 1, p.emoji, p.name, p.description);
+    }
+    let cur = cfg.agent.default_persona.clone();
+    let default_label = cur.clone().unwrap_or_else(|| "none".into());
+    let raw = prompt_default(&format!("Choose [{default_label}]: "), &default_label)?;
+
+    // Accept a number, a name, or "none".
+    let selected: Option<String> = if raw.eq_ignore_ascii_case("none") || raw == "0" {
+        None
+    } else if let Ok(n) = raw.parse::<usize>() {
+        voices.get(n.wrapping_sub(1)).map(|p| p.name.clone())
+    } else {
+        voices.iter().find(|p| p.name.eq_ignore_ascii_case(&raw)).map(|p| p.name.clone())
+    };
+
+    cfg.agent.default_persona = selected.clone();
+    match &selected {
+        Some(name) => println!("  {G}✓{X} voice: {B}{name}{X}"),
+        None => println!("  {G}✓{X} plain voice"),
+    }
+    Ok(())
+}
+
+/// Step 3 — reach. The web UI is always on; optionally wire Telegram so you can
+/// talk to it from your phone.
+fn setup_step_comms(home: &Home, cfg: &mut Config) -> Result<()> {
+    step_header(3, 5, "How do you want to reach it?");
+    println!("  {D}The web UI is always available:  revenant open{X}");
+    let token_env = cfg.channels.telegram.token_env.clone();
+    let have = secret_present(home, &token_env);
+    let dflt = if cfg.channels.telegram.enabled && have { "y" } else { "n" };
+    let want = prompt_default(&format!("  Connect Telegram (chat from your phone)? [{}]: ", if dflt == "y" { "Y/n" } else { "y/N" }), dflt)?;
+    if !want.eq_ignore_ascii_case("y") {
+        cfg.channels.telegram.enabled = false;
+        println!("  {G}✓{X} web only for now {D}(add Telegram later in config){X}");
+        return Ok(());
+    }
+    println!(
+        "\n  In Telegram: message {B}@BotFather{X} → {B}/newbot{X} → follow the prompts →\n  it hands you a token like {D}123456:ABC-DEF…{X}"
+    );
+    if have {
+        let replace = prompt_default("  A bot token is already set — replace it? [y/N]: ", "n")?;
+        if !replace.eq_ignore_ascii_case("y") {
+            cfg.channels.telegram.enabled = true;
+            println!("  {G}✓{X} Telegram on, keeping existing token");
+            return Ok(());
+        }
+    }
+    let token = prompt(&format!("  Paste your bot token ({token_env}, blank to skip): "))?;
+    if token.is_empty() {
+        cfg.channels.telegram.enabled = false;
+        println!("  {Y}!{X} skipped — web only. Re-run setup to add it.");
+    } else {
+        upsert_secret(home, &token_env, &token)?;
+        cfg.channels.telegram.enabled = true;
+        println!("  {G}✓{X} Telegram on. After setup: {B}revenant up{X}, then {B}/pair{X} in chat to link your account.");
+    }
+    Ok(())
+}
+
+/// The public marketplace directory. Browsing/adopting are open reads — only
+/// *joining* the network (publishing, registering an endpoint) is opt-in — so
+/// onboarding can offer skills without enabling the network.
+const DEFAULT_NECROPOLIS_URL: &str = "https://necropolis.revenantai.dev";
+
+/// Step 4 — skills. Browse what the marketplace offers and adopt a few. Fully
+/// optional and degrades gracefully when the marketplace is unreachable.
+async fn setup_step_skills(home: &Home, cfg: &mut Config) {
+    step_header(4, 5, "Give it some skills? (optional)");
+    // Reads are open: resolve a URL even when the network isn't "joined".
+    let url = std::env::var("REVENANT_NECROPOLIS")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .or_else(|| cfg.network.necropolis_url.clone())
+        .unwrap_or_else(|| DEFAULT_NECROPOLIS_URL.to_string());
+    println!("  {D}fetching the marketplace…{X}");
+    let client = revenant_net::NecropolisClient::new(&url);
+    let items = match client.list(Some("skill")).await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("  {Y}!{X} couldn't reach the marketplace ({e}). Skip — add skills later, nothing lost.");
+            return;
+        }
+    };
+    if items.is_empty() {
+        println!("  {D}no skills published yet — skipping.{X}");
+        return;
+    }
+    // The marketplace works — remember its URL so the web UI browse works later
+    // (a read-only convenience; this does NOT enable publishing/joining).
+    if cfg.network.necropolis_url.is_none() {
+        cfg.network.necropolis_url = Some(url.clone());
+    }
+    let skill_idx = revenant_skills::SkillIndex::new(home.skills_dir());
+    let _ = skill_idx.scan();
+    let installed: std::collections::HashSet<String> =
+        skill_idx.list().into_iter().map(|s| s.name).collect();
+    let show = items.len().min(12);
+    for (i, a) in items.iter().take(show).enumerate() {
+        let title = a["title"].as_str().unwrap_or("");
+        let desc = a["description"].as_str().unwrap_or("");
+        let have = installed.contains(&wizard_slug(title));
+        println!(
+            "  {B}{:>2}){X} {:<24} {D}{}{X}{}",
+            i + 1,
+            title,
+            &desc.chars().take(52).collect::<String>(),
+            if have { format!("  {G}[installed]{X}") } else { String::new() },
+        );
+    }
+    if items.len() > show {
+        println!("  {D}…and {} more — full list in the web UI marketplace.{X}", items.len() - show);
+    }
+    let raw = prompt("  Adopt which? (comma-separated numbers, or Enter to skip): ")
+        .unwrap_or_default();
+    let picks: Vec<usize> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1 && *n <= show)
+        .collect();
+    if picks.is_empty() {
+        println!("  {G}✓{X} no skills for now");
+        return;
+    }
+    for n in picks {
+        let a = &items[n - 1];
+        let title = a["title"].as_str().unwrap_or("").to_string();
+        let id = a["id"].as_str().unwrap_or("");
+        match client.pull(id).await {
+            Ok(artifact) => {
+                if artifact.kind != revenant_net::ArtifactKind::Skill {
+                    println!("  {Y}!{X} {title}: not a skill, skipped");
+                    continue;
+                }
+                match artifact.payload() {
+                    Ok(payload) => {
+                        let dir = home.skills_dir().join(wizard_slug(&title));
+                        if std::fs::create_dir_all(&dir)
+                            .and_then(|_| std::fs::write(dir.join("SKILL.md"), &payload))
+                            .is_ok()
+                        {
+                            println!("  {G}✓{X} adopted {B}{title}{X} {D}(signature verified){X}");
+                        } else {
+                            println!("  {Y}!{X} {title}: couldn't write to disk");
+                        }
+                    }
+                    Err(e) => println!("  {Y}!{X} {title}: bad payload ({e})"),
+                }
+            }
+            Err(e) => println!("  {Y}!{X} {title}: {e}"),
+        }
+    }
+}
+
+/// Step 5 — your name. Seeds MEMORY.md so the agent knows who it works for from
+/// the very first message. Skippable.
+fn setup_step_owner(home: &Home) -> Result<()> {
+    step_header(5, 5, "Last thing — what should it call you?");
+    let name = prompt("  Your name (blank to skip): ")?;
+    if name.is_empty() {
+        println!("  {G}✓{X} no problem — it'll learn as you talk");
+        return Ok(());
+    }
+    let mem_path = home.workspace_dir().join("MEMORY.md");
+    let existing = std::fs::read_to_string(&mem_path).unwrap_or_default();
+    if existing.to_lowercase().contains("owner") {
+        println!("  {G}✓{X} got it, {B}{name}{X} {D}(memory already had an owner note){X}");
+        return Ok(());
+    }
+    std::fs::create_dir_all(home.workspace_dir())?;
+    let line = format!("- Owner: {name} — the person this revenant works for.\n");
+    let body = if existing.trim().is_empty() {
+        format!("# Memory (durable facts about the owner)\n\n{line}")
+    } else {
+        format!("{}\n{line}", existing.trim_end())
+    };
+    std::fs::write(&mem_path, body)?;
+    println!("  {G}✓{X} nice to meet you, {B}{name}{X}");
+    Ok(())
+}
+
+/// Best-effort check for the `ollama` binary on PATH.
+fn which_ollama() -> Option<()> {
+    std::process::Command::new("ollama")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|_| ())
 }
 
 pub fn set_mode_0600(path: &std::path::Path) -> Result<()> {
@@ -1276,7 +1608,8 @@ fn cmd_render() -> Result<()> {
         .into_iter()
         .map(|(k, _)| k)
         .collect();
-    print!("{}", revenant_gateway::render_gateway_yaml(&cfg, &available)?);
+    let req_log = revenant_gateway::request_log_url(&home, &cfg);
+    print!("{}", revenant_gateway::render_gateway_yaml(&cfg, &available, req_log.as_deref())?);
     Ok(())
 }
 
@@ -1302,7 +1635,8 @@ async fn cmd_doctor() -> Result<()> {
     // Secrets / provider keys
     let secrets = std::fs::read_to_string(home.root().join("secrets.env")).unwrap_or_default();
     let present: Vec<&str> = [
-        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY",
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY", "GROQ_API_KEY",
     ]
     .into_iter()
     .filter(|k| secrets.contains(k))
@@ -1803,5 +2137,76 @@ mod tests {
         assert_eq!(parse_calver("v0.1.0"), None); // year 0 out of range
         assert_eq!(parse_calver("main"), None);
         assert_eq!(parse_calver("v2026.13.0"), None); // month out of range
+    }
+
+    // ---- setup wizard helpers ------------------------------------------------
+
+    #[test]
+    fn apply_provider_writes_all_tiers_plus_local() {
+        use revenant_core::config::Config;
+        use revenant_core::providers;
+
+        // A cloud provider (Grok) → fast/balanced/deep on it + a free local tier,
+        // default routed to balanced.
+        let grok = providers::find("grok").unwrap();
+        let mut cfg = Config::default_config();
+        super::apply_provider(&mut cfg, &grok);
+        for t in ["fast", "balanced", "deep", "local"] {
+            assert!(cfg.tiers.contains_key(t), "missing tier {t}");
+        }
+        assert_eq!(cfg.agent.default_tier, "balanced");
+        let balanced = &cfg.tiers["balanced"].targets[0];
+        assert_eq!(balanced.model, grok.balanced);
+        assert_eq!(balanced.base_url.as_deref(), Some("https://api.x.ai/v1"));
+        assert_eq!(balanced.api_key_env.as_deref(), Some("XAI_API_KEY"));
+        // The kept local tier is keyless Ollama.
+        assert!(cfg.tiers["local"].targets[0].api_key_env.is_none());
+
+        // A local-only provider defaults to the local tier.
+        let ollama = providers::find("ollama").unwrap();
+        let mut cfg2 = Config::default_config();
+        super::apply_provider(&mut cfg2, &ollama);
+        assert_eq!(cfg2.agent.default_tier, "local");
+    }
+
+    #[test]
+    fn wizard_slug_is_stable_and_safe() {
+        assert_eq!(super::wizard_slug("Deep Research"), "deep-research");
+        assert_eq!(super::wizard_slug("  K8s   Ops!! "), "k8s-ops");
+        assert_eq!(super::wizard_slug("---"), "skill");
+        assert_eq!(super::wizard_slug("已"), "skill"); // no ascii-alnum → fallback
+    }
+
+    #[test]
+    fn upsert_secret_replaces_and_appends() {
+        use revenant_core::home::Home;
+        let tmp = std::env::temp_dir().join(format!("rev-wiz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("REVENANT_HOME", &tmp);
+        let home = Home::resolve();
+        std::fs::create_dir_all(home.root()).unwrap();
+
+        // First write appends under a fresh header.
+        super::upsert_secret(&home, "ANTHROPIC_API_KEY", "sk-ant-1").unwrap();
+        let body = std::fs::read_to_string(home.secrets_path()).unwrap();
+        assert!(body.contains("ANTHROPIC_API_KEY=sk-ant-1"));
+        assert!(body.starts_with('#')); // header preserved
+
+        // A second key appends without disturbing the first.
+        super::upsert_secret(&home, "XAI_API_KEY", "xai-1").unwrap();
+        // Replacing an existing key updates in place (no duplicate line).
+        super::upsert_secret(&home, "ANTHROPIC_API_KEY", "sk-ant-2").unwrap();
+        let body = std::fs::read_to_string(home.secrets_path()).unwrap();
+        assert!(body.contains("ANTHROPIC_API_KEY=sk-ant-2"));
+        assert!(!body.contains("sk-ant-1"));
+        assert!(body.contains("XAI_API_KEY=xai-1"));
+        assert_eq!(body.matches("ANTHROPIC_API_KEY=").count(), 1);
+
+        assert!(super::secret_present(&home, "ANTHROPIC_API_KEY"));
+        assert!(!super::secret_present(&home, "OPENAI_API_KEY"));
+
+        std::env::remove_var("REVENANT_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

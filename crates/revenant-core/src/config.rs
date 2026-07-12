@@ -473,6 +473,16 @@ pub struct GatewayConfig {
     /// endpoint. Supervision and config rendering are disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Request-log / analytics database. When on, the gateway persists every
+    /// LLM/MCP/A2A request (tokens, cost, latency, model, identity) so the
+    /// Traffic & Analytics pages work. On by default — this is the gateway's
+    /// observability superpower, and it's local (SQLite under the home dir).
+    #[serde(default = "default_true")]
+    pub analytics: bool,
+    /// Explicit request-log DB URL (`sqlite://…` or `postgres://…`). When unset
+    /// and analytics is on, defaults to a SQLite file in the gateway home dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_log_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,6 +510,11 @@ pub struct AgentConfig {
     /// Minimum tool calls in a turn before it's considered worth distilling.
     #[serde(default = "default_learn_min_tools")]
     pub learn_min_tools: usize,
+    /// Default voice for new sessions that haven't picked one explicitly (set
+    /// by the setup wizard). `None` = the plain house voice. A per-session
+    /// `/persona` always overrides this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_persona: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -511,6 +526,7 @@ impl Default for AgentConfig {
             max_iterations: default_max_iterations(),
             learn: true,
             learn_min_tools: default_learn_min_tools(),
+            default_persona: None,
         }
     }
 }
@@ -705,6 +721,8 @@ impl Config {
                 a2a_egress_base: default_a2a_egress_base(),
                 binary: None,
                 endpoint: None,
+                analytics: true,
+                request_log_url: None,
             },
             agent: AgentConfig::default(),
             memory: MemoryConfig::default(),

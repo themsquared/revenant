@@ -8,14 +8,36 @@
 
 use anyhow::{bail, Result};
 use revenant_core::config::Config;
+use revenant_core::home::Home;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+
+/// Resolve the request-log / analytics DB URL for this config, if analytics is
+/// on. Defaults to a SQLite file under the gateway home dir; an explicit
+/// `request_log_url` (sqlite:// or postgres://) overrides. Kept here so the
+/// supervisor and `revenant render` agree on the path.
+pub fn request_log_url(home: &Home, cfg: &Config) -> Option<String> {
+    if !cfg.gateway.analytics {
+        return None;
+    }
+    if let Some(url) = &cfg.gateway.request_log_url {
+        return Some(url.clone());
+    }
+    // sqlx sqlite wants an absolute path as sqlite://<abs>; create_if_missing
+    // handles first-run creation. The DB lives beside the gateway config.
+    Some(format!("sqlite://{}", home.gateway_dir().join("requests.db").display()))
+}
 
 /// `available_env` holds the env var names that will actually be present in
 /// the gateway's environment. Targets referencing a missing key are dropped
 /// (with a loud warning) so a fresh install without cloud keys still serves
-/// whatever tiers it can — e.g. `local` via Ollama.
-pub fn render_gateway_yaml(cfg: &Config, available_env: &HashSet<String>) -> Result<String> {
+/// whatever tiers it can — e.g. `local` via Ollama. `request_log_url` enables
+/// the analytics DB sink when `Some` (see [`request_log_url`]).
+pub fn render_gateway_yaml(
+    cfg: &Config,
+    available_env: &HashSet<String>,
+    request_log_url: Option<&str>,
+) -> Result<String> {
     let mut models: Vec<Value> = Vec::new();
     let mut virtual_models: Vec<Value> = Vec::new();
 
@@ -116,6 +138,17 @@ pub fn render_gateway_yaml(cfg: &Config, available_env: &HashSet<String>) -> Res
         },
         "llm": Value::Object(llm),
     });
+
+    // Request-log / analytics sink: persists every request (tokens, cost,
+    // latency, model, identity) so the gateway's Traffic & Analytics pages
+    // work. SQLite by default, Postgres if the URL says so. This is the moat's
+    // audit trail — every byte the harness spends is recorded below it.
+    if let Some(url) = request_log_url {
+        doc["config"]
+            .as_object_mut()
+            .unwrap()
+            .insert("database".into(), json!({ "url": url }));
+    }
 
     // MCP plugin bus: one gateway endpoint multiplexing every configured MCP
     // server (stdio-spawned or remote). Namespaced + governable by the gateway.
@@ -225,10 +258,74 @@ mod tests {
     use super::*;
     use revenant_core::config::Config;
 
+    // Validate-before-ship: every provider the setup wizard can write must
+    // render into gateway YAML the supervisor accepts. This is the config real
+    // users depend on, so it's proven here rather than discovered at runtime.
+    #[test]
+    fn every_catalog_provider_renders() {
+        use revenant_core::config::{Provider, RouteStrategy, TierConfig, TierTarget};
+        use revenant_core::providers;
+        for choice in providers::catalog() {
+            let mut cfg = Config::default_config();
+            let mut tiers = choice.tiers();
+            // Mirror the wizard's apply_provider: keep a free local tier.
+            tiers.entry("local".into()).or_insert_with(|| TierConfig {
+                strategy: RouteStrategy::Failover,
+                targets: vec![TierTarget {
+                    provider: Provider::Ollama,
+                    model: "qwen2.5-coder:14b".into(),
+                    api_key_env: None,
+                    base_url: None,
+                    weight: None,
+                }],
+            });
+            cfg.tiers = tiers;
+            // Make every key env "present" so cloud tiers aren't dropped.
+            let env: HashSet<String> = choice.key_env.map(|e| e.to_string()).into_iter().collect();
+            let yaml = render_gateway_yaml(&cfg, &env, None)
+                .unwrap_or_else(|e| panic!("provider '{}' failed to render: {e:#}", choice.key));
+            // The chosen provider's gateway name must appear, and its balanced
+            // model must be wired in.
+            assert!(
+                yaml.contains(choice.provider.gateway_name()),
+                "provider '{}' missing gateway name in YAML",
+                choice.key
+            );
+            assert!(
+                yaml.contains(choice.balanced),
+                "provider '{}' missing balanced model {}",
+                choice.key,
+                choice.balanced
+            );
+            // OpenAI-compatible providers (Grok) must carry their base URL.
+            if let Some(base) = choice.base_url {
+                assert!(yaml.contains(base), "provider '{}' missing base_url", choice.key);
+            }
+        }
+    }
+
+    #[test]
+    fn analytics_db_renders_under_config() {
+        let env: HashSet<String> = ["ANTHROPIC_API_KEY".to_string()].into();
+        // Given a request-log URL, it lands under `config.database.url` — the
+        // key the enterprise gateway resolves its request-log store from.
+        let yaml = render_gateway_yaml(
+            &Config::default_config(),
+            &env,
+            Some("sqlite:///home/u/.revenant/gateway/requests.db"),
+        )
+        .unwrap();
+        assert!(yaml.contains("database:"));
+        assert!(yaml.contains("url: sqlite:///home/u/.revenant/gateway/requests.db"));
+        // None → no database key at all (analytics off / external gateway).
+        let off = render_gateway_yaml(&Config::default_config(), &env, None).unwrap();
+        assert!(!off.contains("database:"));
+    }
+
     #[test]
     fn default_config_renders() {
         let env: HashSet<String> = ["ANTHROPIC_API_KEY".to_string()].into();
-        let yaml = render_gateway_yaml(&Config::default_config(), &env).unwrap();
+        let yaml = render_gateway_yaml(&Config::default_config(), &env, None).unwrap();
         // Balanced is multi-target → virtual model with failover.
         assert!(yaml.contains("virtualModels"));
         assert!(yaml.contains("name: balanced"));
@@ -246,7 +343,7 @@ mod tests {
         // No keys at all → cloud tiers are skipped; config errors only when
         // NOTHING is usable.
         let env = HashSet::new();
-        let err = render_gateway_yaml(&Config::default_config(), &env).unwrap_err();
+        let err = render_gateway_yaml(&Config::default_config(), &env, None).unwrap_err();
         assert!(err.to_string().contains("no tier has a usable target"));
 
         let mut cfg = Config::default_config();
@@ -263,7 +360,7 @@ mod tests {
                 strategy: revenant_core::config::RouteStrategy::Failover,
             },
         );
-        let yaml = render_gateway_yaml(&cfg, &env).unwrap();
+        let yaml = render_gateway_yaml(&cfg, &env, None).unwrap();
         assert!(yaml.contains("name: local"));
         assert!(!yaml.contains("anthropic"));
     }
@@ -296,7 +393,7 @@ mod tests {
                 ],
             },
         );
-        let yaml = render_gateway_yaml(&cfg, &env).unwrap();
+        let yaml = render_gateway_yaml(&cfg, &env, None).unwrap();
         assert!(yaml.contains("weighted"));
         assert!(yaml.contains("weight: 70"));
         assert!(yaml.contains("weight: 30"));
@@ -313,13 +410,13 @@ mod tests {
         cfg.spending.budget = 500_000;
         cfg.spending.interval = "24h".into();
         cfg.spending.count = BudgetCount::Tokens;
-        let yaml = render_gateway_yaml(&cfg, &env).unwrap();
+        let yaml = render_gateway_yaml(&cfg, &env, None).unwrap();
         assert!(yaml.contains("localRateLimit"));
         assert!(yaml.contains("maxTokens: 500000"));
         assert!(yaml.contains("fillInterval: 24h"));
         assert!(yaml.contains("type: tokens"));
         // Off by default → no policies block.
-        let off = render_gateway_yaml(&Config::default_config(), &env).unwrap();
+        let off = render_gateway_yaml(&Config::default_config(), &env, None).unwrap();
         assert!(!off.contains("localRateLimit"));
     }
 }

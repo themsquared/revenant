@@ -125,6 +125,9 @@ pub struct AgentRuntime {
     /// Closed learning loop (Hermes-style self-improvement).
     pub learn: bool,
     pub learn_min_tools: usize,
+    /// Default voice for new sessions that haven't chosen one (set at setup).
+    /// A per-session `/persona` always wins over this.
+    pub default_persona: Option<String>,
     /// Timestamps of recent auto-distilled skills (rolling 1h) — anti-spam.
     pub learn_budget: Arc<Mutex<Vec<i64>>>,
     /// Privacy router: sensitive turns are forced onto `privacy_tier`. None
@@ -229,6 +232,7 @@ impl AgentRuntime {
             max_iterations: self.max_iterations.max(60),
             learn: false,
             learn_min_tools: self.learn_min_tools,
+            default_persona: self.default_persona.clone(),
             learn_budget: self.learn_budget.clone(),
             privacy: None,
         }
@@ -338,10 +342,12 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         // Resolve the session's personality (top-level turns only; subagents
         // have their own directive and no persona).
         let persona_voice = if agent.is_none() {
-            match self.store.session_get_persona(session_id).await {
-                Ok(Some(name)) => self.personalities.get(&name).map(|p| p.voice),
-                _ => None,
-            }
+            let chosen = match self.store.session_get_persona(session_id).await {
+                Ok(Some(name)) => Some(name),
+                // No explicit per-session voice → fall back to the setup default.
+                _ => self.default_persona.clone(),
+            };
+            chosen.and_then(|name| self.personalities.get(&name).map(|p| p.voice))
         } else {
             None
         };

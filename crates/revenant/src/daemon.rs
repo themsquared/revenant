@@ -169,6 +169,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         max_iterations: cfg.agent.max_iterations,
         learn: cfg.agent.learn,
         learn_min_tools: cfg.agent.learn_min_tools,
+        default_persona: cfg.agent.default_persona.clone(),
         learn_budget: Arc::new(std::sync::Mutex::new(Vec::new())),
         privacy: build_privacy(cfg),
     });

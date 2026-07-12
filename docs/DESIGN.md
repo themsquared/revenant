@@ -423,6 +423,16 @@ Shipped: `revenant spend` (tokens + $ + budget). Next:
   Telegram.
 - **Per-session cost attribution** in the web UI Spend tab.
 
+### Gateway as control plane
+The gateway is under-exploited: we use it as an LLM router + one global cap, but
+agentgateway is a full agent-mesh data plane (per-agent identity, guardrails,
+rate limits, MCP authz, request-log analytics). Treating it as revenant's
+un-rewritable enforcement kernel — every spawned identity scoped, budgeted,
+guardrailed, audited below the harness — is the moat made literal. Grounded
+inventory + phased roadmap: **[docs/gateway-controlplane.md](gateway-controlplane.md)**.
+(Phase 0, request-log/analytics DB, is shipped: `config.database.url` rendered by
+default so the Traffic & Analytics pages work.)
+
 ### Other high-value items worth doing
 - **`revenant doctor` deepening**: cost/credit health, model-availability ping,
   "is the autonomous loop configured safely" check.

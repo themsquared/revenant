@@ -8,16 +8,12 @@
 //! own box. Identity is a self-sovereign Ed25519 keypair; authenticity is
 //! cryptographic, not directory-asserted.
 
-pub mod accounts;
 pub mod artifact;
 pub mod client;
-pub mod email;
 pub mod identity;
 pub mod ledger;
-pub mod necropolis;
 
 pub use artifact::{Artifact, ArtifactKind};
 pub use client::{LedgerHead, NecropolisClient};
 pub use identity::Identity;
-pub use ledger::Entry;
-pub use necropolis::Directory;
+pub use ledger::{Entry, Ledger};

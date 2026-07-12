@@ -4,7 +4,7 @@
 mod render;
 mod supervisor;
 
-pub use render::render_gateway_yaml;
+pub use render::{render_gateway_yaml, request_log_url};
 pub use supervisor::{base_passthrough_env, GatewaySupervisor, SupervisorHandle};
 
 use anyhow::{bail, Context, Result};
@@ -103,7 +103,8 @@ pub async fn write_gateway_config(
 ) -> Result<()> {
     let available: std::collections::HashSet<String> =
         env.iter().map(|(k, _)| k.clone()).collect();
-    let yaml = render_gateway_yaml(cfg, &available)?;
+    let req_log = render::request_log_url(home, cfg);
+    let yaml = render_gateway_yaml(cfg, &available, req_log.as_deref())?;
     std::fs::create_dir_all(home.gateway_dir())?;
     let next = home.gateway_config_next_path();
     let live = home.gateway_config_path();
