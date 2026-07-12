@@ -135,6 +135,7 @@ pub fn render_gateway_yaml(
         "config": {
             "readinessAddr": format!("127.0.0.1:{}", cfg.gateway.readiness_port),
             "statsAddr": format!("127.0.0.1:{}", cfg.gateway.stats_port),
+            "adminAddr": format!("127.0.0.1:{}", cfg.gateway.admin_port),
         },
         "llm": Value::Object(llm),
     });

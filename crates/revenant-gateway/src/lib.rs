@@ -1,9 +1,11 @@
 //! revenant-gateway: renders agentgateway config from harness state and
 //! supervises the gateway as a child process.
 
+pub mod analytics;
 mod render;
 mod supervisor;
 
+pub use analytics::{analytics_summary, AnalyticsSummary};
 pub use render::{render_gateway_yaml, request_log_url};
 pub use supervisor::{base_passthrough_env, GatewaySupervisor, SupervisorHandle};
 

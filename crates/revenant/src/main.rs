@@ -2001,6 +2001,28 @@ async fn cmd_spend(window: String) -> Result<()> {
             cfg.spending.interval,
         );
     }
+
+    // Gateway-authoritative view: what the gateway actually metered, below the
+    // harness. Fails soft — the local numbers above still stand if it's down.
+    match revenant_gateway::analytics_summary(cfg.gateway.admin_port, "provider").await {
+        Ok(summary) if !summary.groups.is_empty() => {
+            let (greq, gtok, gcost) = summary.totals();
+            println!("\n🜁 gateway (authoritative · last 24h · by provider)\n");
+            for g in &summary.groups {
+                println!(
+                    "  {:<20} {:>10} tok · {:>4} req · ${:.4}",
+                    g.label, g.total_tokens, g.requests, g.cost
+                );
+            }
+            println!("\n  total: {gtok} tok · {greq} req · ${gcost:.4}");
+        }
+        Ok(_) => {
+            println!("\n🜁 gateway analytics: no requests logged yet (last 24h).");
+        }
+        Err(e) => {
+            println!("\n  ⚠️  gateway analytics unavailable ({e}).\n     (needs a running gateway on this build; older gateways predate the request-log DB.)");
+        }
+    }
     Ok(())
 }
 

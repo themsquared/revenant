@@ -461,6 +461,11 @@ pub struct GatewayConfig {
     pub stats_port: u16,
     #[serde(default = "default_mcp_port")]
     pub mcp_port: u16,
+    /// Admin API/UI port (request-log search + Traffic & Analytics). The
+    /// gateway defaults this to 15000; we render it explicitly so revenant
+    /// knows where to read its own telemetry back.
+    #[serde(default = "default_admin_port")]
+    pub admin_port: u16,
     /// Base port for governed A2A egress; each gateway-routed remote agent
     /// gets `a2a_egress_base + its index`.
     #[serde(default = "default_a2a_egress_base")]
@@ -626,6 +631,9 @@ fn default_readiness_port() -> u16 {
 fn default_mcp_port() -> u16 {
     41002
 }
+fn default_admin_port() -> u16 {
+    15000
+}
 fn default_a2a_egress_base() -> u16 {
     41010
 }
@@ -718,6 +726,7 @@ impl Config {
                 readiness_port: default_readiness_port(),
                 stats_port: default_stats_port(),
                 mcp_port: default_mcp_port(),
+                admin_port: default_admin_port(),
                 a2a_egress_base: default_a2a_egress_base(),
                 binary: None,
                 endpoint: None,
