@@ -14,81 +14,31 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-14
-            zig: ""
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            zig: "--zig"
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            zig: "--zig"
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve version
-        id: v
-        shell: bash
-        # On a tag push ref_name IS the tag; on manual dispatch use the input.
-        run: echo "version=${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add ${{ matrix.target }}
-
-      - name: Install zig + cargo-zigbuild (musl targets)
-        if: matrix.zig == '--zig'
-        run: |
-          pip3 install ziglang
-          cargo install --locked cargo-zigbuild
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Package
-        run: sh installer/package.sh "${{ steps.v.outputs.version }}" "${{ matrix.target }}" ${{ matrix.zig }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist-${{ matrix.target }}
-          path: dist/*
-
-  release:
-    needs: build
+  resolve:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      draft: ${{ steps.v.outputs.draft }}
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: staging
-      - name: Assemble release assets
+      - id: v
+        shell: bash
+        # On a tag push ref_name IS the tag and we publish it; on manual
+        # dispatch use the input and stage it as a draft for review.
         run: |
-          mkdir -p dist
-          find staging -name '*.tar.gz' -exec cp {} dist/ \;
-          cd dist
-          # One aggregated SHA256SUMS the installer verifies against.
-          sha256sum *.tar.gz > SHA256SUMS
-          echo "--- release contents ---"; ls -la; cat SHA256SUMS
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}"
-          gh release create "$VERSION" dist/* \
-            --repo "${{ github.repository }}" \
-            --title "$VERSION" \
-            --generate-notes \
-            ${{ github.ref_type == 'tag' && ' ' || '--draft' }}
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "draft=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "draft=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    uses: ./.github/workflows/build-release.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      prerelease: false
+      draft: ${{ needs.resolve.outputs.draft == 'true' }}

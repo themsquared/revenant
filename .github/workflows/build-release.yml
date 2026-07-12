@@ -1,0 +1,102 @@
+name: build-release
+
+# Reusable build+publish pipeline shared by the stable `release` workflow (tag
+# pushes) and the rolling `main-prerelease` workflow (pushes to main). Keeping a
+# single definition guarantees identical asset naming
+# (`revenant-<version>-<triple>.tar.gz`) and an identical aggregated SHA256SUMS,
+# which is exactly what the verified-download path in `cmd_update` relies on.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version/tag to build (e.g. v2026.7.0 or v2026.7.412-main.abc1234)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Create the release as a draft"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            zig: ""
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: "--zig"
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: "--zig"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Install zig + cargo-zigbuild (musl targets)
+        if: matrix.zig == '--zig'
+        run: |
+          pip3 install ziglang
+          cargo install --locked cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Package
+        run: sh installer/package.sh "${{ inputs.version }}" "${{ matrix.target }}" ${{ matrix.zig }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+      - name: Assemble release assets
+        run: |
+          mkdir -p dist
+          find staging -name '*.tar.gz' -exec cp {} dist/ \;
+          cd dist
+          # One aggregated SHA256SUMS the installer/updater verifies against.
+          sha256sum *.tar.gz > SHA256SUMS
+          echo "--- release contents ---"; ls -la; cat SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.version }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ inputs.version }}" \
+            --target "${{ github.sha }}" \
+            --generate-notes \
+            ${{ inputs.prerelease && '--prerelease' || '' }} \
+            ${{ inputs.draft && '--draft' || '' }}

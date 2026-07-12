@@ -1,0 +1,75 @@
+name: main-prerelease
+
+# Publishes a rolling prerelease for every push to main so the `main` update
+# channel (config: [update].channel = "main") always has fresh artifacts.
+#
+# The tag is CalVer-compatible: v<YEAR>.<MONTH>.<COUNT>-main.<shortsha>, where
+# COUNT is the commit count on HEAD. parse_calver strips the `-main.<sha>`
+# suffix and reads (YEAR, MONTH, COUNT); the monotonic COUNT is what lets two
+# builds in the same month compare as distinct, so `revenant update --check`
+# actually sees each new rolling build. Assets and SHA256SUMS are produced by
+# the shared build-release workflow, byte-for-byte identical to stable releases.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A newer push supersedes an in-flight build; no point publishing a stale one.
+concurrency:
+  group: main-prerelease
+  cancel-in-progress: true
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.calver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the commit count (patch) is accurate
+      - id: calver
+        shell: bash
+        run: |
+          YEAR=$(date -u +%Y)
+          MONTH=$(date -u +%-m)          # no leading zero — matches stable v<y>.<m>
+          COUNT=$(git rev-list --count HEAD)
+          SHA=$(git rev-parse --short HEAD)
+          TAG="v${YEAR}.${MONTH}.${COUNT}-main.${SHA}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "rolling tag: $TAG"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build-release.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ needs.version.outputs.tag }}
+      prerelease: true
+      draft: false
+
+  prune:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune old rolling prereleases (keep newest 10)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Keep the 10 most recent rolling prereleases; delete older ones
+          # (release + its git tag) so the channel doesn't grow unbounded.
+          # Stable releases and dispatch drafts are never touched.
+          mapfile -t OLD < <(
+            gh release list --repo "${{ github.repository }}" --limit 200 \
+              --json tagName,createdAt,isPrerelease \
+              --jq '[.[] | select(.isPrerelease and (.tagName | test("-main\\.")))]
+                    | sort_by(.createdAt) | reverse | .[10:] | .[].tagName'
+          )
+          for tag in "${OLD[@]}"; do
+            echo "pruning $tag"
+            gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag --yes
+          done
