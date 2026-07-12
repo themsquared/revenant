@@ -1069,10 +1069,10 @@ struct NetPublish {
 }
 
 impl NetPublish {
-    /// Collect (title, payload_bytes) for the requested kind, honoring an
-    /// optional name filter. Skills = `<skills_dir>/<name>/SKILL.md`; plugins =
-    /// `<plugins_dir>/*.wasm`.
-    fn collect(&self, kind: &str, names: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    /// Collect (title, description, payload_bytes) for the requested kind,
+    /// honoring an optional name filter. Skills = `<skills_dir>/<name>/SKILL.md`
+    /// (description pulled from the frontmatter); plugins = `<plugins_dir>/*.wasm`.
+    fn collect(&self, kind: &str, names: &[String]) -> Result<Vec<(String, String, Vec<u8>)>, String> {
         let want = |n: &str| names.is_empty() || names.iter().any(|x| x == n);
         let mut out = Vec::new();
         match kind {
@@ -1085,7 +1085,13 @@ impl NetPublish {
                     let manifest = entry.path().join("SKILL.md");
                     if manifest.is_file() && want(&name) {
                         match std::fs::read(&manifest) {
-                            Ok(bytes) => out.push((name, bytes)),
+                            Ok(bytes) => {
+                                let desc = revenant_net::artifact::frontmatter_description(
+                                    &String::from_utf8_lossy(&bytes),
+                                )
+                                .unwrap_or_default();
+                                out.push((name, desc, bytes));
+                            }
                             Err(e) => return Err(format!("reading {}: {e}", manifest.display())),
                         }
                     }
@@ -1103,7 +1109,7 @@ impl NetPublish {
                     let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
                     if want(&stem) {
                         match std::fs::read(&path) {
-                            Ok(bytes) => out.push((stem, bytes)),
+                            Ok(bytes) => out.push((stem, String::new(), bytes)),
                             Err(e) => return Err(format!("reading {}: {e}", path.display())),
                         }
                     }
@@ -1170,9 +1176,9 @@ impl Tool for NetPublish {
 
         let (mut ok, mut failed) = (0usize, 0usize);
         let mut lines = Vec::new();
-        for (title, bytes) in items {
+        for (title, desc, bytes) in items {
             let artifact =
-                revenant_net::Artifact::create(&id, art_kind, title.clone(), "", &bytes, None, now);
+                revenant_net::Artifact::create(&id, art_kind, title.clone(), desc, &bytes, None, now);
             match client.publish(&artifact).await {
                 Ok(aid) => {
                     ok += 1;

@@ -43,6 +43,23 @@ pub struct Artifact {
     pub sig: String,
 }
 
+/// Pull `description:` out of a SKILL.md-style YAML frontmatter block so a
+/// published skill carries a human description in the catalog (not the id/sig —
+/// description is metadata, outside the signed preimage). None if absent.
+pub fn frontmatter_description(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    for line in rest[..end].lines() {
+        if let Some(v) = line.trim().strip_prefix("description:") {
+            let v = v.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 impl Artifact {
     /// The bytes that get hashed into `id` and signed — binds kind, title, and
     /// payload together so none can be swapped without breaking the signature.

@@ -481,8 +481,16 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 serde_json::from_value(serde_json::Value::String(kind_s.clone()))
                     .with_context(|| format!("bad kind '{kind_s}' (skill|plugin|signal|improvement)"))?;
             let bytes = std::fs::read(file).with_context(|| format!("reading {file}"))?;
+            // Skills carry a human description in their frontmatter — surface it
+            // in the catalog (it's metadata, outside the signed preimage).
+            let desc = if matches!(kind, revenant_net::ArtifactKind::Skill) {
+                revenant_net::artifact::frontmatter_description(&String::from_utf8_lossy(&bytes))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let artifact = revenant_net::Artifact::create(
-                &id, kind, title, "", &bytes, None, now_ts(),
+                &id, kind, title, desc, &bytes, None, now_ts(),
             );
             let aid = client.publish(&artifact).await?;
             println!("published {} artifact {}", kind_s, &aid[..12]);
