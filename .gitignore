@@ -8,8 +8,11 @@ secrets.env
 *.env
 !*.example.env
 
-# release artifacts
-dist/
+# release artifacts (root-level, from the packaging script). NOTE: this is
+# intentionally root-scoped — web/dist IS committed so that a from-source
+# `cargo build` (including the Ascension coder) embeds a working web UI without
+# needing a Node/Vite toolchain. Rebuild it with `cd web && npm run build`.
+/dist/
 
 # Nested workspaces (e.g. wasm example plugins) have their own target dirs
 examples/**/target/
