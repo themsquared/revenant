@@ -7,6 +7,18 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
+/// Env vars every child process should inherit regardless of provider
+/// secrets, so stdio subprocesses (e.g. MCP servers) can find the user's
+/// home directory, kubeconfig, ssh config, etc. The gateway's own env is
+/// still cleared first; this is a small, deliberate allowlist rather than
+/// a full passthrough.
+pub fn base_passthrough_env() -> Vec<(String, String)> {
+    const KEYS: &[&str] = &["HOME", "USER", "USERPROFILE", "SHELL", "LANG", "TMPDIR", "TZ"];
+    KEYS.iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect()
+}
+
 pub struct GatewaySupervisor {
     pub binary: PathBuf,
     pub config_path: PathBuf,
@@ -104,6 +116,7 @@ impl GatewaySupervisor {
             .arg(&self.config_path)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .envs(base_passthrough_env())
             .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

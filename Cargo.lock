@@ -2555,6 +2555,8 @@ dependencies = [
  "revenant-agent",
  "revenant-core",
  "revenant-store",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",

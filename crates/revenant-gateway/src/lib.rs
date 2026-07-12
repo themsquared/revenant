@@ -5,7 +5,7 @@ mod render;
 mod supervisor;
 
 pub use render::render_gateway_yaml;
-pub use supervisor::{GatewaySupervisor, SupervisorHandle};
+pub use supervisor::{base_passthrough_env, GatewaySupervisor, SupervisorHandle};
 
 use anyhow::{bail, Context, Result};
 use revenant_core::config::Config;
@@ -115,6 +115,7 @@ pub async fn write_gateway_config(
         .arg(&next)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .envs(base_passthrough_env())
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .output()
         .await
