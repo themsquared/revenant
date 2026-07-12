@@ -203,6 +203,12 @@ enum Command {
     },
     /// Daemon status.
     Status,
+    /// Token + dollar spend by model, with budget status (cost-consciousness).
+    Spend {
+        /// Window: today | 24h | 7d
+        #[arg(long, default_value = "today")]
+        window: String,
+    },
     /// Diagnose your setup in plain English — config, keys, credit, daemon,
     /// channels, network. Run this first if anything feels off.
     Doctor,
@@ -346,6 +352,7 @@ async fn run_command(command: Command) -> Result<()> {
             Command::Up => daemon::cmd_up().await,
             Command::Chat { tier } => repl::cmd_chat(tier).await,
             Command::Status => cmd_status().await,
+            Command::Spend { window } => cmd_spend(window).await,
             Command::Doctor => cmd_doctor().await,
             Command::Update { check } => cmd_update(check),
             Command::Approvals { action } => cmd_approvals(action).await,
@@ -1592,6 +1599,66 @@ async fn cmd_status() -> Result<()> {
             }
         }
         Err(_) => println!("daemon: not running (`revenant up`)"),
+    }
+    Ok(())
+}
+
+async fn cmd_spend(window: String) -> Result<()> {
+    let home = Home::resolve();
+    let cfg = load_config(&home)?;
+    let client = revenant_client::Client::from_env(&home)?;
+    client
+        .health()
+        .await
+        .context("spend needs a running daemon — start it with `revenant up`")?;
+    let rows = client.spend(&window).await?;
+    if rows.is_empty() {
+        println!("no spend recorded in window '{window}'.");
+        return Ok(());
+    }
+    let priced = !cfg.pricing.is_empty();
+    println!("🜁 spend · {window}\n");
+    let (mut tin, mut tout, mut treq, mut tcost) = (0i64, 0i64, 0i64, 0.0f64);
+    let mut any_unpriced = false;
+    for r in &rows {
+        tin += r.tokens_in;
+        tout += r.tokens_out;
+        treq += r.requests;
+        let cost = cfg.pricing.get(&r.model).map(|p| {
+            r.tokens_in as f64 / 1e6 * p.input_per_mtok + r.tokens_out as f64 / 1e6 * p.output_per_mtok
+        });
+        let cost_s = match cost {
+            Some(c) => {
+                tcost += c;
+                format!("  ${c:.4}")
+            }
+            None if priced => {
+                any_unpriced = true;
+                "  (no price)".to_string()
+            }
+            None => String::new(),
+        };
+        println!(
+            "  {:<32} {:>10} in / {:>10} out · {:>4} req{}",
+            r.model, r.tokens_in, r.tokens_out, r.requests, cost_s
+        );
+    }
+    println!(
+        "\n  total: {tin} in / {tout} out · {treq} req{}",
+        if priced { format!(" · ${tcost:.4}") } else { String::new() }
+    );
+    if !priced {
+        println!("\n  Set [pricing] in config.toml (model → input_per_mtok / output_per_mtok, USD)\n  to see dollar cost, not just tokens.");
+    } else if any_unpriced {
+        println!("\n  Some models have no [pricing] entry — add them for a complete total.");
+    }
+    if cfg.spending.enabled {
+        println!(
+            "\n  budget cap: {} {} per {} (gateway-enforced)",
+            cfg.spending.budget,
+            format!("{:?}", cfg.spending.count).to_lowercase(),
+            cfg.spending.interval,
+        );
     }
     Ok(())
 }

@@ -43,6 +43,9 @@ the owner wants a capability, `skill_browse` the network and offer to `skill_ado
 before building one from scratch.\n\
 - To share skills or plugins with the network, use `net_publish` — it publishes the whole set in \
 ONE call and asks for approval once. Never loop `exec revenant net publish` per file.\n\
+- Spend deliberately: match the model tier to the job. Use `fast` for lookups, formatting, and \
+simple extraction; reserve `deep` for genuinely hard reasoning. When you spawn or author a \
+subagent, give it the cheapest tier that will do its job well and only the tools it needs.\n\
 - When you notice a standing, recurring need (a watch, a periodic check, a digest), propose a loop \
 with `loop_create` rather than waiting to be asked; keep intervals sane and let it be approved.\n\
 - When a task fits a specialist agent on the mesh (its roster is in the `call_agent` tool), delegate \

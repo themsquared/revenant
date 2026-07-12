@@ -30,6 +30,11 @@ pub struct Config {
     /// Update channel: year_month (stable CalVer) | main (rolling) | manual.
     #[serde(default)]
     pub update: UpdateConfig,
+    /// Optional per-model pricing (USD per million tokens) so `revenant spend`
+    /// can report dollar cost, not just tokens. Empty by default — fill in the
+    /// models you use from your provider's pricing page. Keyed by model id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pricing: BTreeMap<String, ModelPrice>,
     /// MCP servers multiplexed behind the gateway (the plugin bus).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpServer>,
@@ -526,6 +531,16 @@ pub struct TierConfig {
     pub strategy: RouteStrategy,
 }
 
+/// Per-model price in USD per MILLION tokens. Set these from your provider's
+/// pricing page; `revenant spend` uses them to turn token counts into dollars.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ModelPrice {
+    /// USD per 1M input (prompt) tokens.
+    pub input_per_mtok: f64,
+    /// USD per 1M output (completion) tokens.
+    pub output_per_mtok: f64,
+}
+
 /// Multi-target routing strategy, matching agentgateway's `virtualModels`
 /// routing enum (verified against v1.3.1: `failover` | `weighted`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,6 +715,7 @@ impl Config {
             network: NetworkConfig::default(),
             experience: ExperienceConfig::default(),
             update: UpdateConfig::default(),
+            pricing: BTreeMap::new(),
             mcp: Vec::new(),
             a2a_agents: Vec::new(),
             tiers,
