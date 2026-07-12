@@ -110,9 +110,14 @@ impl JobRunner {
         }
         let tier: Tier = p.tier.as_deref().unwrap_or("balanced").parse().unwrap_or(Tier::Balanced);
 
+        // Build the worktree OUTSIDE the target repo so we never litter the
+        // user's working tree or pollute their `git status`.
         let branch = format!("job/{}", job.id);
-        let wt = root.join(".revenant-jobs").join(job.id.to_string());
+        let wt = std::env::temp_dir().join("revenant-jobs").join(job.id.to_string());
         let _ = std::fs::remove_dir_all(&wt);
+        if let Some(parent) = wt.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         git(root, &["worktree", "prune"]).ok();
         git(root, &["branch", "-D", &branch]).ok();
         git(root, &["worktree", "add", "-b", &branch, &wt.to_string_lossy(), "HEAD"])
@@ -123,6 +128,7 @@ impl JobRunner {
         let diff = git(&wt, &["diff"]).unwrap_or_default();
         let _ = git(root, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
         let _ = git(root, &["branch", "-D", &branch]);
+        let _ = std::fs::remove_dir_all(&wt); // belt-and-suspenders
 
         let summary = coded?;
         Ok(if diff.trim().is_empty() {

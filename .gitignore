@@ -18,3 +18,7 @@ examples/**/target/
 
 # Stray root fly.toml from `fly launch` — real deploy config is deploy/necropolis/fly.toml
 /fly.toml
+
+# Ephemeral coding-job / ascension worktrees (should live outside the repo, but guard anyway)
+.revenant-jobs/
+.ascension-worktrees/
