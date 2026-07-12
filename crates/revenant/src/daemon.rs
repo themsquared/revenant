@@ -353,13 +353,17 @@ pub async fn cmd_up() -> Result<()> {
         );
     }
 
-    let listener = tokio::net::TcpListener::bind(crate::DEFAULT_BIND)
+    // Control-plane bind: DEFAULT_BIND, overridable via REVENANT_BIND so a
+    // second instance (e.g. a rollout smoke test) can come up on an alt port
+    // without colliding with the live daemon.
+    let bind = std::env::var("REVENANT_BIND").unwrap_or_else(|_| crate::DEFAULT_BIND.to_string());
+    let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .with_context(|| format!("binding control plane on {}", crate::DEFAULT_BIND))?;
+        .with_context(|| format!("binding control plane on {bind}"))?;
     println!(
         "\x1b[1;35mrevenant\x1b[0m is up and does not sleep — gateway {} · control http://{} (ctrl-c to lay it down)",
         daemon.llm_endpoint,
-        crate::DEFAULT_BIND
+        bind
     );
 
     let server = axum::serve(listener, revenant_control::router(state));
