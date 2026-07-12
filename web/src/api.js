@@ -83,6 +83,8 @@ export function eventStream(onEvent) {
     'subagent_finished',
     'loop_completed',
     'gateway_status',
+    'context_folded',
+    'task_queued',
   ]) {
     source.addEventListener(name, forward)
   }

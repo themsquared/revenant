@@ -19,7 +19,7 @@ use revenant_security::{ApprovalBroker, Verdict};
 use revenant_skills::SkillIndex;
 use revenant_store::Store;
 use revenant_tools::{ToolCx, ToolRegistry};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -32,6 +32,33 @@ const ITERATION_CEILING_FACTOR: u32 = 3;
 /// …but if it makes NO progress (every tool call in a round errored) for this
 /// many rounds past the soft budget, stop — don't burn the ceiling spinning.
 const STALL_ROUNDS: u32 = 3;
+
+/// A message that landed mid-turn, carrying the tier it came in on (used if it
+/// turns out to be a new task run as its own turn).
+#[derive(Debug, Clone)]
+pub struct Interjection {
+    pub text: String,
+    pub tier: Tier,
+}
+
+/// RAII marker: a session is "active" (top-level turn in flight) for the life
+/// of this guard, so interjection routing knows to hold new input. Cleared on
+/// drop — including on error/panic paths out of the turn.
+struct ActiveGuard {
+    set: Arc<Mutex<HashSet<i64>>>,
+    session_id: i64,
+}
+impl ActiveGuard {
+    fn new(set: &Arc<Mutex<HashSet<i64>>>, session_id: i64) -> Self {
+        set.lock().unwrap().insert(session_id);
+        ActiveGuard { set: set.clone(), session_id }
+    }
+}
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.session_id);
+    }
+}
 
 /// Layer 0: identity + rules. Byte-stable for future prompt caching.
 const IDENTITY: &str = "You are Revenant — a lean personal agent that runs anywhere and comes \
@@ -137,6 +164,15 @@ pub struct AgentRuntime {
     pub default_persona: Option<String>,
     /// Timestamps of recent auto-distilled skills (rolling 1h) — anti-spam.
     pub learn_budget: Arc<Mutex<Vec<i64>>>,
+    /// Sessions with a top-level turn in flight — so a new message can be
+    /// treated as a mid-turn interjection instead of waiting in line.
+    pub active_turns: Arc<Mutex<HashSet<i64>>>,
+    /// Interjections that arrived mid-turn, awaiting triage at the next
+    /// iteration boundary (session → queued messages).
+    pub interjections: Arc<Mutex<HashMap<i64, Vec<Interjection>>>>,
+    /// Interjections triaged as NEW tasks — run as follow-up turns once the
+    /// current turn finishes (the session actor drains these).
+    pub deferred: Arc<Mutex<HashMap<i64, Vec<Interjection>>>>,
     /// Privacy router: sensitive turns are forced onto `privacy_tier`. None
     /// when disabled or misconfigured (no such tier).
     pub privacy: Option<(Arc<revenant_core::privacy::Detector>, Tier)>,
@@ -245,6 +281,9 @@ impl AgentRuntime {
             learn_min_tools: self.learn_min_tools,
             default_persona: self.default_persona.clone(),
             learn_budget: self.learn_budget.clone(),
+            active_turns: self.active_turns.clone(),
+            interjections: self.interjections.clone(),
+            deferred: self.deferred.clone(),
             privacy: None,
         }
     }
@@ -407,6 +446,11 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         let mut last_assistant_id = 0i64;
         // Tool trajectory for the learning loop.
         let mut tools_used: Vec<String> = Vec::new();
+
+        // Mark this session active (top-level turns only) so mid-turn messages
+        // are held as interjections instead of waiting behind the whole turn.
+        // Cleared when this turn returns (RAII), even on error.
+        let _active = (depth == 0).then(|| ActiveGuard::new(&self.active_turns, session_id));
 
         // Soft budget = configured max_iterations; past it the turn auto-continues
         // while it's still making progress, up to `ceiling`. This is what stops
@@ -577,7 +621,7 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             }
             // Copy handle so each concurrent closure can read the allowlist.
             let allow_ref = allowlist.as_ref();
-            let results: Vec<ContentBlock> = futures::stream::iter(calls.into_iter().map(
+            let mut results: Vec<ContentBlock> = futures::stream::iter(calls.into_iter().map(
                 |(id, name, input)| async move {
                     // Enforce a subagent's allowlist even if it hallucinates a
                     // tool outside its set.
@@ -599,6 +643,29 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             .buffer_unordered(CONCURRENT_TOOLS)
             .collect()
             .await;
+
+            // Fold in any mid-turn interjections before persisting this user
+            // turn. Steering context rides IN the same user message as the tool
+            // results (one valid user turn), so the model sees it on its very
+            // next step. A genuinely new task is deferred to run after this one.
+            if depth == 0 {
+                let pending: Vec<Interjection> =
+                    self.interjections.lock().unwrap().remove(&session_id).unwrap_or_default();
+                for itj in pending {
+                    let preview: String = itj.text.chars().take(140).collect();
+                    if self.interjection_is_new_task(&user_text, &itj.text, tier).await {
+                        self.deferred.lock().unwrap().entry(session_id).or_default().push(itj);
+                        self.events.emit(Event::TaskQueued { session_id, task: preview });
+                    } else {
+                        results.push(ContentBlock::text(format!(
+                            "[The user just added this mid-task — factor it into what you're doing now]: {}",
+                            itj.text
+                        )));
+                        self.events.emit(Event::ContextFolded { session_id, note: preview });
+                    }
+                }
+            }
+
             self.store
                 .append_message(session_id, Role::User, &results, estimate(&results))
                 .await?;
@@ -1409,6 +1476,72 @@ fn sanitize_history(mut messages: Vec<WireMessage>) -> Vec<WireMessage> {
     messages
 }
 
+impl AgentRuntime {
+    /// Triage a mid-turn interjection: a NEW separable task (queue it) or more
+    /// context/steering for the task in flight (fold it in)? A cheap forced-tool
+    /// call. Routes on the turn's own tier so a free `local` session stays free;
+    /// any failure defaults to STEER (folding just adds context — the safe,
+    /// less-disruptive choice).
+    async fn interjection_is_new_task(
+        &self,
+        current_task: &str,
+        interjection: &str,
+        tier: Tier,
+    ) -> bool {
+        let spec = revenant_core::ToolSpec {
+            name: "triage".into(),
+            description: "Classify a new user message relative to the task in progress.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "new_task": {
+                        "type": "boolean",
+                        "description": "true = a separate task that would derail the current work; false = adds detail/correction/steering for the CURRENT task"
+                    }
+                },
+                "required": ["new_task"]
+            }),
+        };
+        let system = format!(
+            "You are a fast router. The agent is CURRENTLY working on:\n---\n{}\n---\n\
+             The user just sent this mid-task:\n---\n{}\n---\n\
+             Call `triage`. new_task=false when it adds detail, a correction, or steers the \
+             CURRENT task (most 'also…', 'wait, use…', 'make sure…' cases). new_task=true ONLY \
+             when it's a clearly separate request.",
+            current_task.chars().take(2000).collect::<String>(),
+            interjection.chars().take(1000).collect::<String>(),
+        );
+        // Free session ⇒ route free; otherwise the cheap paid tier.
+        let router_tier = if tier == Tier::Local { Tier::Local } else { Tier::Fast };
+        let req = MessagesRequest {
+            model: router_tier.as_str().to_string(),
+            max_tokens: 128,
+            system: Some(serde_json::Value::String(system)),
+            messages: vec![WireMessage::new(Role::User, vec![ContentBlock::text("classify")])],
+            tools: vec![spec],
+            tool_choice: Some(serde_json::json!({"type": "tool", "name": "triage"})),
+            stream: true,
+            identity: Some("router".to_string()),
+        };
+        match self.llm.stream_message(&req, |_| {}).await {
+            Ok(outcome) => outcome
+                .content
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::ToolUse { name, input, .. } if name == "triage" => {
+                        input.get("new_task").and_then(|v| v.as_bool())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false),
+            Err(err) => {
+                tracing::warn!("interjection triage failed — folding as context: {err:#}");
+                false
+            }
+        }
+    }
+}
+
 // ---- session actors ----
 
 #[derive(Debug)]
@@ -1434,6 +1567,21 @@ impl SessionManager {
     }
 
     pub async fn submit(&self, session_id: i64, msg: SessionMsg) -> Result<()> {
+        // If a top-level turn is already running for this session, this isn't a
+        // message that waits in line — it's a mid-turn interjection. Hold it for
+        // the running loop to triage (steer the current turn, or queue as a new
+        // task) instead of blocking behind the whole turn.
+        if self.runtime.active_turns.lock().unwrap().contains(&session_id) {
+            let SessionMsg::UserInput { content, tier } = msg;
+            self.runtime
+                .interjections
+                .lock()
+                .unwrap()
+                .entry(session_id)
+                .or_default()
+                .push(Interjection { text: content, tier });
+            return Ok(());
+        }
         let sender = {
             let mut senders = self.senders.lock().unwrap();
             match senders.get(&session_id) {
@@ -1475,6 +1623,31 @@ async fn session_actor(
                         session_id,
                         error: format!("{err:#}"),
                     });
+                }
+                // Drain anything queued during the turn: new tasks triaged aside,
+                // plus interjections that landed after the last mid-turn drain.
+                // Run them in order as their own turns; a follow-up turn may
+                // itself queue more, so loop until the session is quiet.
+                loop {
+                    let mut next = runtime.deferred.lock().unwrap().remove(&session_id).unwrap_or_default();
+                    next.extend(
+                        runtime.interjections.lock().unwrap().remove(&session_id).unwrap_or_default(),
+                    );
+                    if next.is_empty() {
+                        break;
+                    }
+                    for itj in next {
+                        if let Err(err) = runtime
+                            .run_turn(session_id, itj.tier, vec![ContentBlock::text(itj.text)])
+                            .await
+                        {
+                            tracing::error!(session_id, "queued turn failed: {err:#}");
+                            runtime.events.emit(Event::TurnFailed {
+                                session_id,
+                                error: format!("{err:#}"),
+                            });
+                        }
+                    }
                 }
             }
         }

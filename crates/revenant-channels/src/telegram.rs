@@ -476,6 +476,28 @@ impl OutboundMirror {
                         self.client.typing(chat_id).await;
                     }
                 }
+                // A mid-turn message was folded into the running turn — a quiet
+                // ack so the user knows it landed and is being factored in.
+                Event::ContextFolded { session_id, note } => {
+                    if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
+                        let _ = self
+                            .client
+                            .send_message(chat_id, &format!("✏️ folding that in: {}", clip(&note, 200)))
+                            .await;
+                    }
+                }
+                // …or triaged as a separate task, to run right after this one.
+                Event::TaskQueued { session_id, task } => {
+                    if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
+                        let _ = self
+                            .client
+                            .send_message(
+                                chat_id,
+                                &format!("🧵 queued as a separate task (after this one): {}", clip(&task, 200)),
+                            )
+                            .await;
+                    }
+                }
                 // Loop results pushed to telegram go to every paired chat.
                 Event::LoopCompleted { name, channel_out, text, .. }
                     if channel_out.contains("telegram") =>

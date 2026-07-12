@@ -276,6 +276,8 @@ async fn events(
                 revenant_core::Event::GatewayStatus { .. } => "gateway_status",
                 revenant_core::Event::UpdateAvailable { .. } => "update_available",
                 revenant_core::Event::UpdateInstalled { .. } => "update_installed",
+                revenant_core::Event::ContextFolded { .. } => "context_folded",
+                revenant_core::Event::TaskQueued { .. } => "task_queued",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())

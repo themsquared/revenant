@@ -93,6 +93,18 @@ pub enum Event {
         tag: String,
         restarting: bool,
     },
+    /// A mid-turn interjection was folded into the running turn as extra
+    /// context (the agent will factor it into its next step).
+    ContextFolded {
+        session_id: i64,
+        note: String,
+    },
+    /// A mid-turn interjection was judged a new task and queued to run right
+    /// after the current turn (same session), rather than derailing it.
+    TaskQueued {
+        session_id: i64,
+        task: String,
+    },
 }
 
 impl Event {
