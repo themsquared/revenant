@@ -16,7 +16,7 @@ RHOME="${REVENANT_HOME:-$HOME/.revenant}"
 BIN_DIR="$RHOME/bin"
 LOG="$RHOME/logs/rollout.log"
 SERVICE="dev.revenant.agent"
-LOCK="$RHOME/rollout.lock"
+LOCKDIR="$RHOME/rollout.lock.d"
 FORCE="${1:-}"
 
 # Self-sufficient PATH: launchd runs with a minimal environment, so name every
@@ -25,11 +25,22 @@ NODE_BIN="$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail 
 export PATH="$HOME/.cargo/bin:${NODE_BIN:-}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 mkdir -p "$RHOME/logs" "$BIN_DIR"
 
-# --- single-flight lock (flock if available, else mkdir) ---------------------
-exec 9>"$LOCK"
-if command -v flock >/dev/null 2>&1; then
-  flock -n 9 || { echo "$(date '+%F %T') another rollout is running — skip" >>"$LOG"; exit 0; }
+# --- single-flight lock -------------------------------------------------------
+# `mkdir` is atomic on POSIX (works on macOS, unlike flock), so it's the lock.
+# If the holder is dead (crashed without cleanup), reclaim the stale lock so a
+# one-off crash can't wedge the canary forever. Concurrency matters here: the
+# 300s timer must never race a manual --force run onto the fixed smoke ports.
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  oldpid="$(cat "$LOCKDIR/pid" 2>/dev/null || echo)"
+  if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+    echo "$(date '+%F %T') | rollout skipped — held by pid $oldpid" >>"$LOG"; exit 0
+  fi
+  echo "$(date '+%F %T') | reclaiming stale rollout lock (pid ${oldpid:-?} gone)" >>"$LOG"
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || { echo "$(date '+%F %T') | lock race lost — skip" >>"$LOG"; exit 0; }
 fi
+echo "$$" >"$LOCKDIR/pid"
+trap 'rm -rf "$LOCKDIR"' EXIT
 
 exec >>"$LOG" 2>&1
 say() { echo "$(date '+%F %T') | $*"; }
@@ -67,7 +78,7 @@ say "cargo test --release"
 cargo test --release --quiet || fail "tests failed"
 
 # --- 4. isolated smoke boot on alt ports (live daemon untouched) -------------
-SB="$(mktemp -d)"; trap 'rm -rf "$SB"' EXIT
+SB="$(mktemp -d)"; trap 'rm -rf "$SB" "$LOCKDIR"' EXIT
 SBH="$SB/home"; mkdir -p "$SBH/gateway/bin" "$SBH/models" "$SBH/logs"
 ln -sf "$RHOME/gateway/bin/"agentgateway-* "$SBH/gateway/bin/" 2>/dev/null || true
 for m in "$RHOME/models/"*; do [ -e "$m" ] && ln -sf "$m" "$SBH/models/"; done
