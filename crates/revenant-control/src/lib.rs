@@ -27,6 +27,8 @@ pub struct AppState {
     pub default_tier: Tier,
     pub gateway_probe: revenant_llm::LlmClient,
     pub home: revenant_core::home::Home,
+    /// Gateway admin/analytics port — for the authoritative spend view.
+    pub admin_port: u16,
     event_seq: Arc<AtomicU64>,
 }
 
@@ -37,6 +39,7 @@ impl AppState {
         default_tier: Tier,
         gateway_probe: revenant_llm::LlmClient,
         home: revenant_core::home::Home,
+        admin_port: u16,
     ) -> Self {
         AppState {
             manager,
@@ -44,6 +47,7 @@ impl AppState {
             default_tier,
             gateway_probe,
             home,
+            admin_port,
             event_seq: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -76,6 +80,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/loops/:id/runs", get(loop_runs))
         .route("/v1/loops/:id", axum::routing::delete(loop_delete).patch(loop_patch))
         .route("/v1/spend", get(spend))
+        .route("/v1/analytics", get(analytics))
         .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
         .route("/v1/channels/pairings", post(pairing_create))
@@ -480,6 +485,39 @@ async fn spend(
     };
     let rows = state.manager.runtime().store.spend_since(from).await?;
     Ok(Json(json!({ "window": q.window, "by_model": rows })))
+}
+
+/// Gateway-authoritative spend: what agentgateway actually metered (tokens,
+/// requests, cost) grouped by provider, over its default window (last 24h).
+/// Fails soft — returns `available:false` with a reason when the gateway or its
+/// request-log DB isn't reachable, so the UI can degrade to the store view.
+async fn analytics(State(state): State<AppState>) -> Json<serde_json::Value> {
+    match revenant_gateway::analytics_summary(state.admin_port, "provider").await {
+        Ok(summary) => {
+            let (requests, total_tokens, cost) = summary.totals();
+            let by_provider: Vec<_> = summary
+                .groups
+                .iter()
+                .map(|g| {
+                    json!({
+                        "label": g.label,
+                        "requests": g.requests,
+                        "total_tokens": g.total_tokens,
+                        "cost": g.cost,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "available": true,
+                "window": "last 24h",
+                "from": summary.window_from,
+                "to": summary.window_to,
+                "by_provider": by_provider,
+                "totals": { "requests": requests, "total_tokens": total_tokens, "cost": cost },
+            }))
+        }
+        Err(e) => Json(json!({ "available": false, "error": e.to_string() })),
+    }
 }
 
 async fn pairing_create(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {

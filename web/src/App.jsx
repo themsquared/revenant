@@ -352,13 +352,52 @@ function Approvals({ onCount }) {
 function Spend() {
   const [window, setWindow] = useState('today')
   const [rows, setRows] = useState([])
+  const [gw, setGw] = useState(null) // gateway analytics (authoritative)
   useEffect(() => {
     api.spend(window).then((r) => setRows(r.by_model))
   }, [window])
+  useEffect(() => {
+    api.analytics().then(setGw).catch(() => setGw({ available: false, error: 'unreachable' }))
+  }, [])
 
-  const max = Math.max(1, ...rows.map((r) => r.tokens_in + r.tokens_out))
+  const storeMax = Math.max(1, ...rows.map((r) => r.tokens_in + r.tokens_out))
+  const gwMax = Math.max(1, ...((gw?.by_provider) || []).map((g) => g.total_tokens))
   return (
     <div className="spend">
+      {/* Gateway-authoritative view: what agentgateway actually metered. */}
+      <h3 className="spend-head">Gateway · authoritative <span className="muted">· last 24h</span></h3>
+      {gw && gw.available && gw.by_provider.length > 0 && (
+        <>
+          {gw.by_provider.map((g) => (
+            <div key={g.label} className="bar-row">
+              <span className="bar-label">{g.label}</span>
+              <div className="bar-track">
+                <div className="bar in" style={{ width: `${(g.total_tokens / gwMax) * 100}%` }} />
+              </div>
+              <span className="bar-nums">
+                {g.total_tokens.toLocaleString()} tok · {g.requests} req · ${g.cost.toFixed(4)}
+              </span>
+            </div>
+          ))}
+          <div className="bar-row total">
+            <span className="bar-label">total</span>
+            <div className="bar-track" />
+            <span className="bar-nums">
+              {gw.totals.total_tokens.toLocaleString()} tok · {gw.totals.requests} req · $
+              {gw.totals.cost.toFixed(4)}
+            </span>
+          </div>
+        </>
+      )}
+      {gw && gw.available && gw.by_provider.length === 0 && (
+        <div className="empty">no gateway traffic in the last 24h</div>
+      )}
+      {gw && !gw.available && (
+        <div className="empty">gateway analytics unavailable ({gw.error || 'gateway down'})</div>
+      )}
+
+      {/* Harness bookkeeping (per-response usage the agent recorded). */}
+      <h3 className="spend-head">Harness <span className="muted">· by model</span></h3>
       <div className="controls">
         {['today', '24h', '7d'].map((w) => (
           <button key={w} className={w === window ? 'tab active' : 'tab'} onClick={() => setWindow(w)}>
@@ -373,12 +412,12 @@ function Spend() {
           <div className="bar-track">
             <div
               className="bar in"
-              style={{ width: `${(r.tokens_in / max) * 100}%` }}
+              style={{ width: `${(r.tokens_in / storeMax) * 100}%` }}
               title={`${r.tokens_in.toLocaleString()} in`}
             />
             <div
               className="bar out"
-              style={{ width: `${(r.tokens_out / max) * 100}%` }}
+              style={{ width: `${(r.tokens_out / storeMax) * 100}%` }}
               title={`${r.tokens_out.toLocaleString()} out`}
             />
           </div>
@@ -389,8 +428,8 @@ function Spend() {
         </div>
       ))}
       <p className="hint">
-        token counts from per-response usage; gateway GenAI metrics land here in a later
-        milestone
+        Gateway numbers are metered below the harness (authoritative). Harness numbers are the
+        agent's own per-response tallies — they can differ (e.g. pre-gateway history).
       </p>
     </div>
   )

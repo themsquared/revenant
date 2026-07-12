@@ -334,6 +334,7 @@ pub async fn cmd_up() -> Result<()> {
         default_tier,
         revenant_llm::LlmClient::new(daemon.llm_endpoint.clone()),
         home.clone(),
+        cfg.gateway.admin_port,
     );
 
     // Durable background-job runner (async coding subtasks + other work items).

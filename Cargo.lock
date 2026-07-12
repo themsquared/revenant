@@ -2468,6 +2468,7 @@ dependencies = [
  "mime_guess",
  "revenant-agent",
  "revenant-core",
+ "revenant-gateway",
  "revenant-llm",
  "revenant-memory",
  "revenant-security",

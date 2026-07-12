@@ -11,6 +11,7 @@ revenant-agent = { workspace = true }
 revenant-security = { workspace = true }
 revenant-skills = { workspace = true }
 revenant-llm = { workspace = true }
+revenant-gateway = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }

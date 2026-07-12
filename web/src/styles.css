@@ -185,6 +185,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 .bar.out { background: var(--ok); }
 .bar-nums { color: var(--dim); font-size: 12px; white-space: nowrap; }
 .hint { color: var(--dim); font-size: 12px; margin-top: 16px; }
+.spend-head { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; margin: 20px 0 10px; }
+.spend-head:first-child { margin-top: 0; }
+.spend-head .muted { color: var(--dim); text-transform: none; letter-spacing: 0; font-weight: 400; }
+.bar-row.total { border-top: 1px solid var(--border, #333); padding-top: 8px; font-weight: 600; }
 
 a { color: var(--accent-2); }
 
