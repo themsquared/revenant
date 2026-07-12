@@ -151,6 +151,21 @@ pub fn render_gateway_yaml(
             .insert("database".into(), json!({ "url": url }));
     }
 
+    // Per-agent identity attribution: derive `agentgateway.user` from the
+    // identity header the harness stamps (owner / subagent / coder), falling
+    // back to "owner". This lights up per-agent analytics/limits/authz below
+    // the harness. Loopback ⇒ attribution, not authentication.
+    if cfg.gateway.identity_attribution {
+        let user_cel = format!(
+            "coalesce(request.headers[\"{}\"], \"owner\")",
+            revenant_core::config::IDENTITY_HEADER
+        );
+        doc["config"].as_object_mut().unwrap().insert(
+            "standardAttributes".into(),
+            json!({ "user": user_cel, "group": "\"revenant\"" }),
+        );
+    }
+
     // MCP plugin bus: one gateway endpoint multiplexing every configured MCP
     // server (stdio-spawned or remote). Namespaced + governable by the gateway.
     if !cfg.mcp.is_empty() {

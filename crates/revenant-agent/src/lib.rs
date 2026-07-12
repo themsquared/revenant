@@ -433,6 +433,10 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
                 tools: tool_specs.clone(),
                 tool_choice: None,
                 stream: true,
+                // Gateway identity: the subagent's name, or "owner" at top level.
+                identity: Some(
+                    agent.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| "owner".to_string()),
+                ),
             };
 
             // Stream, with one retry when nothing was emitted yet (failover).
@@ -620,6 +624,9 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             tools: Vec::new(), // no tools → the model must answer in text
             tool_choice: None,
             stream: true,
+            identity: Some(
+                agent.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| "owner".to_string()),
+            ),
         };
         let events = self.events.clone();
         let outcome = self
@@ -1224,6 +1231,7 @@ one-line 'use when …' description, and a body of concrete steps. Return via re
         tools: vec![spec],
         tool_choice: Some(serde_json::json!({"type": "tool", "name": "record_skill"})),
         stream: true,
+        identity: Some("learn".to_string()),
     };
     let outcome = llm.stream_message(&request, |_| {}).await?;
     let input = outcome

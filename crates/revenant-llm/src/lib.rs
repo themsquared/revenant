@@ -51,6 +51,11 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_choice: Option<serde_json::Value>,
     pub stream: bool,
+    /// Calling agent's identity ("owner" / a subagent name / "coder"), sent as
+    /// the `x-revenant-agent` header for gateway attribution — never part of the
+    /// request body. `None` ⇒ the gateway defaults it to "owner".
+    #[serde(skip)]
+    pub identity: Option<String>,
 }
 
 /// Build a system value with a cache breakpoint after the stable prefix.
@@ -106,7 +111,7 @@ impl LlmClient {
             "model": model, "max_tokens": 1,
             "messages": [{ "role": "user", "content": "hi" }]
         });
-        let resp = Self::headers(self.http.post(&url))
+        let resp = Self::headers(self.http.post(&url), None)
             .json(&req)
             .send()
             .await
@@ -119,12 +124,18 @@ impl LlmClient {
         Ok(())
     }
 
-    fn headers(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn headers(req: reqwest::RequestBuilder, identity: Option<&str>) -> reqwest::RequestBuilder {
         // The gateway injects real provider credentials; these satisfy the
         // Anthropic API shape.
-        req.header("x-api-key", "revenant-local")
+        let req = req
+            .header("x-api-key", "revenant-local")
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        // Per-agent identity for gateway attribution (analytics/limits/authz).
+        match identity {
+            Some(id) => req.header(revenant_core::config::IDENTITY_HEADER, id),
+            None => req,
+        }
     }
 
     /// Stream a Messages call, invoking `on_delta` for each text delta.
@@ -134,7 +145,7 @@ impl LlmClient {
         mut on_delta: impl FnMut(&str),
     ) -> Result<StreamOutcome> {
         let url = format!("{}/v1/messages", self.base_url);
-        let resp = Self::headers(self.http.post(&url))
+        let resp = Self::headers(self.http.post(&url), req.identity.as_deref())
             .json(req)
             .send()
             .await
@@ -272,7 +283,7 @@ impl LlmClient {
             "system": system,
             "messages": messages,
         });
-        let resp = Self::headers(self.http.post(&url)).json(&body).send().await?;
+        let resp = Self::headers(self.http.post(&url), None).json(&body).send().await?;
         if !resp.status().is_success() {
             bail!("count_tokens returned {}", resp.status());
         }
@@ -290,7 +301,7 @@ impl LlmClient {
             data: Vec<EmbeddingItem>,
         }
         let url = format!("{}/v1/embeddings", self.base_url);
-        let resp = Self::headers(self.http.post(&url))
+        let resp = Self::headers(self.http.post(&url), None)
             .json(&serde_json::json!({ "model": model, "input": inputs }))
             .send()
             .await

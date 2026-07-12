@@ -159,11 +159,22 @@ Enforced in the gateway, hidden from the agent.
 
 - **Phase 0 — analytics on (DONE).** `config.database.url` rendered by default;
   verified against the live binary (endpoint returns summaries, DB auto-created).
-- **Phase 1 — consume the telemetry.** Point `revenant status/spend/eval` at the
-  request-log store / analytics API; feed cost/latency/model into the
-  self-improvement fitness axes.
-- **Phase 2 — identity fabric.** Per-agent `apiKey` + `backendAuth`; resolve the
-  render-form question; stamp `metadata.{user,group,tier}`.
+- **Phase 1 — consume the telemetry (DONE).** `revenant spend` now reads the
+  gateway's authoritative per-provider tokens/requests/cost from the analytics
+  API (new `[gateway].admin_port`, rendered `adminAddr`), failing soft when the
+  gateway is down.
+- **Phase 2 — identity fabric (DONE, attribution).** Resolved the render-form
+  question: **no binds/routes refactor needed** — `llm.policies` flattens
+  `LocalGatewayPolicy`, so inbound identity attaches in the shorthand. Shipped
+  via the lighter, loopback-appropriate mechanism: the harness stamps an
+  `x-revenant-agent` header (owner / subagent name / learn / memory), and the
+  gateway derives `agentgateway.user` from it via `config.standardAttributes`
+  CEL — verified E2E (the header lands in the request log's
+  `attributes["agentgateway.user"]`). This is *attribution*, not authentication
+  (loopback). Authenticated per-agent `apiKey` keys + per-agent `backendAuth`
+  remain available (`llm.policies.apiKey`) for when the gateway port is exposed.
+  *Remaining:* attribute the async coder job distinctly (currently "owner"), and
+  add per-agent rate-limit/authz rules keyed on `agentgateway.user` (Phase 4).
 - **Phase 3 — guardrails.** PII masking default-on; MCP guardrails; optional
   webhook jailbreak/moderation.
 - **Phase 4 — scoping.** Per-agent token limits + `mcpAuthorization` tool

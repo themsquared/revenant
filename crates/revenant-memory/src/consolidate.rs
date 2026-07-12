@@ -198,6 +198,7 @@ impl MemoryEngine {
             tools: vec![record_memory_spec()],
             tool_choice: Some(json!({"type": "tool", "name": "record_memory"})),
             stream: true,
+            identity: Some("memory".to_string()),
         };
         let outcome = self.llm.stream_message(&request, |_| {}).await?;
         let input = outcome

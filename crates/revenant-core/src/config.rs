@@ -488,7 +488,19 @@ pub struct GatewayConfig {
     /// and analytics is on, defaults to a SQLite file in the gateway home dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_log_url: Option<String>,
+    /// Per-agent identity attribution. When on, the gateway derives
+    /// `agentgateway.user` from the `x-revenant-agent` header the harness sends
+    /// (owner / a subagent name / coder), so analytics, rate limits, and authz
+    /// can be scoped per agent — enforced below the harness. Loopback, so this
+    /// is attribution, not authentication.
+    #[serde(default = "default_true")]
+    pub identity_attribution: bool,
 }
+
+/// Header the harness stamps with the calling agent's identity; the gateway's
+/// `standardAttributes.user` CEL reads it into `agentgateway.user`. Shared so
+/// the renderer and the LLM client agree on the exact name.
+pub const IDENTITY_HEADER: &str = "x-revenant-agent";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -732,6 +744,7 @@ impl Config {
                 endpoint: None,
                 analytics: true,
                 request_log_url: None,
+                identity_attribution: true,
             },
             agent: AgentConfig::default(),
             memory: MemoryConfig::default(),
