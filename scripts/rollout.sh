@@ -38,19 +38,25 @@ say "=== rollout start (force=${FORCE:-no}) ==="
 
 cd "$REPO"
 
-# --- 1. fetch main, decide whether there's anything to do --------------------
-before="$(git rev-parse HEAD)"
+# --- 1. fetch + fast-forward main; converge the DEPLOYED binary to HEAD ------
+# The baseline is what's actually deployed (the marker), not local HEAD — so if
+# the running binary drifts behind HEAD, we still redeploy. Self-healing.
 git fetch --quiet origin main || fail "git fetch failed"
-after="$(git rev-parse origin/main)"
-if [ "$before" = "$after" ] && [ "$FORCE" != "--force" ]; then
-  say "up to date at ${after:0:12} — nothing to roll out"; exit 0
+git merge --ff-only origin/main 2>/dev/null || true   # no-op if already at/ahead
+target="$(git rev-parse HEAD)"
+deployed="$(cat "$RHOME/deployed-sha" 2>/dev/null || echo none)"
+if [ "$target" = "$deployed" ] && [ "$FORCE" != "--force" ]; then
+  say "deployed already at ${target:0:12} — nothing to roll out"; exit 0
 fi
-[ "$before" != "$after" ] && { git merge --ff-only origin/main || fail "fast-forward failed (local main diverged)"; }
-say "rolling out ${before:0:12} -> $(git rev-parse --short HEAD)"
+say "rolling out ${deployed:0:12} -> ${target:0:12}"
 
-# --- 2. build web only when its sources changed (dist is committed) ----------
-if [ "$FORCE" = "--force" ] || ! git diff --quiet "$before" "$after" -- web/src web/index.html web/package.json 2>/dev/null; then
-  say "web sources changed -> rebuilding dist"
+# --- 2. build web only when its sources changed since the deployed sha -------
+web_changed=1
+if [ "$FORCE" != "--force" ] && git cat-file -e "$deployed" 2>/dev/null; then
+  git diff --quiet "$deployed" "$target" -- web/src web/index.html web/package.json 2>/dev/null && web_changed=0
+fi
+if [ "$web_changed" = "1" ]; then
+  say "rebuilding web dist"
   ( cd web && npm ci --silent && npm run build >/dev/null ) || fail "web build failed"
 fi
 
