@@ -11,13 +11,16 @@ use revenant_core::{Event, Tier};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 const CHANNEL: &str = "telegram";
-/// Streaming-edit throttle: at most one editMessageText per this interval.
-const EDIT_INTERVAL: Duration = Duration::from_millis(1500);
-/// Don't bother editing for fewer than this many new chars.
-const EDIT_MIN_DELTA: usize = 48;
+/// Keep the "typing…" indicator alive while a turn runs (Telegram's action
+/// lasts ~5s, so refresh a bit under that).
+const TYPING_REFRESH: Duration = Duration::from_secs(4);
+/// Telegram's hard per-message limit; longer replies are split.
+const TG_MAX: usize = 4000;
 
 // ---- thin Bot API client ----
 
@@ -193,13 +196,6 @@ impl TelegramClient {
 
 /// Per-session streaming state: where the placeholder message lives and
 /// what's been accumulated.
-struct StreamState {
-    chat_id: i64,
-    message_id: i64,
-    buffer: String,
-    last_edit: Instant,
-    edited_len: usize,
-}
 
 #[derive(Clone)]
 pub struct TelegramChannel {
@@ -403,10 +399,30 @@ impl OutboundMirror {
     async fn run(self) {
         let runtime = self.manager.runtime().clone();
         let mut rx = runtime.events.subscribe();
-        // session_id -> stream state, for telegram-bound sessions only.
-        let mut streams: HashMap<i64, StreamState> = HashMap::new();
         // session_id -> chat_id memo (telegram sessions).
         let mut chats: HashMap<i64, i64> = HashMap::new();
+        // Sessions with an in-flight turn → their chat. Shared with a ticker
+        // that keeps the native "typing…" indicator alive, so a slow turn still
+        // feels live WITHOUT a mutating placeholder message.
+        let active: Arc<AsyncMutex<HashMap<i64, i64>>> = Arc::new(AsyncMutex::new(HashMap::new()));
+        // Delta accumulator — a fallback only, used if TurnCompleted arrives
+        // with no text. We no longer edit a live message.
+        let mut buffers: HashMap<i64, String> = HashMap::new();
+
+        {
+            let active = active.clone();
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(TYPING_REFRESH);
+                loop {
+                    tick.tick().await;
+                    let targets: Vec<i64> = active.lock().await.values().copied().collect();
+                    for chat_id in targets {
+                        client.typing(chat_id).await;
+                    }
+                }
+            });
+        }
 
         loop {
             let event = match rx.recv().await {
@@ -419,116 +435,45 @@ impl OutboundMirror {
             };
 
             match event {
-                // A new turn NEVER inherits the previous turn's message. Drop
-                // any stale stream state, then post a placeholder IMMEDIATELY
-                // (for telegram sessions) so the user gets instant feedback —
-                // the deltas edit it in place. This is what makes the bot feel
-                // responsive even when the first token is seconds away
-                // (thinking, tool calls, gateway latency).
+                // A turn begins: show "typing…" (kept alive by the ticker) and
+                // mark the session active. NO placeholder message — the reply
+                // arrives as one clean message when ready, like a real chat.
                 Event::TurnStarted { session_id } => {
-                    streams.remove(&session_id);
+                    buffers.remove(&session_id);
                     if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
+                        active.lock().await.insert(session_id, chat_id);
                         self.client.typing(chat_id).await;
-                        if let Ok(message_id) = self.client.send_message(chat_id, "…").await {
-                            streams.insert(
-                                session_id,
-                                StreamState {
-                                    chat_id,
-                                    message_id,
-                                    buffer: String::new(),
-                                    last_edit: Instant::now(),
-                                    edited_len: 0,
-                                },
-                            );
-                        }
                     }
                 }
+                // Accumulate deltas silently (fallback only) — never edit a
+                // live message; that "replacing bubble" is what felt off.
                 Event::TurnDelta { session_id, text } => {
-                    let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await
-                    else {
-                        continue;
-                    };
-                    let state = match streams.get_mut(&session_id) {
-                        Some(state) => state,
-                        None => {
-                            let Ok(message_id) = self.client.send_message(chat_id, "…").await
-                            else {
-                                continue;
-                            };
-                            streams.insert(
-                                session_id,
-                                StreamState {
-                                    chat_id,
-                                    message_id,
-                                    buffer: String::new(),
-                                    last_edit: Instant::now(),
-                                    edited_len: 0,
-                                },
-                            );
-                            streams.get_mut(&session_id).unwrap()
-                        }
-                    };
-                    state.buffer.push_str(&text);
-                    let grown = state.buffer.len().saturating_sub(state.edited_len);
-                    if state.last_edit.elapsed() >= EDIT_INTERVAL && grown >= EDIT_MIN_DELTA {
-                        let preview = format!("{}▌", clip(&state.buffer, 3900));
-                        if self
-                            .client
-                            .edit_message(state.chat_id, state.message_id, &preview)
-                            .await
-                            .is_ok()
-                        {
-                            state.last_edit = Instant::now();
-                            state.edited_len = state.buffer.len();
-                        }
-                    }
+                    buffers.entry(session_id).or_default().push_str(&text);
                 }
                 Event::TurnCompleted { session_id, text, .. } => {
-                    if let Some(state) = streams.remove(&session_id) {
-                        let final_text =
-                            if text.is_empty() { state.buffer.clone() } else { text.clone() };
-                        if final_text.is_empty() {
-                            // Neither the final text nor any streamed deltas had
-                            // content — editing to an empty string is rejected
-                            // by the Telegram API (400 "message text is empty").
-                            // Leave a terse placeholder instead of a silent
-                            // failed edit call.
-                            let _ = self
-                                .client
-                                .edit_message(state.chat_id, state.message_id, "(no response)")
-                                .await;
+                    active.lock().await.remove(&session_id);
+                    let buffered = buffers.remove(&session_id).unwrap_or_default();
+                    let final_text = if text.is_empty() { buffered } else { text };
+                    if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
+                        if final_text.trim().is_empty() {
+                            let _ = self.client.send_message(chat_id, "(no response)").await;
                         } else {
-                            let _ = self
-                                .client
-                                .edit_message(
-                                    state.chat_id,
-                                    state.message_id,
-                                    &clip(&final_text, 4000),
-                                )
-                                .await;
-                        }
-                    } else if let Some(chat_id) =
-                        self.chat_for(&runtime, &mut chats, session_id).await
-                    {
-                        // Turn produced no deltas we saw (e.g. mirror started
-                        // mid-turn) — send the final text outright.
-                        if !text.is_empty() {
-                            let _ = self.client.send_message(chat_id, &clip(&text, 4000)).await;
+                            self.send_long(chat_id, &final_text).await;
                         }
                     }
                 }
                 Event::TurnFailed { session_id, error } => {
-                    if let Some(state) = streams.remove(&session_id) {
-                        let _ = self
-                            .client
-                            .edit_message(state.chat_id, state.message_id, &format!("⚠️ {error}"))
-                            .await;
+                    active.lock().await.remove(&session_id);
+                    buffers.remove(&session_id);
+                    if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
+                        let _ = self.client.send_message(chat_id, &format!("⚠️ {error}")).await;
                     }
                 }
-                Event::ToolStarted { session_id, summary, .. } => {
+                // Tool activity just refreshes "typing…" — the chat stays clean
+                // (tools are visible in the TUI / web UI).
+                Event::ToolStarted { session_id, .. } => {
                     if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
                         self.client.typing(chat_id).await;
-                        let _ = summary; // keep the chat clean; tools show in TUI/web
                     }
                 }
                 // Loop results pushed to telegram go to every paired chat.
@@ -586,6 +531,17 @@ impl OutboundMirror {
         }
     }
 
+    /// Send a reply as one or more messages (Telegram caps a message near
+    /// 4096 chars). Splitting on line boundaries keeps it readable and, unlike
+    /// an edited bubble, each part actually notifies — it reads as a chat.
+    async fn send_long(&self, chat_id: i64, text: &str) {
+        for part in split_message(text, TG_MAX) {
+            if self.client.send_message(chat_id, &part).await.is_err() {
+                break;
+            }
+        }
+    }
+
     /// Resolve a session to its Telegram chat id (only telegram-channel
     /// sessions map; others are ignored by the mirror).
     async fn chat_for(
@@ -635,6 +591,43 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Split a reply into Telegram-sized pieces, preferring line boundaries so a
+/// message is never chopped mid-line. A single line longer than `max` is
+/// hard-wrapped. Returns `[text]` unchanged when it already fits.
+fn split_message(text: &str, max: usize) -> Vec<String> {
+    if text.chars().count() <= max {
+        return vec![text.to_string()];
+    }
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, parts: &mut Vec<String>| {
+        let trimmed = cur.trim_end_matches('\n');
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+        cur.clear();
+    };
+    for line in text.split_inclusive('\n') {
+        if line.chars().count() > max {
+            flush(&mut cur, &mut parts);
+            let mut rest = line;
+            while rest.chars().count() > max {
+                let cut = rest.char_indices().nth(max).map(|(i, _)| i).unwrap_or(rest.len());
+                parts.push(rest[..cut].to_string());
+                rest = &rest[cut..];
+            }
+            cur.push_str(rest);
+        } else {
+            if cur.chars().count() + line.chars().count() > max {
+                flush(&mut cur, &mut parts);
+            }
+            cur.push_str(line);
+        }
+    }
+    flush(&mut cur, &mut parts);
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +637,33 @@ mod tests {
         assert_eq!(clip("hello", 10), "hello");
         let clipped = clip("héllo wörld", 6);
         assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn split_message_keeps_short_text_whole() {
+        assert_eq!(split_message("hi there", 100), vec!["hi there".to_string()]);
+    }
+
+    #[test]
+    fn split_message_chunks_on_line_boundaries_under_limit() {
+        let text = "line one\nline two\nline three";
+        let parts = split_message(text, 12);
+        assert!(parts.len() >= 2, "expected multiple parts, got {parts:?}");
+        for p in &parts {
+            assert!(p.chars().count() <= 12, "part too long: {p:?}");
+        }
+        // Every original line survives intact across the parts.
+        let joined = parts.join("\n");
+        for line in ["line one", "line two", "line three"] {
+            assert!(joined.contains(line));
+        }
+    }
+
+    #[test]
+    fn split_message_hard_wraps_a_giant_line() {
+        let text = "x".repeat(50);
+        let parts = split_message(&text, 20);
+        assert_eq!(parts.len(), 3); // 20 + 20 + 10
+        assert_eq!(parts.iter().map(|p| p.chars().count()).sum::<usize>(), 50);
     }
 }
