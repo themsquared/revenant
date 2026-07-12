@@ -12,6 +12,10 @@ use std::time::Duration;
 /// Tool results larger than this are truncated in-context (full content
 /// retrieval via ranges comes with `expand_result` in M2).
 const MAX_RESULT_BYTES: usize = 8 * 1024;
+/// Cap for a deliberate file read — far higher than the chat-output cap, since
+/// the agent needs the WHOLE file to edit it. Only pathologically large files
+/// get windowed (with offset/limit paging).
+const READ_MAX_BYTES: usize = 256 * 1024;
 
 /// A minimal file-editing toolset jailed to a single root — the Ascension
 /// actuator uses this to let a coding agent edit an ephemeral git worktree
@@ -180,8 +184,12 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         spec!(
             "read_file",
-            "Read a file from the workspace or skills directory. Relative paths resolve against the workspace.",
-            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})
+            "Read a file. Returns the WHOLE file by default (up to ~256KB) — essential for editing safely. For a bigger file, page it with `offset` (1-based start line) and `limit` (max lines); the response reports the total line count so you know how much remains.",
+            json!({"type":"object","properties":{
+                "path":{"type":"string"},
+                "offset":{"type":"integer","description":"1-based start line (default 1)"},
+                "limit":{"type":"integer","description":"max lines to return (default: to end of file)"}
+            },"required":["path"]})
         )
     }
     fn permission(&self) -> PermissionTier {
@@ -192,9 +200,42 @@ impl Tool for ReadFile {
             Ok(p) => p,
             Err(e) => return e,
         };
-        match self.jail.resolve_read(path).and_then(|p| Ok(std::fs::read_to_string(p)?)) {
-            Ok(content) => ToolOutput::ok(truncate_result(content)),
-            Err(err) => ToolOutput::err(format!("{err:#}")),
+        let content = match self.jail.resolve_read(path).and_then(|p| Ok(std::fs::read_to_string(p)?)) {
+            Ok(c) => c,
+            Err(err) => return ToolOutput::err(format!("{err:#}")),
+        };
+        // A file read returns the FILE — not the 8KB chat-output cap. Truncating
+        // a file the agent means to edit is how you get hallucinated diffs.
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+        let start = (offset - 1).min(total);
+        let mut end = limit.map_or(total, |l| (start + l).min(total));
+        let mut body = lines[start..end].join("\n");
+        // Guard against a pathologically huge window blowing the context.
+        let mut byte_capped = false;
+        if body.len() > READ_MAX_BYTES {
+            let mut cut = READ_MAX_BYTES;
+            while cut > 0 && !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body.truncate(cut);
+            // Recompute how many whole lines actually made it in.
+            end = start + body.lines().count();
+            byte_capped = true;
+        }
+        let windowed = start > 0 || end < total || byte_capped;
+        if windowed {
+            ToolOutput::ok(format!(
+                "[read_file {path}: lines {}–{} of {total}{}. {}]\n{body}",
+                start + 1,
+                end,
+                if byte_capped { " (byte-capped)" } else { "" },
+                if end < total { format!("Pass offset={} to read more.", end + 1) } else { "End of file.".into() },
+            ))
+        } else {
+            ToolOutput::ok(body)
         }
     }
 }
