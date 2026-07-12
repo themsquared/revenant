@@ -108,13 +108,16 @@ impl JobRunner {
         if !root.join(".git").exists() {
             bail!("code root {} is not a git repo (needed for a safe isolated worktree)", p.root);
         }
-        // Escalate on retry: a first pass that produced nothing gets a stronger
-        // model next time (a cheap tier can narrate an edit without making it).
+        // Escalate on retry, but ONLY within the paid API hierarchy — a cheap
+        // API tier can narrate an edit without making it, so bump it. A `local`
+        // (free) job must NEVER auto-escalate to a paid tier: that would silently
+        // charge you for a test you deliberately ran for free. local stays local.
         let base = p.tier.as_deref().unwrap_or("balanced");
         let tier_name = if job.attempts >= 2 {
             match base {
                 "fast" => "balanced",
-                _ => "deep",
+                "balanced" => "deep",
+                other => other, // deep stays deep; local/unknown never escalate
             }
         } else {
             base
