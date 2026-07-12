@@ -2,87 +2,116 @@
 # revenant installer — the agent that comes back.
 #   curl -fsSL https://raw.githubusercontent.com/themsquared/revenant/main/installer/install.sh | sh
 #
-# Detects OS/arch, fetches the pinned revenant + agentgateway binaries into
-# ~/.revenant/bin, verifies checksums, and runs `revenant init`. Keys and the
-# embedding model are handled by init, not this script.
+# Detects OS/arch, fetches the pinned revenant binaries into ~/.revenant/bin,
+# verifies the checksum, and puts `revenant` on your PATH. It does NOT prompt for
+# anything (stdin is the pipe) — the guided setup (keys, gateway, first chat)
+# happens when you run `revenant`, in your real terminal.
 set -eu
 
 REPO="themsquared/revenant"
 BIN_DIR="${REVENANT_HOME:-$HOME/.revenant}/bin"
 LOCAL_BIN="$HOME/.local/bin"
 
-say() { printf '\033[1;35mrevenant\033[0m %s\n' "$1"; }
-die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+# Colour only when writing to a terminal (not when piped to a file/log).
+if [ -t 1 ]; then
+  P='\033[1;35m'; G='\033[1;32m'; Y='\033[1;33m'; R='\033[1;31m'; B='\033[1m'; D='\033[2m'; X='\033[0m'
+else
+  P=''; G=''; Y=''; R=''; B=''; D=''; X=''
+fi
+line() { printf '%b\n' "$1"; }
+step() { printf '  %b▸%b %b\n' "$P" "$X" "$1"; }
+ok()   { printf '  %b✓%b %b\n' "$G" "$X" "$1"; }
+warn() { printf '  %b!%b %b\n' "$Y" "$X" "$1"; }
+die()  { printf '\n  %b✗ %s%b\n\n' "$R" "$1" "$X" >&2; exit 1; }
 
-# --- detect platform ---
+line ""
+line "  ${P}🜁  R E V E N A N T${X}"
+line "  ${D}the agent that comes back${X}"
+line ""
+
+# --- detect platform ---------------------------------------------------------
 os="$(uname -s)"; arch="$(uname -m)"
 case "$os" in
   Darwin) case "$arch" in
             arm64|aarch64) triple="aarch64-apple-darwin" ;;
-            *) die "unsupported macOS arch: $arch (only Apple Silicon prebuilt; build from source)" ;;
+            *) die "unsupported macOS arch '$arch' — only Apple Silicon is prebuilt (build from source)." ;;
           esac ;;
   Linux)  case "$arch" in
             x86_64|amd64)  triple="x86_64-unknown-linux-musl" ;;
             aarch64|arm64) triple="aarch64-unknown-linux-musl" ;;
-            *) die "unsupported Linux arch: $arch" ;;
+            *) die "unsupported Linux arch '$arch'." ;;
           esac ;;
-  *) die "unsupported OS: $os (try the container image)" ;;
+  *) die "unsupported OS '$os' — try the container image." ;;
 esac
-say "platform: $triple"
+step "platform    ${B}$triple${X}"
 
-# --- resolve version ---
+# --- resolve version ---------------------------------------------------------
 VERSION="${REVENANT_VERSION:-latest}"
 if [ "$VERSION" = "latest" ]; then
-  VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+  VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
-  [ -n "$VERSION" ] || die "could not resolve latest release (set REVENANT_VERSION)"
+  [ -n "$VERSION" ] || die "couldn't reach GitHub to resolve the latest release (offline? rate-limited? set REVENANT_VERSION)."
 fi
-say "version: $VERSION"
+step "version     ${B}$VERSION${X}"
+[ -x "$BIN_DIR/revenant" ] && step "${D}(upgrading an existing install)${X}"
 
 base="https://github.com/$REPO/releases/download/$VERSION"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-
-fetch() { # <name>
-  say "downloading $1"
-  curl -fSL --progress-bar "$base/$1" -o "$tmp/$1" || die "download failed: $1"
-}
-
 tarball="revenant-$VERSION-$triple.tar.gz"
-fetch "$tarball"
-fetch "SHA256SUMS"
 
-# --- verify checksum ---
-say "verifying checksum"
+# --- download ----------------------------------------------------------------
+step "downloading ${D}$tarball${X}"
+curl -fSL --progress-bar "$base/$tarball" -o "$tmp/$tarball" || die "download failed — is $VERSION built for $triple yet?"
+curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || die "couldn't fetch SHA256SUMS."
+
+# --- verify (never trust a byte we didn't checksum) --------------------------
 ( cd "$tmp" && grep " $tarball\$" SHA256SUMS | (
-    if command -v sha256sum >/dev/null 2>&1; then sha256sum -c -;
-    else shasum -a 256 -c -; fi
-  ) ) || die "checksum verification failed"
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum -c - >/dev/null
+    else shasum -a 256 -c - >/dev/null; fi
+  ) ) || die "checksum verification FAILED — refusing to install. Try again or report this."
+ok "checksum verified"
 
-# --- install ---
+# --- install -----------------------------------------------------------------
 mkdir -p "$BIN_DIR"
 tar -xzf "$tmp/$tarball" -C "$BIN_DIR"
 chmod +x "$BIN_DIR/revenant" "$BIN_DIR/revenant-tui" 2>/dev/null || true
-say "installed to $BIN_DIR"
+ok "installed → ${D}$BIN_DIR${X}"
 
-# Symlink onto PATH if ~/.local/bin is available.
-if printf '%s' "$PATH" | grep -q "$LOCAL_BIN"; then
+# --- put it on PATH ----------------------------------------------------------
+on_path=0
+case ":$PATH:" in *":$LOCAL_BIN:"*) on_path=1 ;; esac
+linked=0
+if [ "$on_path" = "1" ]; then
   mkdir -p "$LOCAL_BIN"
   ln -sf "$BIN_DIR/revenant" "$LOCAL_BIN/revenant"
   ln -sf "$BIN_DIR/revenant-tui" "$LOCAL_BIN/revenant-tui"
-  say "linked into $LOCAL_BIN"
-else
-  say "add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\""
+  ok "linked → ${D}$LOCAL_BIN/revenant${X}"
+  linked=1
 fi
 
-# --- init (fetches agentgateway + embedding model, prompts for keys) ---
-say "running setup…"
-"$BIN_DIR/revenant" init
-
-cat <<EOF
-
-$(say "done.")
-  revenant chat            # talk to it
-  revenant service install # run it always-on
-  revenant open            # web UI
-EOF
+# --- done: hand off to the guided first run ----------------------------------
+line ""
+line "  ${G}${B}✓ Revenant is on your machine.${X}"
+line ""
+if [ "$linked" = "1" ]; then
+  line "  ${B}Next — run it:${X}"
+  line ""
+  line "      ${P}revenant${X}"
+else
+  # Not on PATH: give the exact one-liner for their shell, then the run command.
+  rc="$HOME/.profile"
+  case "${SHELL:-}" in *zsh) rc="$HOME/.zshrc" ;; *bash) rc="$HOME/.bashrc" ;; esac
+  warn "${LOCAL_BIN} isn't on your PATH yet."
+  line ""
+  line "  ${B}Add it, then run revenant:${X}"
+  line ""
+  line "      ${P}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> $rc${X}"
+  line "      ${P}. $rc && revenant${X}"
+  line ""
+  line "  ${D}(or run it directly: $BIN_DIR/revenant)${X}"
+fi
+line ""
+line "  ${D}A one-time guided setup — how it'll think, then you're chatting.${X}"
+line "  ${D}No config files, no docs.  ·  https://revenantai.dev${X}"
+line ""
