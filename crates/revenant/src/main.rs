@@ -2112,6 +2112,9 @@ async fn cmd_spend(window: String) -> Result<()> {
             cfg.spending.interval,
         );
     }
+    if let Some(line) = daily_budget_line(&cfg, &client).await {
+        println!("\n  {line}");
+    }
 
     // Gateway-authoritative view: what the gateway actually metered, below the
     // harness. Fails soft — the local numbers above still stand if it's down.
@@ -2135,6 +2138,45 @@ async fn cmd_spend(window: String) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A one-line "daily budget: [████░░░░░░] $2.10 / $4.00 (52%)" status, or None
+/// when no daily budget is configured (or it can't be priced). Shows the same
+/// budget the background alert watches, so it's actionable before an alert fires.
+async fn daily_budget_line(
+    cfg: &revenant_core::config::Config,
+    client: &revenant_client::Client,
+) -> Option<String> {
+    let priced = !cfg.pricing.is_empty();
+    let (unit_usd, budget) = match (cfg.spending.daily_budget_usd, cfg.spending.daily_budget_tokens) {
+        (Some(b), _) if priced && b > 0.0 => (true, b),
+        (_, Some(b)) if b > 0 => (false, b as f64),
+        _ => return None,
+    };
+    let today = client.spend("today").await.ok()?;
+    let spent: f64 = if unit_usd {
+        today
+            .iter()
+            .filter_map(|r| {
+                cfg.pricing.get(&r.model).map(|p| {
+                    r.tokens_in as f64 / 1e6 * p.input_per_mtok
+                        + r.tokens_out as f64 / 1e6 * p.output_per_mtok
+                })
+            })
+            .sum()
+    } else {
+        today.iter().map(|r| (r.tokens_in + r.tokens_out) as f64).sum()
+    };
+    let frac = if budget > 0.0 { spent / budget } else { 0.0 };
+    let pct = (frac * 100.0).round() as i64;
+    let filled = (frac.clamp(0.0, 1.0) * 10.0).round() as usize;
+    let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(10 - filled));
+    let (spent_s, budget_s) = if unit_usd {
+        (format!("${spent:.2}"), format!("${budget:.2}"))
+    } else {
+        (format!("{} tok", spent as i64), format!("{} tok", budget as i64))
+    };
+    Some(format!("daily budget: {bar} {spent_s} / {budget_s} ({pct}%)"))
 }
 
 async fn cmd_jobs(action: Vec<String>) -> Result<()> {

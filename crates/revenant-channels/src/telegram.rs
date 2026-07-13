@@ -285,6 +285,21 @@ impl TelegramChannel {
             .await
             .unwrap_or(false);
 
+        // /help and /start work in any state so commands are discoverable.
+        if text == "/help" || text == "/start" {
+            let msg = if allowed {
+                "Commands:\n\
+                 /stop — stop the turn I'm running\n\
+                 /persona <name|off> — switch my voice (no name lists them)\n\
+                 /help — this list\n\n\
+                 Otherwise just talk to me — I stream replies as I go, and you can send more mid-turn to steer or queue it."
+            } else {
+                "This agent is private. Pair with a code from `revenant pair` on the host:\n/pair <code>"
+            };
+            let _ = self.client.send_message(chat_id, msg).await;
+            return;
+        }
+
         // Pairing flow for unknown chats.
         if !allowed {
             if let Some(code) = text.strip_prefix("/pair ").map(str::trim) {

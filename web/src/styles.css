@@ -198,6 +198,13 @@ button:disabled { opacity: 0.5; cursor: default; }
 .spend-head:first-child { margin-top: 0; }
 .spend-head .muted { color: var(--dim); text-transform: none; letter-spacing: 0; font-weight: 400; }
 .bar-row.total { border-top: 1px solid var(--border, #333); padding-top: 8px; font-weight: 600; }
+.budget-gauge { padding: 12px 14px; margin-bottom: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); }
+.budget-gauge .budget-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 8px; }
+.budget-gauge .budget-nums { color: var(--dim); }
+.budget-gauge .bar { height: 10px; }
+.budget-gauge.warn .bar.in { background: #fbbf24; }
+.budget-gauge.over .bar.in { background: var(--no); }
+.budget-gauge.over .budget-nums { color: var(--no); }
 
 a { color: var(--accent-2); }
 

@@ -419,17 +419,35 @@ function Spend() {
   const [window, setWindow] = useState('today')
   const [rows, setRows] = useState([])
   const [gw, setGw] = useState(null) // gateway analytics (authoritative)
+  const [budget, setBudget] = useState(null) // daily budget gauge, or null
   useEffect(() => {
     api.spend(window).then((r) => setRows(r.by_model))
   }, [window])
   useEffect(() => {
     api.analytics().then(setGw).catch(() => setGw({ available: false, error: 'unreachable' }))
   }, [])
+  useEffect(() => {
+    // Daily budget gauge — computed server-side (same math as the alert).
+    api.budget()
+      .then((b) => setBudget(b && b.configured ? b : null))
+      .catch(() => setBudget(null))
+  }, [])
 
   const storeMax = Math.max(1, ...rows.map((r) => r.tokens_in + r.tokens_out))
   const gwMax = Math.max(1, ...((gw?.by_provider) || []).map((g) => g.total_tokens))
   return (
     <div className="spend">
+      {budget && (
+        <div className={`budget-gauge${budget.frac >= 1 ? ' over' : budget.frac >= 0.8 ? ' warn' : ''}`}>
+          <div className="budget-head">
+            <span>daily budget</span>
+            <span className="budget-nums">{budget.spent} / {budget.budget} · {budget.pct}%</span>
+          </div>
+          <div className="bar-track">
+            <div className="bar in" style={{ width: `${Math.min(100, budget.frac * 100)}%` }} />
+          </div>
+        </div>
+      )}
       {/* Gateway-authoritative view: what agentgateway actually metered. */}
       <h3 className="spend-head">Gateway · authoritative <span className="muted">· last 24h</span></h3>
       {gw && gw.available && gw.by_provider.length > 0 && (

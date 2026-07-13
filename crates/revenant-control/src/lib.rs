@@ -81,6 +81,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/loops/:id/runs", get(loop_runs))
         .route("/v1/loops/:id", axum::routing::delete(loop_delete).patch(loop_patch))
         .route("/v1/spend", get(spend))
+        .route("/v1/budget", get(budget))
         .route("/v1/analytics", get(analytics))
         .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
@@ -492,6 +493,66 @@ async fn spend(
     };
     let rows = state.manager.runtime().store.spend_since(from).await?;
     Ok(Json(json!({ "window": q.window, "by_model": rows })))
+}
+
+/// Today's spend vs the configured soft daily budget — the same math the
+/// background alert uses, for the web gauge. `configured:false` when no daily
+/// budget is set (or a USD budget can't be priced).
+async fn budget(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let cfg = revenant_core::config::Config::from_toml(
+        &std::fs::read_to_string(state.home.config_path()).unwrap_or_default(),
+    )
+    .map_err(|e| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("parse config: {e}") })?;
+
+    let priced = !cfg.pricing.is_empty();
+    let (unit_usd, budget) = match (cfg.spending.daily_budget_usd, cfg.spending.daily_budget_tokens) {
+        (Some(b), _) if priced && b > 0.0 => (true, b),
+        (_, Some(b)) if b > 0 => (false, b as f64),
+        _ => return Ok(Json(json!({ "configured": false }))),
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let rows = state.manager.runtime().store.spend_since(now - (now % 86_400)).await?;
+    let spent: f64 = if unit_usd {
+        rows.iter()
+            .filter_map(|r| {
+                cfg.pricing.get(&r.model).map(|p| {
+                    r.tokens_in as f64 / 1e6 * p.input_per_mtok
+                        + r.tokens_out as f64 / 1e6 * p.output_per_mtok
+                })
+            })
+            .sum()
+    } else {
+        rows.iter().map(|r| (r.tokens_in + r.tokens_out) as f64).sum()
+    };
+    let frac = if budget > 0.0 { spent / budget } else { 0.0 };
+    let (spent_s, budget_s) = if unit_usd {
+        (format!("${spent:.2}"), format!("${budget:.2}"))
+    } else {
+        (fmt_tokens(spent), fmt_tokens(budget))
+    };
+    Ok(Json(json!({
+        "configured": true,
+        "unit": if unit_usd { "usd" } else { "tokens" },
+        "spent": spent_s,
+        "budget": budget_s,
+        "pct": (frac * 100.0).round() as i64,
+        "frac": frac,
+    })))
+}
+
+fn fmt_tokens(n: f64) -> String {
+    let n = n as u64;
+    if n >= 1_000_000 {
+        format!("{:.1}M tok", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K tok", n as f64 / 1e3)
+    } else {
+        format!("{n} tok")
+    }
 }
 
 /// Gateway-authoritative spend: what agentgateway actually metered (tokens,

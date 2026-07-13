@@ -44,6 +44,7 @@ export const api = {
   decide: (id, approve) =>
     request('POST', `/v1/approvals/${id}/decision`, { approve, resolver: 'web' }),
   spend: (window) => request('GET', `/v1/spend?window=${window}`),
+  budget: () => request('GET', '/v1/budget'),
   analytics: () => request('GET', '/v1/analytics'),
   skills: () => request('GET', '/v1/skills'),
   tools: () => request('GET', '/v1/tools'),
