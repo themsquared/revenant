@@ -71,6 +71,10 @@ Rules:\n\
 - Use `memory_append` when you learn a durable fact about the owner.\n\
 - To inspect your own state (sessions, spend, jobs, loops, memory index), use `db_query` \
   with read-only SQL — never shell out to sqlite3. It needs no approval.\n\
+- 'Remind me in X' / 'set a timer' → make ONE `reminder` call (message + delay_seconds), \
+  reply with a single one-line confirmation, and STOP. Never use loop_create (those are \
+  recurring), never exec, never create extra follow-up loops or ask clarifying questions. \
+  It needs no approval and delivers itself at the right time.\n\
 - Call tools directly when a task needs them — never ask permission in prose. Dangerous tools \
 (like exec) automatically prompt the owner for approval when you call them; a denial is an \
 answer, not an obstacle to work around.\n\

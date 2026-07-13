@@ -67,6 +67,7 @@ impl JobRunner {
         let store = &self.manager.runtime().store;
         let outcome = match job.kind.as_str() {
             "code" => self.run_code_job(&job).await,
+            "reminder" => self.run_reminder_job(&job).await,
             other => Err(anyhow::anyhow!("unknown job kind '{other}'")),
         };
         match outcome {
@@ -88,6 +89,24 @@ impl JobRunner {
                 );
             }
         }
+    }
+
+    /// A one-shot reminder/timer: the job was scheduled with `run_after` = the
+    /// due time, so simply firing it here delivers the message. Emit a
+    /// ReminderFired event — the Telegram channel (and web UI) pushes it to the
+    /// owner. Fire-once by construction: the job goes `done` and never repeats.
+    async fn run_reminder_job(&self, job: &JobRow) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct ReminderPayload {
+            message: String,
+        }
+        let p: ReminderPayload =
+            serde_json::from_str(&job.payload).context("bad `reminder` job payload (need message)")?;
+        self.manager
+            .runtime()
+            .events
+            .emit(revenant_core::Event::ReminderFired { message: p.message.clone() });
+        Ok(format!("reminder delivered: {}", p.message.chars().take(80).collect::<String>()))
     }
 
     /// A coding subtask: run a jailed coder in an EPHEMERAL git worktree of the

@@ -525,6 +525,14 @@ impl OutboundMirror {
                         }
                     }
                 }
+                // A reminder/timer came due → the owner's pocket.
+                Event::ReminderFired { message } => {
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let _ = self.client.send_message(chat_id, &format!("⏰ {message}")).await;
+                        }
+                    }
+                }
                 // Auto-update news → every paired chat (the owner's pocket).
                 Event::UpdateAvailable { current, latest, channel } => {
                     let from = current.unwrap_or_else(|| "source".into());

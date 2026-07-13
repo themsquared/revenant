@@ -42,6 +42,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(ListDir { jail: read_jail.clone() }),
         Arc::new(Exec { workspace: home.workspace_dir() }),
         Arc::new(DbQuery),
+        Arc::new(Reminder),
         Arc::new(Recall),
         Arc::new(MemorySave),
         Arc::new(MemoryRead { home: home.clone() }),
@@ -531,6 +532,72 @@ impl Tool for DbQuery {
             Err(e) => ToolOutput::err(format!("db_query failed: {e:#}")),
         }
     }
+}
+
+// ---- reminders & timers ----
+
+/// Set a one-shot reminder/timer: deliver `message` to the owner after
+/// `delay_seconds`. Backed by a durable job (`run_after` = due time), so it
+/// fires ONCE at the right time, survives restarts, and needs NO approval —
+/// setting a timer is benign. This is the ONLY correct way to do "remind me in
+/// X": do not use loop_create (those are recurring) or exec.
+struct Reminder;
+
+#[async_trait::async_trait]
+impl Tool for Reminder {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "reminder",
+            "Remind the owner of something after a delay (a one-shot timer). Give the message and delay_seconds (e.g. '15 minutes' = 900). Fires exactly once at that time and delivers to the owner's channel. Use this for any 'remind me in X' / 'set a timer' request — never loop_create (recurring) or exec.",
+            json!({"type":"object","properties":{
+                "message":{"type":"string","description":"what to remind the owner (phrase it as the reminder text)"},
+                "delay_seconds":{"type":"integer","description":"seconds from now to fire (e.g. 15 minutes = 900)"}
+            },"required":["message","delay_seconds"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::WriteWorkspace
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        let message = match arg_str(&args, "message") {
+            Ok(m) => m.to_string(),
+            Err(e) => return e,
+        };
+        let delay = match args.get("delay_seconds").and_then(|v| v.as_i64()) {
+            Some(d) => d.clamp(1, 60 * 60 * 24 * 30), // 1s … 30d
+            None => return ToolOutput::err("delay_seconds must be an integer number of seconds"),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let payload = json!({ "message": message }).to_string();
+        // A reminder that can't be enqueued is worth surfacing; a couple of
+        // retries covers a transient store hiccup without spamming.
+        if let Err(e) = cx.store.job_enqueue("reminder", &payload, "reminder", 3, now + delay).await {
+            return ToolOutput::err(format!("couldn't set the reminder: {e:#}"));
+        }
+        ToolOutput::ok(format!("⏰ Reminder set for {} from now: {message}", human_delay(delay)))
+    }
+}
+
+/// "900" → "15m", "90" → "1m30s", "7200" → "2h". Compact, for the confirmation.
+fn human_delay(secs: i64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if s > 0 && h == 0 {
+        out.push_str(&format!("{s}s"));
+    }
+    if out.is_empty() {
+        out.push_str("0s");
+    }
+    out
 }
 
 // ---- memory & recall ----
@@ -1795,6 +1862,44 @@ mod dbquery_tests {
             assert!(out.is_error, "write must be refused: {bad}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reminder_enqueues_one_shot_job() {
+        let dir = std::env::temp_dir().join(format!("rev-rem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("t.db")).unwrap();
+        let cx = ToolCx {
+            session_id: 1,
+            home: revenant_core::home::Home::resolve(),
+            store,
+            memory: None,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let out = Reminder
+            .invoke(&cx, json!({ "message": "go upstairs", "delay_seconds": 900 }))
+            .await;
+        assert!(!out.is_error, "reminder should set cleanly: {}", out.content);
+        assert!(out.content.contains("15m"), "confirmation shows the delay: {}", out.content);
+
+        // Exactly one durable, one-shot `reminder` job, due ~15m out.
+        let jobs = cx.store.jobs_list(10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, "reminder");
+        assert!((jobs[0].run_after - (now + 900)).abs() <= 2, "run_after ≈ now+900");
+        assert!(jobs[0].payload.contains("go upstairs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn human_delay_reads_naturally() {
+        assert_eq!(human_delay(900), "15m");
+        assert_eq!(human_delay(90), "1m30s");
+        assert_eq!(human_delay(7200), "2h");
+        assert_eq!(human_delay(45), "45s");
     }
 }
 

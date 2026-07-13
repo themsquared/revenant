@@ -278,6 +278,7 @@ async fn events(
                 revenant_core::Event::UpdateInstalled { .. } => "update_installed",
                 revenant_core::Event::ContextFolded { .. } => "context_folded",
                 revenant_core::Event::TaskQueued { .. } => "task_queued",
+                revenant_core::Event::ReminderFired { .. } => "reminder_fired",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())

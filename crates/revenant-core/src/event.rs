@@ -105,6 +105,10 @@ pub enum Event {
         session_id: i64,
         task: String,
     },
+    /// A one-shot reminder/timer came due — deliver its message to the owner.
+    ReminderFired {
+        message: String,
+    },
 }
 
 impl Event {
