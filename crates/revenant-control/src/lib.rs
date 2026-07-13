@@ -65,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/events", get(events))
         .route("/v1/sessions", get(sessions_list).post(session_create))
         .route("/v1/sessions/:id/messages", get(messages_list).post(message_send))
+        .route("/v1/sessions/:id/cancel", post(session_cancel))
         .route("/v1/code", post(code))
         .route("/v1/approvals", get(approvals_pending))
         .route("/v1/approvals/:id/decision", post(approval_decide))
@@ -280,6 +281,7 @@ async fn events(
                 revenant_core::Event::TaskQueued { .. } => "task_queued",
                 revenant_core::Event::ReminderFired { .. } => "reminder_fired",
                 revenant_core::Event::ComplexityRouted { .. } => "complexity_routed",
+                revenant_core::Event::TurnCancelled { .. } => "turn_cancelled",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())
@@ -564,6 +566,16 @@ async fn personalities_list(State(state): State<AppState>) -> Json<serde_json::V
 struct PersonaBody {
     /// null clears the persona (back to default voice).
     persona: Option<String>,
+}
+
+/// Stop the running turn for a session. `running: false` means nothing was in
+/// flight — not an error (idempotent from the UI's perspective).
+async fn session_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let running = state.manager.runtime().cancel(id);
+    Ok(Json(json!({ "ok": true, "running": running })))
 }
 
 async fn session_set_persona(

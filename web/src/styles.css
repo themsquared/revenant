@@ -100,6 +100,7 @@ main { flex: 1; overflow: hidden; }
   font: inherit;
 }
 .login .error { color: var(--no); }
+.composer button.stop { background: var(--no); }
 
 /* chat */
 .chat { display: flex; height: 100%; }

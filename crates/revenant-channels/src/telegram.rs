@@ -319,6 +319,16 @@ impl TelegramChannel {
         // Paired: route to the session actor.
         match runtime.store.ensure_session(CHANNEL, &peer, "chat").await {
             Ok(session_id) => {
+                // /stop — halt the running turn for this chat.
+                if text.trim() == "/stop" {
+                    let reply = if runtime.cancel(session_id) {
+                        "🛑 stopping…"
+                    } else {
+                        "nothing running to stop"
+                    };
+                    let _ = self.client.send_message(chat_id, reply).await;
+                    return;
+                }
                 // /persona <name|off> — switch the voice for this chat.
                 if let Some(rest) = text.strip_prefix("/persona") {
                     let choice = rest.trim();
@@ -484,6 +494,18 @@ impl OutboundMirror {
                     buffers.remove(&session_id);
                     if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
                         let _ = self.client.send_message(chat_id, &format!("⚠️ {error}")).await;
+                    }
+                }
+                // Owner stopped the turn — flush any partial text so nothing is
+                // lost, then confirm.
+                Event::TurnCancelled { session_id } => {
+                    active.lock().await.remove(&session_id);
+                    let buffered = buffers.remove(&session_id).unwrap_or_default();
+                    if let Some(chat_id) = self.chat_for(&runtime, &mut chats, session_id).await {
+                        if !buffered.trim().is_empty() {
+                            self.send_long(chat_id, &buffered).await;
+                        }
+                        let _ = self.client.send_message(chat_id, "🛑 stopped").await;
                     }
                 }
                 // Tool activity just refreshes "typing…" — the chat stays clean

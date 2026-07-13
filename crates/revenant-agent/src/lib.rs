@@ -22,6 +22,7 @@ use revenant_tools::{ToolCx, ToolRegistry};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Max tool calls dispatched concurrently within a single turn.
 const CONCURRENT_TOOLS: usize = 8;
@@ -42,21 +43,30 @@ pub struct Interjection {
 }
 
 /// RAII marker: a session is "active" (top-level turn in flight) for the life
-/// of this guard, so interjection routing knows to hold new input. Cleared on
-/// drop — including on error/panic paths out of the turn.
+/// of this guard, so interjection routing knows to hold new input, and its
+/// cancellation token is registered so the owner can stop the turn. Both are
+/// cleared on drop — including on error/panic paths out of the turn.
 struct ActiveGuard {
     set: Arc<Mutex<HashSet<i64>>>,
+    cancels: Arc<Mutex<HashMap<i64, CancellationToken>>>,
     session_id: i64,
 }
 impl ActiveGuard {
-    fn new(set: &Arc<Mutex<HashSet<i64>>>, session_id: i64) -> Self {
+    fn new(
+        set: &Arc<Mutex<HashSet<i64>>>,
+        cancels: &Arc<Mutex<HashMap<i64, CancellationToken>>>,
+        session_id: i64,
+        token: CancellationToken,
+    ) -> Self {
         set.lock().unwrap().insert(session_id);
-        ActiveGuard { set: set.clone(), session_id }
+        cancels.lock().unwrap().insert(session_id, token);
+        ActiveGuard { set: set.clone(), cancels: cancels.clone(), session_id }
     }
 }
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.set.lock().unwrap().remove(&self.session_id);
+        self.cancels.lock().unwrap().remove(&self.session_id);
     }
 }
 
@@ -185,6 +195,10 @@ pub struct AgentRuntime {
     /// Complexity router: when Some(tier), obviously-trivial turns are routed
     /// DOWN to that (cheap/fast) tier. None when disabled or misconfigured.
     pub complexity_router: Option<Tier>,
+    /// Cancellation tokens for in-flight top-level turns, keyed by session. The
+    /// owner stops a runaway turn via `cancel(session_id)`; the turn loop trips
+    /// the token at its next safe boundary (and mid-stream) and returns.
+    pub cancels: Arc<Mutex<HashMap<i64, CancellationToken>>>,
 }
 
 impl AgentRuntime {
@@ -250,6 +264,19 @@ impl AgentRuntime {
         self.run_turn_inner(session_id, tier, user_content, 0, None).await
     }
 
+    /// Stop a running top-level turn for `session_id`. Returns true if a turn
+    /// was in flight (and has now been signalled to stop at its next safe
+    /// boundary), false if the session wasn't running. Idempotent.
+    pub fn cancel(&self, session_id: i64) -> bool {
+        match self.cancels.lock().unwrap().get(&session_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// How many recent messages to pull for the context window. Must be large
     /// enough to always contain the CURRENT turn's anchoring user message —
     /// otherwise a long tool-using turn (up to ~2 messages per iteration) fills
@@ -296,6 +323,7 @@ impl AgentRuntime {
             privacy: None,
             // Subagents/coder run at a deliberately-chosen tier; don't second-guess it.
             complexity_router: None,
+            cancels: self.cancels.clone(),
         }
     }
 
@@ -485,9 +513,14 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         let mut tools_used: Vec<String> = Vec::new();
 
         // Mark this session active (top-level turns only) so mid-turn messages
-        // are held as interjections instead of waiting behind the whole turn.
-        // Cleared when this turn returns (RAII), even on error.
-        let _active = (depth == 0).then(|| ActiveGuard::new(&self.active_turns, session_id));
+        // are held as interjections instead of waiting behind the whole turn,
+        // and register its cancellation token so the owner can stop it. Cleared
+        // when this turn returns (RAII), even on error. Subagents (depth>0) get
+        // a detached token that is never registered and so never trips.
+        let cancel = CancellationToken::new();
+        let _active = (depth == 0).then(|| {
+            ActiveGuard::new(&self.active_turns, &self.cancels, session_id, cancel.clone())
+        });
 
         // Soft budget = configured max_iterations; past it the turn auto-continues
         // while it's still making progress, up to `ceiling`. This is what stops
@@ -497,6 +530,14 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         let mut stalled_rounds = 0u32;
 
         for iteration in 1..=ceiling {
+            // Owner asked to stop — return promptly with whatever we have. The
+            // last persisted message is a valid boundary; a dangling tool_use
+            // from a half-finished round is healed by sanitize_history next turn.
+            if cancel.is_cancelled() {
+                tracing::info!("session {session_id}: turn cancelled by owner");
+                self.events.emit(Event::TurnCancelled { session_id });
+                return Ok(TurnStats { usage: total_usage, routed_model, iterations: iteration, final_text });
+            }
             let history = self.store.history(session_id, self.history_limit()).await?;
             let messages: Vec<WireMessage> = history
                 .into_iter()
@@ -539,18 +580,30 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             };
 
             // Stream, with one retry when nothing was emitted yet (failover).
+            // Race the stream against cancellation so a stop mid-generation is
+            // immediate — dropping the future closes the gateway connection.
             let events = self.events.clone();
             let mut streamed = false;
-            let outcome = match self
-                .llm
-                .stream_message(&request, |delta| {
+            let stream_res = {
+                let stream_fut = self.llm.stream_message(&request, |delta| {
                     streamed = true;
                     events.emit(Event::TurnDelta { session_id, text: delta.to_string() });
-                })
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) if !streamed => {
+                });
+                tokio::pin!(stream_fut);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    r = &mut stream_fut => Some(r),
+                }
+            };
+            let outcome = match stream_res {
+                None => {
+                    tracing::info!("session {session_id}: turn cancelled mid-stream");
+                    self.events.emit(Event::TurnCancelled { session_id });
+                    return Ok(TurnStats { usage: total_usage, routed_model, iterations: iteration, final_text });
+                }
+                Some(Ok(outcome)) => outcome,
+                Some(Err(err)) if !streamed => {
                     tracing::warn!("attempt failed ({err:#}); retrying once for failover");
                     let events = self.events.clone();
                     self.llm
@@ -559,7 +612,7 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
                         })
                         .await?
                 }
-                Err(err) => return Err(err),
+                Some(Err(err)) => return Err(err),
             };
 
             total_usage.merge(&outcome.usage);
@@ -632,6 +685,15 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
                     iterations: iteration,
                     final_text,
                 });
+            }
+
+            // Owner asked to stop before we kick off this round's tool calls —
+            // don't start work the turn no longer wants. The persisted assistant
+            // tool_use is a dangling boundary that sanitize_history heals.
+            if cancel.is_cancelled() {
+                tracing::info!("session {session_id}: turn cancelled before tool dispatch");
+                self.events.emit(Event::TurnCancelled { session_id });
+                return Ok(TurnStats { usage: total_usage, routed_model, iterations: iteration, final_text });
             }
 
             // Dispatch tool_use blocks CONCURRENTLY. Models emit multiple

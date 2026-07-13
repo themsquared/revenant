@@ -176,6 +176,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         deferred: Arc::default(),
         privacy: build_privacy(cfg),
         complexity_router: build_complexity_router(cfg),
+        cancels: Arc::default(),
     });
 
     let manager = SessionManager::new(runtime);

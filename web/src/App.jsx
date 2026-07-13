@@ -228,6 +228,15 @@ function Chat({ onApprovalCount, setBanner }) {
             setMessages((prev) => [...prev, { role: 'error', text: event.error }])
           }
           break
+        case 'turn_cancelled':
+          if (mine) {
+            setStreaming(false)
+            setMessages((prev) => [
+              ...prev.map((m) => (m.live ? { ...m, live: false } : m)),
+              { role: 'tool', text: '🛑 stopped' },
+            ])
+          }
+          break
         case 'approval_created':
           setApproval(event)
           onApprovalCount((c) => c + 1)
@@ -256,6 +265,15 @@ function Chat({ onApprovalCount, setBanner }) {
       await api.send(sessionId, text)
     } catch (err) {
       setMessages((prev) => [...prev, { role: 'error', text: String(err) }])
+    }
+  }
+
+  const stop = async () => {
+    if (!sessionId) return
+    try {
+      await api.cancel(sessionId)
+    } catch {
+      /* best-effort; the SSE turn_cancelled event flips streaming off */
     }
   }
 
@@ -329,9 +347,13 @@ function Chat({ onApprovalCount, setBanner }) {
             placeholder={streaming ? 'streaming…' : 'message revenant'}
             autoFocus
           />
-          <button onClick={send} disabled={streaming}>
-            send
-          </button>
+          {streaming ? (
+            <button className="stop" onClick={stop} title="stop the running turn">
+              stop
+            </button>
+          ) : (
+            <button onClick={send}>send</button>
+          )}
         </div>
       </section>
     </div>

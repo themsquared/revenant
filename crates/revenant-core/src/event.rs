@@ -117,6 +117,11 @@ pub enum Event {
         from: String,
         to: String,
     },
+    /// The owner stopped a running turn (via UI/Telegram/API). The turn returns
+    /// promptly at the next safe boundary with whatever it had.
+    TurnCancelled {
+        session_id: i64,
+    },
 }
 
 impl Event {
@@ -130,7 +135,8 @@ impl Event {
             | Event::TurnFailed { session_id, .. }
             | Event::ApprovalCreated { session_id, .. }
             | Event::PrivacyRouted { session_id, .. }
-            | Event::ComplexityRouted { session_id, .. } => Some(*session_id),
+            | Event::ComplexityRouted { session_id, .. }
+            | Event::TurnCancelled { session_id } => Some(*session_id),
             Event::SubagentSpawned { parent_session, .. }
             | Event::SubagentFinished { parent_session, .. } => Some(*parent_session),
             _ => None,
