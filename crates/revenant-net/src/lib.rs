@@ -13,7 +13,7 @@ pub mod attest;
 pub mod client;
 pub mod identity;
 pub mod ledger;
-pub mod post;
+pub mod scroll;
 
 pub use artifact::{Artifact, ArtifactKind};
 pub use client::{LedgerHead, NecropolisClient};
