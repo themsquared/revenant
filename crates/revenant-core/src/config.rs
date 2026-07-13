@@ -18,6 +18,9 @@ pub struct Config {
     /// Complexity router: keep trivial turns cheap and snappy (on by default).
     #[serde(default)]
     pub router: RouterConfig,
+    /// Behavioral self-review: reflect on own performance, adjust (on by default).
+    #[serde(default)]
+    pub introspection: IntrospectionConfig,
     /// Global gateway-enforced spend cap (the intelligent-spending ceiling).
     #[serde(default)]
     pub spending: SpendingConfig,
@@ -195,6 +198,55 @@ impl Default for RouterConfig {
 }
 
 fn default_router_fast_tier() -> String {
+    "fast".to_string()
+}
+
+/// Behavioral self-review: on an interval, the agent reads its OWN recent
+/// performance (spend, tool errors, turn failures/cancellations, mid-turn
+/// corrections, denied approvals) and (re)writes a small set of operating
+/// lessons that get injected into every turn's system prompt — so it visibly
+/// adjusts how it works. Heavier changes are surfaced as suggestions for the
+/// owner, never auto-applied. On by default; the daily LLM call is cheap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntrospectionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How often the background self-review runs, in seconds (default daily).
+    #[serde(default = "default_introspect_interval")]
+    pub interval_secs: u64,
+    /// How far back each review looks at performance, in seconds (default 3d).
+    #[serde(default = "default_introspect_lookback")]
+    pub lookback_secs: i64,
+    /// Cap on operating notes kept in force (the reviewer prunes to this).
+    #[serde(default = "default_introspect_max_notes")]
+    pub max_notes: usize,
+    /// Model tier the review runs on (cheap by design).
+    #[serde(default = "default_introspect_tier")]
+    pub tier: String,
+}
+
+impl Default for IntrospectionConfig {
+    fn default() -> Self {
+        IntrospectionConfig {
+            enabled: true,
+            interval_secs: default_introspect_interval(),
+            lookback_secs: default_introspect_lookback(),
+            max_notes: default_introspect_max_notes(),
+            tier: default_introspect_tier(),
+        }
+    }
+}
+
+fn default_introspect_interval() -> u64 {
+    86_400
+}
+fn default_introspect_lookback() -> i64 {
+    259_200
+}
+fn default_introspect_max_notes() -> usize {
+    10
+}
+fn default_introspect_tier() -> String {
     "fast".to_string()
 }
 
@@ -846,6 +898,7 @@ impl Config {
             channels: ChannelsConfig::default(),
             privacy: PrivacyConfig::default(),
             router: RouterConfig::default(),
+            introspection: IntrospectionConfig::default(),
             spending: SpendingConfig::default(),
             ascension: AscensionConfig::default(),
             network: NetworkConfig::default(),

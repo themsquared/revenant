@@ -53,6 +53,13 @@ pub struct SpendView {
     pub requests: i64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SelfReviewView {
+    pub summary: String,
+    pub lessons: Vec<String>,
+    pub suggestions: Vec<String>,
+}
+
 impl Client {
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
         Client {
@@ -197,6 +204,17 @@ impl Client {
             .json::<Resp>()
             .await?
             .by_model)
+    }
+
+    /// Trigger a behavioral self-review and return its result.
+    pub async fn introspect(&self) -> Result<SelfReviewView> {
+        Ok(self
+            .req(reqwest::Method::POST, "/v1/introspect")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<SelfReviewView>()
+            .await?)
     }
 
     /// Set (or clear, with None) a session's personality.

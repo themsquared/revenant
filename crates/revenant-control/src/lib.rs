@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/loops/:id", axum::routing::delete(loop_delete).patch(loop_patch))
         .route("/v1/spend", get(spend))
         .route("/v1/budget", get(budget))
+        .route("/v1/introspect", post(introspect))
         .route("/v1/analytics", get(analytics))
         .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
@@ -284,6 +285,7 @@ async fn events(
                 revenant_core::Event::ComplexityRouted { .. } => "complexity_routed",
                 revenant_core::Event::TurnCancelled { .. } => "turn_cancelled",
                 revenant_core::Event::BudgetAlert { .. } => "budget_alert",
+                revenant_core::Event::SelfReviewCompleted { .. } => "self_review_completed",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())
@@ -541,6 +543,29 @@ async fn budget(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         "budget": budget_s,
         "pct": (frac * 100.0).round() as i64,
         "frac": frac,
+    })))
+}
+
+/// Run a behavioral self-review on demand and return what it found/changed.
+async fn introspect(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let cfg = revenant_core::config::Config::from_toml(
+        &std::fs::read_to_string(state.home.config_path()).unwrap_or_default(),
+    )
+    .unwrap_or_else(|_| revenant_core::config::Config::default_config());
+    let i = &cfg.introspection;
+    let review = state
+        .manager
+        .runtime()
+        .self_review(i.lookback_secs, i.max_notes, &i.tier)
+        .await
+        .map_err(|e| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("self-review failed: {e:#}"),
+        })?;
+    Ok(Json(json!({
+        "summary": review.summary,
+        "lessons": review.lessons,
+        "suggestions": review.suggestions,
     })))
 }
 

@@ -89,6 +89,7 @@ export function eventStream(onEvent) {
     'task_queued',
     'turn_cancelled',
     'budget_alert',
+    'self_review_completed',
   ]) {
     source.addEventListener(name, forward)
   }

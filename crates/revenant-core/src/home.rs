@@ -67,6 +67,13 @@ impl Home {
     pub fn memory_dir(&self) -> PathBuf {
         self.workspace_dir().join("memory")
     }
+    /// Operating notes: behavioral lessons the agent draws from reviewing its
+    /// own recent performance. Injected into the system prompt each turn, like
+    /// MEMORY.md — the agent literally re-reads what it's learned about doing
+    /// its job well. Curated/rewritten by the self-review, editable by the owner.
+    pub fn operating_notes(&self) -> PathBuf {
+        self.workspace_dir().join("OPERATING_NOTES.md")
+    }
     pub fn models_dir(&self) -> PathBuf {
         self.root.join("models")
     }

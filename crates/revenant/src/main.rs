@@ -8,6 +8,7 @@ mod ascend_loop;
 mod autoupdate;
 mod budget;
 mod daemon;
+mod introspect;
 mod repl;
 mod service;
 
@@ -214,6 +215,10 @@ enum Command {
         #[arg(long, default_value = "today")]
         window: String,
     },
+    /// Self-review now: the agent reads its own recent performance and rewrites
+    /// its operating notes (the lessons it applies every turn). Shows what it
+    /// noticed, the notes now in force, and any suggestions for you.
+    Introspect,
     /// Background jobs: list recent, or `show <id>` for detail (async coding etc).
     Jobs {
         /// (empty) to list · show <id>
@@ -355,6 +360,7 @@ async fn run_command(command: Command) -> Result<()> {
             Command::Chat { tier } => repl::cmd_chat(tier).await,
             Command::Status => cmd_status().await,
             Command::Spend { window } => cmd_spend(window).await,
+            Command::Introspect => cmd_introspect().await,
             Command::Jobs { action } => cmd_jobs(action).await,
             Command::Doctor => cmd_doctor().await,
             Command::Update { check } => cmd_update(check),
@@ -2177,6 +2183,35 @@ async fn daily_budget_line(
         (format!("{} tok", spent as i64), format!("{} tok", budget as i64))
     };
     Some(format!("daily budget: {bar} {spent_s} / {budget_s} ({pct}%)"))
+}
+
+async fn cmd_introspect() -> Result<()> {
+    let home = Home::resolve();
+    let client = revenant_client::Client::from_env(&home)
+        .context("self-review needs a running daemon — start it with `revenant up`")?;
+    client
+        .health()
+        .await
+        .context("self-review needs a running daemon — start it with `revenant up`")?;
+    println!("🔎 reviewing my own recent performance…\n");
+    let review = client.introspect().await?;
+    println!("  {}\n", review.summary);
+    if review.lessons.is_empty() {
+        println!("  operating notes: (none)");
+    } else {
+        println!("  operating notes now in force:");
+        for l in &review.lessons {
+            println!("    • {l}");
+        }
+    }
+    if !review.suggestions.is_empty() {
+        println!("\n  suggestions for you (not auto-applied):");
+        for s in &review.suggestions {
+            println!("    → {s}");
+        }
+    }
+    println!("\n  These notes are injected into every turn. Edit them at\n  {}", home.operating_notes().display());
+    Ok(())
 }
 
 async fn cmd_jobs(action: Vec<String>) -> Result<()> {

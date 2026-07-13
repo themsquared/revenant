@@ -619,6 +619,21 @@ impl OutboundMirror {
                         }
                     }
                 }
+                // Self-review finished → tell the owner what it noticed/changed.
+                Event::SelfReviewCompleted { summary, lessons, suggestions } => {
+                    let mut msg = format!("🔎 Self-review: {summary}\n({lessons} operating note(s) in force)");
+                    if !suggestions.is_empty() {
+                        msg.push_str("\n\nSuggestions for you:");
+                        for s in suggestions.iter().take(5) {
+                            msg.push_str(&format!("\n• {s}"));
+                        }
+                    }
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let _ = self.client.send_message(chat_id, &msg).await;
+                        }
+                    }
+                }
                 _ => {}
             }
         }

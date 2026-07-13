@@ -252,6 +252,9 @@ function Chat({ onApprovalCount, setBanner }) {
           // Global (no session_id) — show regardless of the open session.
           setBanner(`💸 ${event.spent} spent today · ${event.pct}% of ${event.budget} daily budget`)
           break
+        case 'self_review_completed':
+          setBanner(`🔎 Self-review: ${event.summary} · ${event.lessons} operating note(s)`)
+          break
         default:
       }
     })

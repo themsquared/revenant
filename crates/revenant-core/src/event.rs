@@ -130,6 +130,15 @@ pub enum Event {
         spent: String,
         budget: String,
     },
+    /// The agent finished a behavioral self-review: it read its own recent
+    /// performance, (re)wrote its operating notes, and may have suggestions for
+    /// the owner. `summary` is one line; `lessons` is the note count now in
+    /// force; `suggestions` are proposed heavier changes awaiting the owner.
+    SelfReviewCompleted {
+        summary: String,
+        lessons: u32,
+        suggestions: Vec<String>,
+    },
 }
 
 impl Event {

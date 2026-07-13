@@ -247,6 +247,22 @@ impl AgentRuntime {
                 stable.push_str(memory.trim());
             }
         }
+        // Operating notes: lessons the agent drew from reviewing its own recent
+        // performance. Top-level turns only — subagents have a fixed directive.
+        if agent.is_none() {
+            if let Ok(notes) = std::fs::read_to_string(self.home.operating_notes()) {
+                let bullets: Vec<&str> = notes
+                    .lines()
+                    .filter(|l| l.trim_start().starts_with("- "))
+                    .collect();
+                if !bullets.is_empty() {
+                    stable.push_str(
+                        "\n\n# Operating notes (lessons from reviewing my own performance — apply them)\n",
+                    );
+                    stable.push_str(&bullets.join("\n"));
+                }
+            }
+        }
         let dynamic = retrieved.map(|block| {
             format!(
                 "# Retrieved memories (relevant to this message; verify with recall if load-bearing)\n{block}"
@@ -1392,6 +1408,249 @@ impl AgentRuntime {
             }
         });
     }
+
+    /// Behavioral self-review: read the agent's OWN recent performance — spend,
+    /// tool errors, and the friction journal (turn failures/cancellations,
+    /// mid-turn corrections, denied approvals) — and (re)write a small set of
+    /// durable operating lessons, which get injected into every turn's system
+    /// prompt. Heavier changes come back as `suggestions` for the owner, never
+    /// auto-applied. Cheap (one small model call) and fail-soft.
+    pub async fn self_review(
+        &self,
+        lookback_secs: i64,
+        max_notes: usize,
+        tier: &str,
+    ) -> Result<SelfReview> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let since = now - lookback_secs.max(3600);
+
+        // --- gather the digest from durable state --------------------------
+        let spend = self.store.spend_since(since).await.unwrap_or_default();
+        let total_tok: i64 = spend.iter().map(|r| r.tokens_in + r.tokens_out).sum();
+        let calls: i64 = spend.iter().map(|r| r.requests).sum();
+
+        let msgs = self.store.messages_since(since, 4000).await.unwrap_or_default();
+        let mut tool_names: HashMap<String, String> = HashMap::new();
+        let mut tool_calls = 0usize;
+        let mut tool_errors = 0usize;
+        let mut err_by_tool: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for m in &msgs {
+            for b in &m.content {
+                match b {
+                    ContentBlock::ToolUse { id, name, .. } => {
+                        tool_calls += 1;
+                        tool_names.insert(id.clone(), name.clone());
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error, .. } if *is_error => {
+                        tool_errors += 1;
+                        let name = tool_names.get(tool_use_id).cloned().unwrap_or_else(|| "unknown".into());
+                        let snippet = content
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| content.to_string());
+                        let e = err_by_tool.entry(name).or_insert((0, String::new()));
+                        e.0 += 1;
+                        if e.1.is_empty() {
+                            e.1 = truncate(&snippet, 160).to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let friction = self.store.journal_digest(since).await.unwrap_or_default();
+        let friction_total: i64 = friction.iter().map(|(_, c)| *c).sum();
+        let examples = self.store.journal_recent(since, 12).await.unwrap_or_default();
+
+        let current_notes = std::fs::read_to_string(self.home.operating_notes()).unwrap_or_default();
+
+        // Nothing happened → don't burn a call; leave notes untouched.
+        if total_tok == 0 && tool_calls == 0 && friction_total == 0 {
+            return Ok(SelfReview {
+                summary: "no recent activity to review".into(),
+                lessons: note_bullets(&current_notes),
+                suggestions: Vec::new(),
+            });
+        }
+
+        // --- build the digest ----------------------------------------------
+        let mut digest = String::new();
+        let days = (lookback_secs as f64 / 86_400.0).max(0.04);
+        digest.push_str(&format!("Window: last {days:.0}d.\n"));
+        digest.push_str(&format!(
+            "Spend: {total_tok} tokens over {calls} model calls.\n"
+        ));
+        if !spend.is_empty() {
+            let mut by = spend.clone();
+            by.sort_by_key(|r| -(r.tokens_in + r.tokens_out));
+            let top: Vec<String> = by
+                .iter()
+                .take(4)
+                .map(|r| format!("{} ({} tok)", r.model, r.tokens_in + r.tokens_out))
+                .collect();
+            digest.push_str(&format!("  by model: {}\n", top.join(", ")));
+        }
+        let rate = if tool_calls > 0 { tool_errors as f64 / tool_calls as f64 * 100.0 } else { 0.0 };
+        digest.push_str(&format!(
+            "Tools: {tool_calls} calls, {tool_errors} errored ({rate:.0}%).\n"
+        ));
+        for (name, (count, sample)) in err_by_tool.iter().take(6) {
+            digest.push_str(&format!("  {name} failed {count}x — e.g. \"{sample}\"\n"));
+        }
+        if friction_total == 0 {
+            digest.push_str("Friction: none logged (no failed/cancelled turns, corrections, or denials).\n");
+        } else {
+            let parts: Vec<String> = friction.iter().map(|(k, c)| format!("{k}: {c}")).collect();
+            digest.push_str(&format!("Friction: {}.\n", parts.join(", ")));
+            for (kind, detail) in examples.iter().take(8) {
+                digest.push_str(&format!("  [{kind}] {}\n", truncate(detail, 140)));
+            }
+        }
+
+        // --- the review call ------------------------------------------------
+        let system = format!(
+            "You are the self-review of an AI agent called Revenant. You are given a digest of the \
+agent's OWN recent performance and its CURRENT operating notes. Think about how it is actually \
+doing and produce a SMALL set of durable OPERATING LESSONS that will make it work better next \
+time: concrete, behavioral, general — not one-off facts, not restatements of its identity. \
+Rewrite the FULL list: merge the current notes with any new lessons, drop stale or low-value \
+ones, keep at most {max_notes}, ordered most-important first. Prefer keeping good existing notes \
+over churn. Separately, list any HEAVIER changes you'd recommend but must NOT self-apply (change a \
+setting, create a skill, edit a memory, adjust a loop) as short owner-facing suggestions. If \
+recent performance shows nothing worth changing, keep the notes as-is and say so in the summary. \
+Return via record_self_review."
+        );
+        let user = format!(
+            "PERFORMANCE DIGEST:\n{digest}\nCURRENT OPERATING NOTES:\n{}",
+            if current_notes.trim().is_empty() { "(none yet)" } else { current_notes.trim() }
+        );
+        let spec = revenant_core::ToolSpec {
+            name: "record_self_review".into(),
+            description: "Record the rewritten operating notes and any owner suggestions.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "one line: what you noticed + did"},
+                    "lessons": {"type": "array", "items": {"type": "string"},
+                        "description": "the FULL operating-notes list to keep in force"},
+                    "suggestions": {"type": "array", "items": {"type": "string"},
+                        "description": "heavier changes for the owner to approve (may be empty)"}
+                },
+                "required": ["summary", "lessons"]
+            }),
+        };
+        let request = MessagesRequest {
+            model: tier.to_string(),
+            max_tokens: 1536,
+            system: Some(serde_json::Value::String(system)),
+            messages: vec![WireMessage::new(Role::User, vec![ContentBlock::text(user)])],
+            tools: vec![spec],
+            tool_choice: Some(serde_json::json!({"type": "tool", "name": "record_self_review"})),
+            stream: true,
+            identity: Some("self-review".to_string()),
+        };
+        let outcome = self.llm.stream_message(&request, |_| {}).await?;
+        let input = outcome
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolUse { name, input, .. } if name == "record_self_review" => {
+                    Some(input.clone())
+                }
+                _ => None,
+            })
+            .context("self-review did not call record_self_review")?;
+
+        let summary = input
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("self-review complete")
+            .trim()
+            .to_string();
+        let mut lessons: Vec<String> = input
+            .get("lessons")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        lessons.truncate(max_notes);
+        let suggestions: Vec<String> = input
+            .get("suggestions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Auto-apply the safe self-guidance: (re)write the operating notes the
+        // agent re-reads every turn. Don't clobber with an empty list.
+        if !lessons.is_empty() {
+            if let Err(err) = write_operating_notes(&self.home, &lessons) {
+                tracing::warn!("self-review: could not write operating notes: {err:#}");
+            } else {
+                tracing::info!("self-review: {} operating note(s) in force", lessons.len());
+            }
+        }
+
+        self.events.emit(Event::SelfReviewCompleted {
+            summary: summary.clone(),
+            lessons: lessons.len() as u32,
+            suggestions: suggestions.clone(),
+        });
+        Ok(SelfReview { summary, lessons, suggestions })
+    }
+}
+
+/// Result of a behavioral self-review.
+#[derive(Debug, Clone)]
+pub struct SelfReview {
+    pub summary: String,
+    pub lessons: Vec<String>,
+    pub suggestions: Vec<String>,
+}
+
+/// Extract the bullet lessons from an OPERATING_NOTES.md body (for reporting a
+/// count without rewriting).
+fn note_bullets(notes: &str) -> Vec<String> {
+    notes
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Atomically write the operating-notes file from the curated lesson list.
+fn write_operating_notes(home: &Home, lessons: &[String]) -> std::io::Result<()> {
+    let mut body = String::from(
+        "# Operating notes\n\nLessons I've drawn from reviewing my own recent performance. I \
+curate these on each self-review — edit freely and I'll keep yours.\n\n",
+    );
+    for l in lessons {
+        body.push_str("- ");
+        body.push_str(l.trim_start_matches("- ").trim());
+        body.push('\n');
+    }
+    let path = home.operating_notes();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)
 }
 
 /// Ask a cheap model whether a completed trajectory is a reusable procedure
@@ -1986,5 +2245,29 @@ mod router_tests {
     fn empty_is_not_trivial() {
         assert!(!is_trivial_turn(""));
         assert!(!is_trivial_turn("   \n  "));
+    }
+}
+
+#[cfg(test)]
+mod notes_tests {
+    use super::{note_bullets, write_operating_notes};
+    use revenant_core::home::Home;
+
+    #[test]
+    fn operating_notes_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("rev-notes-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let home = Home::at(&dir);
+        let lessons = vec![
+            "Prefer read-only checks before asking for approval.".to_string(),
+            "- Batch independent tool calls in one step.".to_string(), // stray dash tolerated
+        ];
+        write_operating_notes(&home, &lessons).unwrap();
+        let body = std::fs::read_to_string(home.operating_notes()).unwrap();
+        let bullets = note_bullets(&body);
+        assert_eq!(bullets.len(), 2);
+        assert_eq!(bullets[0], "Prefer read-only checks before asking for approval.");
+        assert_eq!(bullets[1], "Batch independent tool calls in one step.");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

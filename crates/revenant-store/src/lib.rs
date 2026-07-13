@@ -777,6 +777,79 @@ impl Store {
         .await
     }
 
+    // ---- friction journal (self-review inputs) --------------------------
+
+    /// Append a friction event (a turn failed/was cancelled, the owner steered
+    /// or queued mid-turn, an approval was denied). `detail` is a short human
+    /// snippet. Best-effort — callers ignore errors so journaling never breaks
+    /// a turn.
+    pub async fn journal_add(&self, kind: &str, session_id: Option<i64>, detail: &str) -> Result<()> {
+        let kind = kind.to_owned();
+        let detail = detail.chars().take(500).collect::<String>();
+        self.with(move |conn| {
+            conn.execute(
+                "INSERT INTO agent_journal (at, session_id, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+                (unix_now(), session_id, &kind, &detail),
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// (kind, count) since `from_ts` — the friction shape for a review window.
+    pub async fn journal_digest(&self, from_ts: i64) -> Result<Vec<(String, i64)>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT kind, COUNT(*) FROM agent_journal WHERE at >= ?1
+                 GROUP BY kind ORDER BY COUNT(*) DESC",
+            )?;
+            let rows = stmt.query_map([from_ts], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Recent journal detail snippets since `from_ts` (newest first) — concrete
+    /// examples for the reviewer to reason from.
+    pub async fn journal_recent(&self, from_ts: i64, limit: usize) -> Result<Vec<(String, String)>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT kind, detail FROM agent_journal
+                 WHERE at >= ?1 AND detail <> '' ORDER BY at DESC LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map((from_ts, limit as i64), |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Messages across all sessions since `from_ts` (oldest first) — the
+    /// self-review parses these for tool errors (ToolResult.is_error).
+    pub async fn messages_since(&self, from_ts: i64, limit: usize) -> Result<Vec<StoredMessage>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, turn, role, content FROM messages
+                 WHERE created_at >= ?1 AND compacted_into IS NULL
+                 ORDER BY created_at ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map((from_ts, limit as i64), |row| {
+                let role: String = row.get(2)?;
+                let content: String = row.get(3)?;
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, role, content))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, turn, role, content) = row?;
+                let role = if role == "assistant" { Role::Assistant } else { Role::User };
+                let content: Vec<ContentBlock> = serde_json::from_str(&content).unwrap_or_default();
+                out.push(StoredMessage { id, turn, role, content });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Total tokens spent today (UTC), for the chat footer.
     pub async fn spend_today(&self) -> Result<(i64, i64)> {
         self.with(|conn| {
@@ -1189,6 +1262,27 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              );
              CREATE INDEX idx_jobs_claim ON jobs(status, run_after);
              PRAGMA user_version = 7;
+             COMMIT;",
+        )?;
+    }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 8 {
+        // Friction journal: a durable sink for the "a turn went badly / the
+        // owner had to correct me" signals that otherwise live only on the
+        // event bus (turn failures, cancellations, mid-turn steers/queues,
+        // denied approvals). The self-review reads this back to learn from
+        // friction, not just from successes.
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE agent_journal (
+               id         INTEGER PRIMARY KEY AUTOINCREMENT,
+               at         INTEGER NOT NULL,
+               session_id INTEGER,
+               kind       TEXT NOT NULL,   -- turn_failed | turn_cancelled | context_folded | task_queued | approval_denied
+               detail     TEXT NOT NULL DEFAULT ''
+             );
+             CREATE INDEX idx_journal_at ON agent_journal(at);
+             PRAGMA user_version = 8;
              COMMIT;",
         )?;
     }
