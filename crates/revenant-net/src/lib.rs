@@ -9,6 +9,7 @@
 //! cryptographic, not directory-asserted.
 
 pub mod artifact;
+pub mod attest;
 pub mod client;
 pub mod identity;
 pub mod ledger;

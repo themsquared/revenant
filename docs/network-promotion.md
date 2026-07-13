@@ -33,6 +33,16 @@ sybil-farmable (one actor, three revenants, self-approve). It means:
 2. **Reputation-weighted vote** on top: weight by peer identity age + landed-molt
    history. Promote iff `reproductions ≥ R` **and** `weighted_approval ≥ T`.
 
+**Every change ships via the PR process — always.**
+Network quorum never merges and never bypasses review. A minor change that
+clears proof + reproduction + quorum still lands as a normal PR against the
+source repo and merges through branch protection like any other. The
+reproduction attestations ride *with* the artifact/PR as provenance — they
+raise confidence and can gate whether the auto-PR is *opened*, but they are
+never a merge. This keeps the Ascension invariant (it can propose, never merge)
+true for every revenant, forever. "Auto-promote" therefore means
+**auto-open-a-well-evidenced-PR**, not auto-apply.
+
 **Classification = auto-classify, wards force major.**
 The authoring agent proposes minor/major; the skeptical reviewer gate
 cross-checks the label; and — regardless of the label or how good the eval
