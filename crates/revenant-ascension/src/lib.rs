@@ -20,6 +20,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod classify;
 pub mod config;
 pub mod materiality;
 pub mod offer;
