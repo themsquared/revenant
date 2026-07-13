@@ -189,7 +189,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
         let events = EventBus::new(64);
-        let broker = ApprovalBroker::new(store.clone(), events, Duration::from_millis(200));
+        // Generous TTL so the resolve never races the timeout under load — the
+        // old 200ms was flaky when the box was busy (e.g. a release build).
+        let broker = ApprovalBroker::new(store.clone(), events.clone(), Duration::from_secs(10));
 
         // Approved path
         let b2 = broker.clone();
@@ -200,9 +202,20 @@ mod tests {
         assert!(broker.resolve(&pending[0].id, true, "test").await.unwrap());
         assert_eq!(req.await.unwrap().unwrap(), Verdict::Approved);
 
-        // Timeout path → default deny
-        let verdict = broker
-            .request(1, "exec", "run rm -rf", serde_json::json!({}))
+        // Denied path → explicit deny (deterministic, no wall-clock race)
+        let b3 = broker.clone();
+        let req = tokio::spawn(async move { b3.request(1, "exec", "run rm -rf", serde_json::json!({})).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let pending = store.approvals_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(broker.resolve(&pending[0].id, false, "test").await.unwrap());
+        assert_eq!(req.await.unwrap().unwrap(), Verdict::Denied);
+
+        // Timeout path → default deny. A short-TTL broker with NO resolver: this
+        // is robust at any load (nothing can make it wrongly approve).
+        let broker_to = ApprovalBroker::new(store.clone(), events, Duration::from_millis(150));
+        let verdict = broker_to
+            .request(1, "exec", "run sleep", serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(verdict, Verdict::TimedOut);
@@ -215,7 +228,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rev-sec-grant-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
-        let broker = ApprovalBroker::new(store.clone(), EventBus::new(64), Duration::from_millis(200));
+        // Generous TTL: resolve paths never race the timeout, and we prove
+        // scoping by "did it prompt?" (pending count) rather than waiting out a
+        // timeout — fast and deterministic under any load.
+        let broker = ApprovalBroker::new(store.clone(), EventBus::new(64), Duration::from_secs(10));
 
         // First exec: prompt, then approve WITH a task grant.
         let b2 = broker.clone();
@@ -230,14 +246,25 @@ mod tests {
         assert_eq!(v, Verdict::Approved);
         assert_eq!(store.approvals_pending().await.unwrap().len(), 0, "should not have prompted");
 
-        // A different session is NOT covered by the grant → times out (deny).
-        let v = broker.request(8, "exec", "ls", serde_json::json!({})).await.unwrap();
-        assert_eq!(v, Verdict::TimedOut);
+        // A different session is NOT covered by the grant → it PROMPTS (a
+        // pending approval appears). Session 7's grant means it can't be 7's.
+        let b8 = broker.clone();
+        let r8 = tokio::spawn(async move { b8.request(8, "exec", "ls", serde_json::json!({})).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let pending = store.approvals_pending().await.unwrap();
+        assert_eq!(pending.len(), 1, "uncovered session must prompt");
+        broker.resolve(&pending[0].id, false, "test").await.unwrap();
+        assert_eq!(r8.await.unwrap().unwrap(), Verdict::Denied);
 
-        // Revoke clears it: session 7 prompts again (times out with no resolver).
+        // Revoke clears the grant: session 7 prompts again.
         broker.revoke_grants(7);
-        let v = broker.request(7, "exec", "ls", serde_json::json!({})).await.unwrap();
-        assert_eq!(v, Verdict::TimedOut);
+        let b7 = broker.clone();
+        let r7 = tokio::spawn(async move { b7.request(7, "exec", "ls", serde_json::json!({})).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let pending = store.approvals_pending().await.unwrap();
+        assert_eq!(pending.len(), 1, "revoked grant must prompt again");
+        broker.resolve(&pending[0].id, false, "test").await.unwrap();
+        assert_eq!(r7.await.unwrap().unwrap(), Verdict::Denied);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

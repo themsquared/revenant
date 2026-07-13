@@ -881,9 +881,11 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             summary: summary.clone(),
         });
 
-        // Dangerous tools cross the approval broker, every time (standing
-        // grants arrive with the session-grant work in M2).
-        if tool.permission() >= PermissionTier::Dangerous {
+        // Approval is gated on the risk of THIS call (args-aware), not the
+        // tool's static tier — so routine, safe invocations (e.g. `exec ls`,
+        // `git status`) run without a prompt, and only genuinely consequential
+        // ones (destructive, outbound, irreversible) cross the broker.
+        if tool.risk(&input) >= PermissionTier::Dangerous {
             match self
                 .approvals
                 .request(session_id, name, &summary, input.clone())

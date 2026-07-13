@@ -19,6 +19,13 @@ use std::sync::Arc;
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn permission(&self) -> PermissionTier;
+    /// Risk of a SPECIFIC call, given its arguments. The dispatcher gates on
+    /// this (not the static tier), so a tool can auto-allow its routine, safe
+    /// invocations and only prompt for the consequential ones — e.g. `exec ls`
+    /// vs `exec rm -rf`. Defaults to the static tier (no per-call nuance).
+    fn risk(&self, _input: &serde_json::Value) -> PermissionTier {
+        self.permission()
+    }
     async fn invoke(&self, cx: &ToolCx, args: serde_json::Value) -> ToolOutput;
 }
 
