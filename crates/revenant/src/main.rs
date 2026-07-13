@@ -6,6 +6,7 @@
 
 mod ascend_loop;
 mod autoupdate;
+mod budget;
 mod daemon;
 mod repl;
 mod service;

@@ -122,6 +122,14 @@ pub enum Event {
     TurnCancelled {
         session_id: i64,
     },
+    /// Today's spend crossed a configured fraction of the daily budget. Not a
+    /// hard stop (the gateway cap is the moat) — a heads-up. `spent`/`budget`
+    /// are pre-formatted for display (e.g. "$3.20" / "$4.00", or token counts).
+    BudgetAlert {
+        pct: u8,
+        spent: String,
+        budget: String,
+    },
 }
 
 impl Event {

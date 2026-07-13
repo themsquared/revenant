@@ -87,6 +87,7 @@ export function eventStream(onEvent) {
     'context_folded',
     'task_queued',
     'turn_cancelled',
+    'budget_alert',
   ]) {
     source.addEventListener(name, forward)
   }

@@ -595,6 +595,15 @@ impl OutboundMirror {
                         }
                     }
                 }
+                // Spend crossed a budget threshold → the owner's pocket.
+                Event::BudgetAlert { pct, spent, budget } => {
+                    let msg = format!("💸 Spend alert: {spent} today ({pct}% of {budget} daily budget).");
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let _ = self.client.send_message(chat_id, &msg).await;
+                        }
+                    }
+                }
                 _ => {}
             }
         }

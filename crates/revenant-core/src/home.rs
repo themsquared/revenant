@@ -20,6 +20,11 @@ impl Home {
         Home { root }
     }
 
+    /// Construct a Home rooted at an explicit path (tests, isolated runs).
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Home { root: root.into() }
+    }
+
     pub fn root(&self) -> &PathBuf {
         &self.root
     }

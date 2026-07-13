@@ -282,6 +282,7 @@ async fn events(
                 revenant_core::Event::ReminderFired { .. } => "reminder_fired",
                 revenant_core::Event::ComplexityRouted { .. } => "complexity_routed",
                 revenant_core::Event::TurnCancelled { .. } => "turn_cancelled",
+                revenant_core::Event::BudgetAlert { .. } => "budget_alert",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())

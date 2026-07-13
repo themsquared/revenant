@@ -215,6 +215,22 @@ pub struct SpendingConfig {
     /// What the budget counts: LLM `tokens` (input+output) or `requests`.
     #[serde(default)]
     pub count: BudgetCount,
+    /// Soft daily-spend alert budget in USD. Priced from [pricing]; requires it
+    /// to be set. None (default) → no dollar-based alert. This is independent of
+    /// the hard gateway cap above — it warns, it does not block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_budget_usd: Option<f64>,
+    /// Fallback daily budget in raw tokens (in+out), used when there's no USD
+    /// budget or no pricing. None → no token-based alert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_budget_tokens: Option<u64>,
+    /// Fractions of the daily budget that trigger an alert — at most one alert
+    /// per tick (the highest newly-crossed level), each level once per UTC day.
+    #[serde(default = "default_alert_thresholds")]
+    pub alert_thresholds: Vec<f64>,
+    /// How often to evaluate spend against the daily budget, in seconds.
+    #[serde(default = "default_alert_interval")]
+    pub alert_interval_secs: u64,
 }
 
 impl Default for SpendingConfig {
@@ -224,8 +240,20 @@ impl Default for SpendingConfig {
             budget: default_budget_amount(),
             interval: default_budget_interval(),
             count: BudgetCount::default(),
+            daily_budget_usd: None,
+            daily_budget_tokens: None,
+            alert_thresholds: default_alert_thresholds(),
+            alert_interval_secs: default_alert_interval(),
         }
     }
+}
+
+fn default_alert_thresholds() -> Vec<f64> {
+    vec![0.5, 0.8, 1.0]
+}
+
+fn default_alert_interval() -> u64 {
+    900
 }
 
 /// Unit the spend cap counts — matches agentgateway's localRateLimit `type`.

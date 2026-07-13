@@ -229,6 +229,15 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     // per [update].auto, notifies the owner or installs + restarts. Fail-soft.
     crate::autoupdate::spawn(home.clone(), cfg.clone(), manager.runtime().events.clone());
 
+    // Background budget alerts: warn the owner when today's spend crosses a
+    // fraction of the configured daily budget (no-op unless one is set).
+    crate::budget::spawn(
+        home.clone(),
+        cfg.clone(),
+        manager.runtime().events.clone(),
+        manager.runtime().store.clone(),
+    );
+
     Ok(Daemon {
         manager,
         gateway_handle,

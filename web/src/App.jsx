@@ -248,6 +248,10 @@ function Chat({ onApprovalCount, setBanner }) {
         case 'gateway_status':
           if (!event.healthy) setBanner('gateway unhealthy')
           break
+        case 'budget_alert':
+          // Global (no session_id) — show regardless of the open session.
+          setBanner(`💸 ${event.spent} spent today · ${event.pct}% of ${event.budget} daily budget`)
+          break
         default:
       }
     })
