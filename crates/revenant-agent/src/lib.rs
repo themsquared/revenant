@@ -182,6 +182,9 @@ pub struct AgentRuntime {
     /// Privacy router: sensitive turns are forced onto `privacy_tier`. None
     /// when disabled or misconfigured (no such tier).
     pub privacy: Option<(Arc<revenant_core::privacy::Detector>, Tier)>,
+    /// Complexity router: when Some(tier), obviously-trivial turns are routed
+    /// DOWN to that (cheap/fast) tier. None when disabled or misconfigured.
+    pub complexity_router: Option<Tier>,
 }
 
 impl AgentRuntime {
@@ -291,6 +294,8 @@ impl AgentRuntime {
             interjections: self.interjections.clone(),
             deferred: self.deferred.clone(),
             privacy: None,
+            // Subagents/coder run at a deliberately-chosen tier; don't second-guess it.
+            complexity_router: None,
         }
     }
 
@@ -364,6 +369,7 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         // it onto the local tier so it never reaches a cloud provider. The
         // tier is fixed for the whole turn, so tool results stay local too.
         let mut tier = tier;
+        let mut privacy_pinned = false;
         if depth == 0 {
             if let Some((detector, safe_tier)) = &self.privacy {
                 if tier != *safe_tier {
@@ -377,7 +383,32 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
                             tier: safe_tier.to_string(),
                         });
                         tier = *safe_tier;
+                        privacy_pinned = true;
                     }
+                }
+            }
+        }
+
+        // Complexity router: downgrade obviously-trivial turns to the cheap/fast
+        // tier. Zero-cost (pure heuristic, no extra model call), only ever routes
+        // DOWN (balanced/deep → fast), never touches a turn privacy just pinned,
+        // and only on top-level turns. Keeps "hi" and quick lookups snappy/cheap
+        // without dulling the substantive work.
+        if depth == 0 && !privacy_pinned {
+            if let Some(fast) = self.complexity_router {
+                if matches!(tier, Tier::Balanced | Tier::Deep)
+                    && fast != tier
+                    && is_trivial_turn(&user_text)
+                {
+                    tracing::info!(
+                        "complexity router: trivial turn — routing '{tier}' → '{fast}' (cheaper/snappier)"
+                    );
+                    self.events.emit(Event::ComplexityRouted {
+                        session_id,
+                        from: tier.to_string(),
+                        to: fast.to_string(),
+                    });
+                    tier = fast;
                 }
             }
         }
@@ -1423,6 +1454,86 @@ fn estimate(content: &[ContentBlock]) -> Option<i64> {
     Some((bytes as f64 / 3.6).ceil() as i64)
 }
 
+/// Heuristic, zero-cost classifier for the complexity router: is this turn
+/// obviously trivial enough to answer well on the fast tier? Deliberately
+/// CONSERVATIVE — when in any doubt it returns false so the turn keeps its more
+/// capable tier. Only ever consulted to route DOWN, so a false negative just
+/// means "no savings on this turn", while a false positive means a slightly
+/// weaker answer — we bias hard against the latter.
+fn is_trivial_turn(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let lower = t.to_lowercase();
+
+    // Structural signals of a substantive turn → keep the capable tier.
+    if t.len() > 280 {
+        return false;
+    }
+    if t.contains("```") {
+        return false; // code block
+    }
+    if t.matches('\n').count() > 2 {
+        return false; // multi-line / multi-part ask
+    }
+    if lower.contains("://") {
+        return false; // URL → likely research/fetch
+    }
+    // A token that looks like a file path (has both a slash and a dot).
+    if t.split_whitespace().any(|w| w.contains('/') && w.contains('.')) {
+        return false;
+    }
+
+    // A request for judgment/opinion/comparison wants the better tier even when
+    // it's phrased briefly ("should we drop Postgres?").
+    const JUDGMENT: &[&str] = &[
+        "should", "could we", "would you", "worth", "better to", "recommend",
+        "opinion", " vs ", " versus ", "trade-off", "tradeoff", "pros and cons",
+    ];
+    if JUDGMENT.iter().any(|k| lower.contains(k)) {
+        return false;
+    }
+
+    // Substantive-intent verbs → not trivial.
+    const HEAVY: &[&str] = &[
+        "analy", "debug", "refactor", "implement", "architect", "design ",
+        "investigat", "optimi", "compare", "review ", "diagnos", "root cause",
+        "strateg", "migrat", "benchmark", "profil", "walk me through",
+        "step by step", "trace ", "audit", "explain how", "explain why",
+        "write a", "write the", "build a", "build the", "plan ",
+    ];
+    if HEAVY.iter().any(|k| lower.contains(k)) {
+        return false;
+    }
+
+    let words = t.split_whitespace().count();
+    let first = lower.split_whitespace().next().unwrap_or("");
+
+    // Positive trivial signals — short greetings/acks (first word, so "no" can't
+    // match "north"), and simple lookup/definition/conversion prefixes.
+    const GREET: &[&str] = &[
+        "hi", "hello", "hey", "yo", "sup", "thanks", "thank", "thx", "thanx",
+        "cheers", "gm", "gn", "ok", "okay", "yes", "yep", "yeah", "no", "nope",
+        "cool", "nice", "great", "lol",
+    ];
+    if GREET.contains(&first) && words <= 5 {
+        return true;
+    }
+    const LOOKUP_PREFIX: &[&str] = &[
+        "what time", "what's the time", "whats the time", "what day",
+        "what's the date", "whats the date", "define ", "what is ", "what's ",
+        "whats ", "who is ", "who's ", "whos ", "translate ", "convert ",
+        "how many", "how much is", "capital of", "spell ", "what does",
+    ];
+    if LOOKUP_PREFIX.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+
+    // Ultra-short leftover chatter (judgment/heavy already excluded above).
+    words <= 4
+}
+
 /// Repair a history window into a structurally valid Anthropic message
 /// sequence, whatever corrupted it:
 ///   - a `tool_use` with no following `tool_result` (a turn that died after
@@ -1758,5 +1869,60 @@ mod history_tests {
         ];
         let out = sanitize_history(msgs);
         assert!(out.is_empty(), "expected empty (all plumbing), got {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::is_trivial_turn;
+
+    #[test]
+    fn trivial_turns_route_down() {
+        for t in [
+            "hi",
+            "hey there",
+            "thanks!",
+            "ok cool",
+            "what time is it?",
+            "what's the date today",
+            "define idempotent",
+            "what is a monad",
+            "who is Ada Lovelace",
+            "convert 10km to miles",
+            "how many ounces in a pound",
+            "capital of France?",
+            "translate hola to english",
+            "yes",
+            "nope",
+        ] {
+            assert!(is_trivial_turn(t), "expected trivial: {t:?}");
+        }
+    }
+
+    #[test]
+    fn substantive_turns_keep_their_tier() {
+        for t in [
+            "should we drop Postgres for SQLite?", // judgment
+            "analyze the failover path in the gateway",
+            "debug why the daemon exits on boot",
+            "refactor the turn loop to reduce clones",
+            "explain how the privacy router decides a tier",
+            "compare RRF and PPR for our retrieval",
+            "write a script that rolls out the canary",
+            "```\nlet x = 1;\n```",                 // code
+            "look at crates/revenant-agent/src/lib.rs and fix it", // file path
+            "review https://example.com/spec and summarize", // URL
+            "north star metric for the quarter",    // 'no' must not match first-word
+            "is it worth migrating to the new API",  // judgment + heavy
+            "walk me through the deploy step by step",
+        ] {
+            assert!(!is_trivial_turn(t), "expected substantive: {t:?}");
+        }
+    }
+
+    #[test]
+    fn empty_is_not_trivial() {
+        assert!(!is_trivial_turn(""));
+        assert!(!is_trivial_turn("   \n  "));
     }
 }

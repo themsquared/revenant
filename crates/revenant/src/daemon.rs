@@ -175,6 +175,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         interjections: Arc::default(),
         deferred: Arc::default(),
         privacy: build_privacy(cfg),
+        complexity_router: build_complexity_router(cfg),
     });
 
     let manager = SessionManager::new(runtime);
@@ -265,6 +266,28 @@ fn build_privacy(
         &cfg.privacy.extra_patterns,
     ));
     Some((detector, tier))
+}
+
+/// Build the complexity router's target tier if enabled AND that tier actually
+/// exists — otherwise disable quietly (it's a cost optimization, not security,
+/// so a missing tier just means "no downgrade", no scary warning).
+fn build_complexity_router(cfg: &Config) -> Option<revenant_core::Tier> {
+    if !cfg.router.complexity {
+        return None;
+    }
+    let tier: revenant_core::Tier = cfg.router.fast_tier.parse().ok()?;
+    if !cfg.tiers.contains_key(&cfg.router.fast_tier) {
+        tracing::warn!(
+            "complexity router off: tier '{}' is not configured",
+            cfg.router.fast_tier
+        );
+        return None;
+    }
+    tracing::info!(
+        "complexity router ON — trivial turns route down to '{}'",
+        cfg.router.fast_tier
+    );
+    Some(tier)
 }
 
 const REFLECTION_ID: &str = "lp-reflection";

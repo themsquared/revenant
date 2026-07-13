@@ -109,6 +109,14 @@ pub enum Event {
     ReminderFired {
         message: String,
     },
+    /// The complexity router downgraded a trivial turn to a cheaper tier. Bus /
+    /// observability only — deliberately NOT pushed to chat surfaces (that would
+    /// be noise on every "hi").
+    ComplexityRouted {
+        session_id: i64,
+        from: String,
+        to: String,
+    },
 }
 
 impl Event {
@@ -121,7 +129,8 @@ impl Event {
             | Event::TurnCompleted { session_id, .. }
             | Event::TurnFailed { session_id, .. }
             | Event::ApprovalCreated { session_id, .. }
-            | Event::PrivacyRouted { session_id, .. } => Some(*session_id),
+            | Event::PrivacyRouted { session_id, .. }
+            | Event::ComplexityRouted { session_id, .. } => Some(*session_id),
             Event::SubagentSpawned { parent_session, .. }
             | Event::SubagentFinished { parent_session, .. } => Some(*parent_session),
             _ => None,

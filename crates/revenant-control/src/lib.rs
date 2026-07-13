@@ -279,6 +279,7 @@ async fn events(
                 revenant_core::Event::ContextFolded { .. } => "context_folded",
                 revenant_core::Event::TaskQueued { .. } => "task_queued",
                 revenant_core::Event::ReminderFired { .. } => "reminder_fired",
+                revenant_core::Event::ComplexityRouted { .. } => "complexity_routed",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())

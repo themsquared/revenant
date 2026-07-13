@@ -15,6 +15,9 @@ pub struct Config {
     pub channels: ChannelsConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    /// Complexity router: keep trivial turns cheap and snappy (on by default).
+    #[serde(default)]
+    pub router: RouterConfig,
     /// Global gateway-enforced spend cap (the intelligent-spending ceiling).
     #[serde(default)]
     pub spending: SpendingConfig,
@@ -167,6 +170,32 @@ impl Default for PrivacyConfig {
 
 fn default_privacy_tier() -> String {
     "local".to_string()
+}
+
+/// Complexity router: downgrade obviously-trivial turns (greetings, quick
+/// lookups, short factual asks) to a cheap/fast tier so simple requests stay
+/// snappy and cheap. Heuristic-only — it adds zero latency and zero spend, and
+/// it is deliberately conservative: it ONLY ever routes DOWN (balanced/deep →
+/// `fast_tier`), never up, never touches a turn already on local/fast, and
+/// never overrides a turn the privacy router pinned on-box.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouterConfig {
+    /// Route trivial turns down to `fast_tier`. On by default.
+    #[serde(default = "default_true")]
+    pub complexity: bool,
+    /// The tier trivial turns route to (must be a configured tier).
+    #[serde(default = "default_router_fast_tier")]
+    pub fast_tier: String,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        RouterConfig { complexity: true, fast_tier: default_router_fast_tier() }
+    }
+}
+
+fn default_router_fast_tier() -> String {
+    "fast".to_string()
 }
 
 /// Global spend cap enforced by the gateway on the LLM listener — a token
@@ -788,6 +817,7 @@ impl Config {
             memory: MemoryConfig::default(),
             channels: ChannelsConfig::default(),
             privacy: PrivacyConfig::default(),
+            router: RouterConfig::default(),
             spending: SpendingConfig::default(),
             ascension: AscensionConfig::default(),
             network: NetworkConfig::default(),
