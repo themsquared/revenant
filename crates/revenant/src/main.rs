@@ -1635,6 +1635,43 @@ async fn cmd_doctor() -> Result<()> {
         }
     };
 
+    // Home dir writable — everything downstream depends on it.
+    let write_probe = home.root().join(".doctor-write-test");
+    match std::fs::write(&write_probe, b"ok") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&write_probe);
+            ok("home writable", &home.root().display().to_string());
+        }
+        Err(e) => bad("home", &format!("not writable: {e}")),
+    }
+
+    // Database — open and exercise a read, so a corrupt or locked db surfaces
+    // here instead of mid-turn. (WAL allows this reader alongside the daemon.)
+    match revenant_store::Store::open(&home.db_path()) {
+        Ok(store) => match store.spend_today().await {
+            Ok((tin, tout)) => {
+                ok("database", &format!("readable ({tin} tok in / {tout} out today)"))
+            }
+            Err(e) => bad("database", &format!("query failed: {e:#}")),
+        },
+        Err(e) => bad("database", &format!("can't open {}: {e:#}", home.db_path().display())),
+    }
+
+    // Tiers — the routing table. Empty targets = turns 500 at the gateway.
+    if let Some(cfg) = &cfg {
+        let empty: Vec<&str> =
+            cfg.tiers.iter().filter(|(_, t)| t.targets.is_empty()).map(|(k, _)| k.as_str()).collect();
+        if cfg.tiers.is_empty() {
+            bad("tiers", "none configured — add a [tiers.fast] target");
+        } else if !empty.is_empty() {
+            warn("tiers", &format!("no targets on: {}", empty.join(", ")));
+        } else {
+            let mut names: Vec<&str> = cfg.tiers.keys().map(|s| s.as_str()).collect();
+            names.sort_unstable();
+            ok("tiers", &format!("{} configured: {}", cfg.tiers.len(), names.join(", ")));
+        }
+    }
+
     // Secrets / provider keys
     let secrets = std::fs::read_to_string(home.root().join("secrets.env")).unwrap_or_default();
     let present: Vec<&str> = [
@@ -1708,11 +1745,49 @@ async fn cmd_doctor() -> Result<()> {
         }
     }
 
+    // Memory — enabled? and if builtin, is the embedding model present?
+    if let Some(cfg) = &cfg {
+        if !cfg.memory.enabled {
+            ok("memory", "disabled");
+        } else if matches!(cfg.memory.embedder, revenant_core::config::EmbedderKind::Builtin) {
+            let has_model = std::fs::read_dir(home.models_dir())
+                .ok()
+                .map(|mut rd| rd.any(|e| e.is_ok()))
+                .unwrap_or(false);
+            if has_model {
+                ok("memory", "enabled (builtin embedder; model present)");
+            } else {
+                warn("memory", "enabled (builtin) but no model in ~/.revenant/models — fetched on first use");
+            }
+        } else {
+            ok("memory", "enabled (gateway embedder)");
+        }
+    }
+
     // Network / the horde
     if let Some(cfg) = &cfg {
         match &cfg.network.necropolis_url {
             Some(u) => ok("network", &format!("Necropolis: {u}")),
             None => warn("network", "no Necropolis set — set network.necropolis_url to join the horde"),
+        }
+    }
+
+    // Always-on service (survives reboot) — distinct from "daemon up" above.
+    match crate::service::is_installed() {
+        Some(true) => ok("service", "installed (auto-starts on login)"),
+        Some(false) => warn("service", "not installed — run `revenant service install` for always-on"),
+        None => {}
+    }
+
+    // Version + any pending update.
+    match installed_release_tag(&home) {
+        Some(tag) => ok("version", &format!("release {tag}")),
+        None => ok("version", "source build (no release tag)"),
+    }
+    if let Ok(latest) = std::fs::read_to_string(home.root().join("update-available")) {
+        let latest = latest.trim();
+        if !latest.is_empty() {
+            warn("update", &format!("{latest} available — run `revenant update`"));
         }
     }
 

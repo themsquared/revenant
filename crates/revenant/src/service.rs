@@ -87,6 +87,17 @@ pub fn restart() -> Result<()> {
     Ok(())
 }
 
+/// Is the always-on service installed (unit/plist present)? Best-effort, for
+/// `revenant doctor` — distinct from "is the daemon currently up", which the
+/// health check answers. None on unsupported platforms.
+pub fn is_installed() -> Option<bool> {
+    match std::env::consts::OS {
+        "macos" => Some(launchd_path().map(|p| p.exists()).unwrap_or(false)),
+        "linux" => Some(systemd_path().map(|p| p.exists()).unwrap_or(false)),
+        _ => None,
+    }
+}
+
 fn launchd_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("no home dir")?;
     Ok(home.join("Library/LaunchAgents").join(format!("{LABEL}.plist")))
