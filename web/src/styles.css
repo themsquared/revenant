@@ -132,6 +132,14 @@ main { flex: 1; overflow: hidden; }
 .msg.assistant { align-self: flex-start; background: var(--panel-2); }
 .msg.tool { align-self: flex-start; color: var(--dim); font-size: 12px; padding: 2px 12px; }
 .msg.error { align-self: flex-start; background: #450a0a; color: #fca5a5; }
+/* Rendered markdown inside assistant bubbles. */
+.msg.assistant code { background: var(--panel); padding: 1px 5px; border-radius: 5px; font-size: 0.9em; }
+.msg.assistant pre { background: var(--panel); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 6px 0; }
+.msg.assistant pre code { background: none; padding: 0; }
+.msg.assistant a { color: var(--accent); text-decoration: underline; }
+.msg.assistant h4 { margin: 8px 0 4px; font-size: 1em; }
+.msg.assistant ul { margin: 4px 0; padding-left: 1.3em; }
+.msg.assistant strong { font-weight: 600; }
 .cursor { animation: blink 1s step-start infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 

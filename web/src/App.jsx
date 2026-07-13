@@ -9,6 +9,40 @@ import { api, eventStream, getToken, setToken } from './api.js'
 const SIMPLE_TABS = ['chat', 'approvals', 'skills', 'personalities', 'settings']
 const ADVANCED_TABS = ['tools', 'subagents', 'loops', 'spend', 'memory']
 
+// Minimal, safe markdown -> HTML for assistant messages. Escapes first (no
+// injection), protects code so its contents aren't re-interpreted, then applies
+// a small, well-formed subset: code blocks, inline code, bold, links, headers,
+// and bullet lists. Only http(s) links are emitted.
+function mdToHtml(src) {
+  const esc = (s) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const code = []
+  // Park code as a sentinel token that survives esc() (no & < >) and will not
+  // collide with prose. Restored verbatim at the end.
+  const park = (html) => `@@RVC${code.push(html) - 1}@@`
+  let t = String(src)
+    .replace(/```[\w+.-]*\n?([\s\S]*?)```/g, (_, c) => park(`<pre><code>${esc(c)}</code></pre>`))
+    .replace(/`([^`\n]+)`/g, (_, c) => park(`<code>${esc(c)}</code>`))
+  t = esc(t)
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/^\s*#{1,6}\s+(.*)$/gm, '<h4>$1</h4>')
+  // Bullet lists: wrap consecutive "- "/"* " lines in <ul>.
+  t = t.replace(/(?:^\s*[-*]\s+.*(?:\n|$))+/gm, (block) => {
+    const items = block
+      .trim()
+      .split('\n')
+      .map((l) => `<li>${l.replace(/^\s*[-*]\s+/, '')}</li>`)
+      .join('')
+    return `<ul>${items}</ul>`
+  })
+  t = t.replace(/\n/g, '<br>')
+  code.forEach((frag, i) => {
+    t = t.split(`@@RVC${i}@@`).join(frag)
+  })
+  return t
+}
+
 export default function App() {
   const [authed, setAuthed] = useState(false)
   const [tab, setTab] = useState('chat')
@@ -264,7 +298,13 @@ function Chat({ onApprovalCount, setBanner }) {
         <div className="log">
           {messages.map((m, i) => (
             <div key={i} className={`msg ${m.role}`}>
-              {m.role === 'tool' ? `⚙ ${m.text}` : m.text}
+              {m.role === 'tool' ? (
+                `⚙ ${m.text}`
+              ) : m.role === 'assistant' ? (
+                <span dangerouslySetInnerHTML={{ __html: mdToHtml(m.text) }} />
+              ) : (
+                m.text
+              )}
               {m.live && <span className="cursor">▌</span>}
             </div>
           ))}
