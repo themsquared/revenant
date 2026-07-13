@@ -122,6 +122,16 @@ cp -f "$BIN_DIR/revenant" "$BIN_DIR/revenant.bak" 2>/dev/null || true
 cp -f target/release/revenant "$BIN_DIR/revenant"
 [ -f target/release/revenant-tui ] && cp -f target/release/revenant-tui "$BIN_DIR/revenant-tui"
 
+# Keep the PATH binary pointed at the installed one — otherwise the CLI you
+# type (`revenant …`) drifts behind the canary-updated daemon. Re-assert the
+# symlink each deploy (it can get replaced by a stale copy over time).
+for lb in "$HOME/.local/bin/revenant" "$HOME/.local/bin/revenant-tui"; do
+  target="$BIN_DIR/$(basename "$lb")"
+  if [ -e "$target" ] && [ ! -L "$lb" -o "$(readlink "$lb" 2>/dev/null)" != "$target" ]; then
+    ln -sf "$target" "$lb"
+  fi
+done
+
 restart_live() {
   if launchctl print "gui/$(id -u)/$SERVICE" >/dev/null 2>&1; then
     launchctl kickstart -k "gui/$(id -u)/$SERVICE"
