@@ -139,6 +139,23 @@ impl TelegramClient {
         Ok(msg.message_id)
     }
 
+    /// Send pre-rendered Telegram HTML (parse_mode=HTML). Callers fall back to
+    /// `send_message` (plain) if this errors on malformed markup.
+    pub async fn send_html(&self, chat_id: i64, html: &str) -> Result<i64> {
+        let msg: Message = self
+            .call(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": html,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": true
+                }),
+            )
+            .await?;
+        Ok(msg.message_id)
+    }
+
     pub async fn send_approval(&self, chat_id: i64, text: &str, approval_id: &str) -> Result<i64> {
         let msg: Message = self
             .call(
@@ -566,7 +583,13 @@ impl OutboundMirror {
     /// an edited bubble, each part actually notifies — it reads as a chat.
     async fn send_long(&self, chat_id: i64, text: &str) {
         for part in split_message(text, TG_MAX) {
-            if self.client.send_message(chat_id, &part).await.is_err() {
+            // Render markdown → Telegram HTML so **bold**, `code`, code blocks
+            // and [links](url) look right. Fall back to the raw text if the
+            // markup is somehow malformed (Telegram rejects bad HTML).
+            let html = md_to_telegram_html(&part);
+            if self.client.send_html(chat_id, &html).await.is_err()
+                && self.client.send_message(chat_id, &part).await.is_err()
+            {
                 break;
             }
         }
@@ -621,6 +644,62 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Render the agent's GitHub-flavored markdown into the small HTML subset
+/// Telegram supports (`<b> <i> <code> <pre> <a>`). Code regions are pulled out
+/// FIRST so their contents aren't re-interpreted, everything is HTML-escaped,
+/// then inline markup is applied and the code re-inserted. Unmatched markers
+/// stay literal (safe) — and the caller falls back to plain text if Telegram
+/// ever rejects the result.
+fn md_to_telegram_html(md: &str) -> String {
+    use regex::Regex;
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+
+    // 1. Stash code so later passes can't touch it. NUL-delimited tokens
+    //    (NUL never appears in chat text).
+    let mut stash: Vec<String> = Vec::new();
+    let fence = Regex::new(r"(?s)```[a-zA-Z0-9_+.-]*\n?(.*?)```").unwrap();
+    let inline = Regex::new(r"`([^`\n]+)`").unwrap();
+
+    let mut out = String::new();
+    let mut last = 0;
+    for m in fence.captures_iter(md) {
+        let whole = m.get(0).unwrap();
+        out.push_str(&md[last..whole.start()]);
+        out.push_str(&format!("\u{0}{}\u{0}", stash.len()));
+        stash.push(format!("<pre>{}</pre>", esc(&m[1])));
+        last = whole.end();
+    }
+    out.push_str(&md[last..]);
+
+    // Inline code next (same parking).
+    let mut tmp = String::new();
+    let mut last = 0;
+    for m in inline.captures_iter(&out) {
+        let whole = m.get(0).unwrap();
+        tmp.push_str(&out[last..whole.start()]);
+        tmp.push_str(&format!("\u{0}{}\u{0}", stash.len()));
+        stash.push(format!("<code>{}</code>", esc(&m[1])));
+        last = whole.end();
+    }
+    tmp.push_str(&out[last..]);
+
+    // 2. Escape the prose, then apply the inline markup Telegram understands.
+    let mut s = esc(&tmp);
+    s = Regex::new(r"\*\*([^*\n]+)\*\*").unwrap().replace_all(&s, "<b>$1</b>").into_owned();
+    s = Regex::new(r#"\[([^\]]+)\]\((https?://[^)\s]+)\)"#)
+        .unwrap()
+        .replace_all(&s, r#"<a href="$2">$1</a>"#)
+        .into_owned();
+    s = Regex::new(r"(?m)^\s*#{1,6}\s+(.*)$").unwrap().replace_all(&s, "<b>$1</b>").into_owned();
+    s = Regex::new(r"(?m)^(\s*)[-*]\s+").unwrap().replace_all(&s, "$1• ").into_owned();
+
+    // 3. Re-insert the parked code (tokens survived escaping — they're NULs).
+    for (i, frag) in stash.iter().enumerate() {
+        s = s.replace(&format!("\u{0}{i}\u{0}"), frag);
+    }
+    s
+}
+
 /// Split a reply into Telegram-sized pieces, preferring line boundaries so a
 /// message is never chopped mid-line. A single line longer than `max` is
 /// hard-wrapped. Returns `[text]` unchanged when it already fits.
@@ -667,6 +746,33 @@ mod tests {
         assert_eq!(clip("hello", 10), "hello");
         let clipped = clip("héllo wörld", 6);
         assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn md_to_telegram_html_renders_the_common_markup() {
+        let h = md_to_telegram_html("**bold** and `code` and [x](https://a.com)");
+        assert!(h.contains("<b>bold</b>"));
+        assert!(h.contains("<code>code</code>"));
+        assert!(h.contains(r#"<a href="https://a.com">x</a>"#));
+    }
+
+    #[test]
+    fn md_to_telegram_html_escapes_and_protects_code() {
+        // Markup INSIDE a code block must not be interpreted, and <>& escaped.
+        let h = md_to_telegram_html("```\nif a < b && **x** { }\n```");
+        assert!(h.contains("<pre>"));
+        assert!(h.contains("&lt; b &amp;&amp; **x**"), "code stays literal + escaped: {h}");
+        assert!(!h.contains("<b>x</b>"), "no bold inside code");
+        // Prose angle brackets are escaped (no injection).
+        let h2 = md_to_telegram_html("a <script> tag");
+        assert!(h2.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn md_to_telegram_html_leaves_unmatched_markers_literal() {
+        // A lone ** must not produce an unclosed tag (would 400 Telegram).
+        let h = md_to_telegram_html("2 ** 3 = 8 is not bold");
+        assert!(!h.contains("<b>"), "no stray bold tag: {h}");
     }
 
     #[test]
