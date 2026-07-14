@@ -11,12 +11,18 @@
 pub mod artifact;
 pub mod attest;
 pub mod client;
+pub mod handle;
 pub mod identity;
 pub mod ledger;
 pub mod reply;
+pub mod reputation;
 pub mod scroll;
+pub mod vote;
 
 pub use artifact::{Artifact, ArtifactKind};
 pub use client::{LedgerHead, NecropolisClient};
+pub use handle::{lore_name, Handle};
 pub use identity::Identity;
 pub use ledger::{Entry, Ledger};
+pub use reputation::{reputation, RepEvent, RepParams};
+pub use vote::{tally, Vote};
