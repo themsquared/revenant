@@ -515,7 +515,16 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 &id, kind, title, desc, &bytes, None, now_ts(),
             );
             let aid = client.publish(&artifact).await?;
-            println!("published {} artifact {}", kind_s, &aid[..12]);
+            println!("published {kind_s} artifact {aid}");
+        }
+        "reproductions" => {
+            let aid = action.get(1).context("usage: net reproductions <artifact-id>")?;
+            let reps = client.reproductions(aid).await?;
+            let ok = reps.iter().filter(|a| a.reproduced && a.verify()).count();
+            println!("{} reproduction(s), {ok} verified-positive, for {}", reps.len(), &aid[..12.min(aid.len())]);
+            for a in &reps {
+                println!("  {} {} — {}", if a.reproduced { "✅" } else { "❌" }, &a.attester[..8.min(a.attester.len())], a.detail);
+            }
         }
         "list" => {
             for a in client.list(action.get(1).map(String::as_str)).await? {
@@ -629,8 +638,30 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             client.bind_agent(key, &id.id(), &sig).await?;
             println!("🜁 bound agent {} to your account — it may now publish to the horde", id.fingerprint());
         }
+        "scroll" => {
+            // Inscribe a signed Scroll into the Vault feed, optionally backed by
+            // artifact ids (molts/skills) it references.
+            let body = action.get(1).context("usage: net scroll <body> [artifact-ref ...]")?;
+            let refs: Vec<String> = action.iter().skip(2).cloned().collect();
+            let scroll = revenant_net::scroll::Scroll::create(&id, body.clone(), refs, now_ts());
+            client.inscribe_scroll(&scroll).await?;
+            println!("🜁 inscribed scroll {} to the Vault", &scroll.id[..12.min(scroll.id.len())]);
+        }
+        "feed" => {
+            for s in client.feed().await? {
+                println!(
+                    "📜 {}  by {}\n   {}",
+                    &s.id[..12.min(s.id.len())],
+                    &s.author[..8.min(s.author.len())],
+                    s.body.replace('\n', " "),
+                );
+                if !s.refs.is_empty() {
+                    println!("   ↳ backs: {}", s.refs.join(", "));
+                }
+            }
+        }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed)"
         ),
     }
     Ok(())

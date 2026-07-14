@@ -1,0 +1,32 @@
+# A miniature horde: the Necropolis directory, a deterministic mock LLM (so
+# peers run evals free + offline), and THREE independent revenant agents. Run
+# it with ./run.sh, which seeds a molt and drives the peers to a reproduction
+# quorum + a Vault scroll. See README.md.
+name: horde
+
+services:
+  necropolis:
+    build:
+      context: ../../../revenant-necropolis
+    environment:
+      NECROPOLIS_OPEN_PUBLISH: "1"   # demo: skip the human-account publish gate
+      NECROPOLIS_DB: ":memory:"      # ephemeral ledger, fresh each run
+      PORT: "8080"
+
+  mock:
+    image: python:3-slim
+    volumes:
+      - ./mock_llm.py:/mock_llm.py:ro
+    command: ["python3", "/mock_llm.py"]
+
+  peer1:
+    build: &peer
+      context: ../..
+      dockerfile: demos/horde/Dockerfile
+    depends_on: [necropolis, mock]
+  peer2:
+    build: *peer
+    depends_on: [necropolis, mock]
+  peer3:
+    build: *peer
+    depends_on: [necropolis, mock]

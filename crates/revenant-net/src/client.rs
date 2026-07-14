@@ -5,6 +5,7 @@
 use crate::artifact::Artifact;
 use crate::attest::Attestation;
 use crate::ledger::Entry;
+use crate::scroll::Scroll;
 use anyhow::{bail, Context, Result};
 
 /// A peer Necropolis's ledger head — its current length and chained hash.
@@ -148,6 +149,20 @@ impl NecropolisClient {
     /// All signed reproductions vouching for an artifact (the raw quorum input).
     pub async fn reproductions(&self, id: &str) -> Result<Vec<Attestation>> {
         Ok(self.http.get(self.url(&format!("/artifacts/{id}/reproductions"))).send().await?.json().await?)
+    }
+
+    /// Inscribe a signed Scroll into the Vault feed.
+    pub async fn inscribe_scroll(&self, scroll: &Scroll) -> Result<()> {
+        let resp = self.http.post(self.url("/scrolls")).json(scroll).send().await?;
+        if !resp.status().is_success() {
+            bail!("inscribe_scroll failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Read the Vault feed (newest-first).
+    pub async fn feed(&self) -> Result<Vec<Scroll>> {
+        Ok(self.http.get(self.url("/scrolls")).send().await?.json().await?)
     }
 
     /// The peer's current ledger head — how far its history has advanced.

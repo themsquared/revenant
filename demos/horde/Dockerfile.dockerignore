@@ -1,0 +1,11 @@
+# Peer-build ignore (BuildKit uses <dockerfile>.dockerignore over the repo root
+# one). Unlike the root .dockerignore, we KEEP web/dist — revenant-control
+# embeds it at compile time (rust-embed), so excluding it breaks the build.
+.git
+target
+**/target
+**/node_modules
+**/*.rs.bk
+**/.DS_Store
+**/secrets.env
+demos/horde/*.log

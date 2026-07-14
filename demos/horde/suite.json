@@ -1,0 +1,11 @@
+{
+  "task": [
+    {
+      "id": "repro-check",
+      "prompt": "Emit the reproduction marker for this molt.",
+      "tier": "fast",
+      "tags": ["reproduction"],
+      "grade": { "contains": ["HORDE_REPRODUCE_OK"] }
+    }
+  ]
+}

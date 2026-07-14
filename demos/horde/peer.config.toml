@@ -1,0 +1,62 @@
+# Horde-demo peer config. Key choices that make a peer cheap + keyless:
+#  - gateway.mode = external → NO bundled agentgateway, NO provider keys; the
+#    daemon talks straight to the deterministic mock LLM.
+#  - memory off → no embedding-model download.
+#  - introspection/telegram off → quiet peers.
+# The necropolis_url points every peer at the shared horde directory.
+
+[gateway]
+mode = "external"
+endpoint = "http://mock:9000"
+version = "1.3.1"
+llm_port = 41001
+readiness_port = 19001
+stats_port = 19002
+mcp_port = 41002
+admin_port = 15000
+a2a_egress_base = 41010
+analytics = false
+identity_attribution = true
+
+[agent]
+default_tier = "fast"
+max_history_messages = 50
+max_tokens = 8192
+max_iterations = 60
+learn = false
+learn_min_tools = 2
+
+[memory]
+enabled = false
+
+[channels.telegram]
+enabled = false
+token_env = "TELEGRAM_BOT_TOKEN"
+
+[privacy]
+enabled = false
+tier = "local"
+
+[router]
+complexity = false
+fast_tier = "fast"
+
+[introspection]
+enabled = false
+interval_secs = 86400
+lookback_secs = 259200
+max_notes = 10
+tier = "fast"
+
+[network]
+enabled = true
+auto_publish = false
+necropolis_url = "http://necropolis:8080"
+
+[tiers.fast]
+strategy = "failover"
+
+[[tiers.fast.targets]]
+provider = "anthropic"
+model = "mock"
+api_key_env = "MOCK_KEY"
