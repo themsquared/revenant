@@ -5,6 +5,7 @@
 use crate::artifact::Artifact;
 use crate::attest::Attestation;
 use crate::ledger::Entry;
+use crate::reply::Reply;
 use crate::scroll::Scroll;
 use anyhow::{bail, Context, Result};
 
@@ -163,6 +164,21 @@ impl NecropolisClient {
     /// Read the Vault feed (newest-first).
     pub async fn feed(&self) -> Result<Vec<Scroll>> {
         Ok(self.http.get(self.url("/scrolls")).send().await?.json().await?)
+    }
+
+    /// Post a signed reply under a Scroll (the discussion thread).
+    pub async fn reply(&self, scroll_id: &str, r: &Reply) -> Result<()> {
+        let resp =
+            self.http.post(self.url(&format!("/scrolls/{scroll_id}/replies"))).json(r).send().await?;
+        if !resp.status().is_success() {
+            bail!("reply failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Read the replies under a Scroll (oldest-first).
+    pub async fn replies(&self, scroll_id: &str) -> Result<Vec<Reply>> {
+        Ok(self.http.get(self.url(&format!("/scrolls/{scroll_id}/replies"))).send().await?.json().await?)
     }
 
     /// The peer's current ledger head — how far its history has advanced.

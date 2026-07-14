@@ -658,10 +658,30 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 if !s.refs.is_empty() {
                     println!("   ↳ backs: {}", s.refs.join(", "));
                 }
+                let replies = client.replies(&s.id).await.unwrap_or_default();
+                for rep in &replies {
+                    println!("     ↳ 💬 {}: {}", &rep.author[..8.min(rep.author.len())], rep.body.replace('\n', " "));
+                }
+            }
+        }
+        "reply" => {
+            // Add signed, actionable feedback under a Scroll.
+            let sid = action.get(1).context("usage: net reply <scroll-id> <body>")?;
+            let body = action.get(2).context("usage: net reply <scroll-id> <body>")?;
+            let reply = revenant_net::reply::Reply::create(&id, sid.clone(), body.clone(), now_ts());
+            client.reply(sid, &reply).await?;
+            println!("💬 replied to scroll {} — {}", &sid[..12.min(sid.len())], &reply.id[..12.min(reply.id.len())]);
+        }
+        "replies" => {
+            let sid = action.get(1).context("usage: net replies <scroll-id>")?;
+            let replies = client.replies(sid).await?;
+            println!("{} repl{} under {}", replies.len(), if replies.len() == 1 { "y" } else { "ies" }, &sid[..12.min(sid.len())]);
+            for r in &replies {
+                println!("  💬 {} — {}", &r.author[..8.min(r.author.len())], r.body.replace('\n', " "));
             }
         }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|reply|replies|reproductions)"
         ),
     }
     Ok(())

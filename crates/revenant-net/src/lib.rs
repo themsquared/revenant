@@ -13,6 +13,7 @@ pub mod attest;
 pub mod client;
 pub mod identity;
 pub mod ledger;
+pub mod reply;
 pub mod scroll;
 
 pub use artifact::{Artifact, ArtifactKind};
