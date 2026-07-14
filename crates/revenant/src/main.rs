@@ -721,8 +721,50 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 println!("  💬 {} — {}", &r.author[..8.min(r.author.len())], r.body.replace('\n', " "));
             }
         }
+        "vote" => {
+            // Up/down a Scroll or Reply. `net vote <target-id> [up|down|retract]`.
+            let target = action.get(1).context("usage: net vote <scroll-or-reply-id> [up|down|retract]")?;
+            let dir = action.get(2).map(|s| s.as_str()).unwrap_or("up");
+            let value: i8 = match dir {
+                "up" | "+1" | "+" => 1,
+                "down" | "-1" | "-" => -1,
+                "retract" | "0" => 0,
+                _ => bail!("vote direction must be up | down | retract"),
+            };
+            let v = revenant_net::vote::Vote::create(&id, target.clone(), value, now_ts());
+            let t = client.vote(&v).await?;
+            println!(
+                "🗳  voted {dir} on {} — ▲{} ▼{} (score {})",
+                &target[..12.min(target.len())], t.up, t.down, t.score
+            );
+        }
+        "name" => {
+            // Claim a display name, or resolve one: `net name <name>` claims;
+            // `net name --who <pubkey>` looks up.
+            if action.get(1).map(|s| s.as_str()) == Some("--who") {
+                let pk = action.get(2).context("usage: net name --who <pubkey>")?;
+                println!("{} → {}", &pk[..8.min(pk.len())], client.name_of(pk).await?);
+            } else {
+                let name =
+                    action.get(1).context("usage: net name <display-name> | net name --who <pubkey>")?;
+                let h = revenant_net::handle::Handle::create(&id, name, now_ts());
+                client.claim_handle(&h).await?;
+                let me = id.id();
+                println!("🏷  claimed the name '{}' for {}", h.name, &me[..8.min(me.len())]);
+            }
+        }
+        "reputation" | "rep" => {
+            let reps = client.reputation().await?;
+            let mut ranked: Vec<_> = reps.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            println!("🏅 reputation — {} ranked", ranked.len());
+            for (pk, score) in ranked.iter().take(20) {
+                let nm = client.name_of(pk).await.unwrap_or_default();
+                println!("  {score:>7.2}  {nm}  ({})", &pk[..8.min(pk.len())]);
+            }
+        }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|reply|replies|reproductions)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation)"
         ),
     }
     Ok(())

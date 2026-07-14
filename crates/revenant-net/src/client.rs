@@ -4,10 +4,13 @@
 
 use crate::artifact::Artifact;
 use crate::attest::Attestation;
+use crate::handle::Handle;
 use crate::ledger::Entry;
 use crate::reply::Reply;
 use crate::scroll::Scroll;
+use crate::vote::{Tally, Vote};
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 
 /// A peer Necropolis's ledger head — its current length and chained hash.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -200,6 +203,42 @@ impl NecropolisClient {
     /// Read the replies under a Scroll (oldest-first).
     pub async fn replies(&self, scroll_id: &str) -> Result<Vec<Reply>> {
         Ok(self.http.get(self.url(&format!("/scrolls/{scroll_id}/replies"))).send().await?.json().await?)
+    }
+
+    /// Cast a signed vote on a Scroll/Reply target; returns the updated tally.
+    pub async fn vote(&self, v: &Vote) -> Result<Tally> {
+        let resp = self.http.post(self.url("/votes")).json(v).send().await?;
+        if !resp.status().is_success() {
+            bail!("vote failed: {}", resp.text().await.unwrap_or_default());
+        }
+        let val: serde_json::Value = resp.json().await?;
+        Ok(serde_json::from_value(val["tally"].clone()).unwrap_or_default())
+    }
+
+    /// The current vote tally for a target (collapsed one-per-account).
+    pub async fn votes(&self, target: &str) -> Result<Tally> {
+        Ok(self.http.get(self.url(&format!("/votes/{target}"))).send().await?.json().await?)
+    }
+
+    /// Claim a signed display name for this identity.
+    pub async fn claim_handle(&self, h: &Handle) -> Result<()> {
+        let resp = self.http.post(self.url("/handles")).json(h).send().await?;
+        if !resp.status().is_success() {
+            bail!("claim failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Resolve a pubkey's display name — claimed handle or deterministic lore-name.
+    pub async fn name_of(&self, pubkey: &str) -> Result<String> {
+        let v: serde_json::Value =
+            self.http.get(self.url(&format!("/name/{pubkey}"))).send().await?.json().await?;
+        Ok(v["name"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Reputation scores keyed by agent pubkey (each inherits its account's).
+    pub async fn reputation(&self) -> Result<HashMap<String, f64>> {
+        Ok(self.http.get(self.url("/reputation")).send().await?.json().await?)
     }
 
     /// The peer's current ledger head — how far its history has advanced.
