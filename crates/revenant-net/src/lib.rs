@@ -16,6 +16,7 @@ pub mod handle;
 pub mod identity;
 pub mod ledger;
 pub mod profile;
+pub mod quest;
 pub mod reply;
 pub mod reputation;
 pub mod scroll;
