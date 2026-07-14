@@ -3,6 +3,7 @@
 //! attest a successful local re-verification.
 
 use crate::artifact::Artifact;
+use crate::attest::Attestation;
 use crate::ledger::Entry;
 use anyhow::{bail, Context, Result};
 
@@ -132,6 +133,21 @@ impl NecropolisClient {
             .await
             .context("attesting")?;
         Ok(())
+    }
+
+    /// Publish a signed reproduction attestation — proof this revenant re-ran an
+    /// improvement's eval and reproduced (or didn't) the win. Feeds the quorum.
+    pub async fn publish_reproduction(&self, att: &Attestation) -> Result<()> {
+        let resp = self.http.post(self.url("/reproductions")).json(att).send().await?;
+        if !resp.status().is_success() {
+            bail!("publish_reproduction failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// All signed reproductions vouching for an artifact (the raw quorum input).
+    pub async fn reproductions(&self, id: &str) -> Result<Vec<Attestation>> {
+        Ok(self.http.get(self.url(&format!("/artifacts/{id}/reproductions"))).send().await?.json().await?)
     }
 
     /// The peer's current ledger head — how far its history has advanced.

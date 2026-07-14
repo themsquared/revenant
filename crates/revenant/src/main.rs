@@ -9,6 +9,7 @@ mod autoupdate;
 mod budget;
 mod daemon;
 mod introspect;
+mod reproduce;
 mod repl;
 mod service;
 
@@ -219,6 +220,12 @@ enum Command {
     /// its operating notes (the lessons it applies every turn). Shows what it
     /// noticed, the notes now in force, and any suggestions for you.
     Introspect,
+    /// Reproduce a horde improvement: pull the molt, re-run its eval suite on
+    /// this box, and sign+post a reproduction attestation (the promotion quorum).
+    Reproduce {
+        /// The Improvement artifact id to reproduce.
+        artifact_id: String,
+    },
     /// Background jobs: list recent, or `show <id>` for detail (async coding etc).
     Jobs {
         /// (empty) to list · show <id>
@@ -361,6 +368,7 @@ async fn run_command(command: Command) -> Result<()> {
             Command::Status => cmd_status().await,
             Command::Spend { window } => cmd_spend(window).await,
             Command::Introspect => cmd_introspect().await,
+            Command::Reproduce { artifact_id } => reproduce::cmd_reproduce(artifact_id).await,
             Command::Jobs { action } => cmd_jobs(action).await,
             Command::Doctor => cmd_doctor().await,
             Command::Update { check } => cmd_update(check),
