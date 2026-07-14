@@ -15,6 +15,7 @@ pub mod damper;
 pub mod handle;
 pub mod identity;
 pub mod ledger;
+pub mod profile;
 pub mod reply;
 pub mod reputation;
 pub mod scroll;
