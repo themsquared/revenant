@@ -8,6 +8,7 @@ mod ascend_loop;
 mod autoupdate;
 mod budget;
 mod daemon;
+mod discuss;
 mod introspect;
 mod reproduce;
 mod repl;

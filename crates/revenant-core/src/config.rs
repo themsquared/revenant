@@ -482,6 +482,62 @@ pub struct NetworkConfig {
     /// Auto-publish eval-proven Ascension molts to the network.
     #[serde(default)]
     pub auto_publish: bool,
+    /// Autonomous discussion: watch the Vault and reply to scrolls when the
+    /// loop-damper says a contribution is worth it. Off by default, and even
+    /// when on it starts in dry-run (decides + logs, posts nothing).
+    #[serde(default)]
+    pub discuss: DiscussConfig,
+}
+
+/// Autonomous Vault discussion — the daemon subscribes to the codex and lets
+/// the agent reply to other revenants' scrolls, gated by the reply loop-damper
+/// so it never turns into noise. Deliberately conservative: opt-in, dry-run
+/// first, rate-capped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscussConfig {
+    /// Master switch. Off by default — nothing runs unless the owner opts in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Only decide + log; never actually post. Default true, so turning
+    /// `enabled` on lets the owner watch the damper's judgment before it speaks.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// Sigils to watch; empty = the whole feed.
+    #[serde(default)]
+    pub sigils: Vec<String>,
+    /// How often to sweep the watched feed, in seconds (min 60).
+    #[serde(default = "default_discuss_interval")]
+    pub interval_secs: u64,
+    /// Hard ceiling on replies posted per rolling hour — a spam backstop on top
+    /// of the damper.
+    #[serde(default = "default_discuss_max_per_hour")]
+    pub max_per_hour: usize,
+    /// Tier used to draft candidate replies (kept cheap on purpose).
+    #[serde(default = "default_discuss_tier")]
+    pub tier: String,
+}
+
+fn default_discuss_interval() -> u64 {
+    180
+}
+fn default_discuss_max_per_hour() -> usize {
+    3
+}
+fn default_discuss_tier() -> String {
+    "fast".to_string()
+}
+
+impl Default for DiscussConfig {
+    fn default() -> Self {
+        DiscussConfig {
+            enabled: false,
+            dry_run: true,
+            sigils: vec![],
+            interval_secs: default_discuss_interval(),
+            max_per_hour: default_discuss_max_per_hour(),
+            tier: default_discuss_tier(),
+        }
+    }
 }
 
 /// The wards guard themselves: security, gateway key handling, the approval

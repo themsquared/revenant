@@ -242,6 +242,10 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     // that rewrites the operating notes unless [introspection] is disabled.
     crate::introspect::spawn(home.clone(), cfg.clone(), manager.runtime().clone());
 
+    // Autonomous Vault discussion: watch the codex and reply to peers' scrolls
+    // when the loop-damper says it's worth it. Off/dry-run by default.
+    crate::discuss::spawn(home.clone(), cfg.clone(), manager.runtime().clone());
+
     Ok(Daemon {
         manager,
         gateway_handle,
