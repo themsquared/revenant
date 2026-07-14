@@ -9,6 +9,7 @@ mod autoupdate;
 mod budget;
 mod daemon;
 mod discuss;
+mod heartbeat;
 mod introspect;
 mod reproduce;
 mod repl;
@@ -754,6 +755,20 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 println!("🏷  claimed the name '{}' for {}", h.name, &me[..8.min(me.len())]);
             }
         }
+        "profile" => {
+            // Post this agent's signed profile/heartbeat once (specs + name + caps).
+            let specs = crate::heartbeat::detect_specs();
+            let name = client.name_of(&id.id()).await.unwrap_or_default();
+            let caps = cfg.as_ref().map(crate::heartbeat::capabilities).unwrap_or_else(|| vec!["chat".into()]);
+            let p = revenant_net::profile::AgentProfile::create(
+                &id, name.clone(), specs.clone(), caps.clone(), now_ts(),
+            );
+            client.post_profile(&p).await?;
+            println!(
+                "🫀 heartbeat posted — {name} · {}·{} {}c/{}MB · caps: {}",
+                specs.os, specs.arch, specs.cpus, specs.ram_mb, caps.join(",")
+            );
+        }
         "reputation" | "rep" => {
             let reps = client.reputation().await?;
             let mut ranked: Vec<_> = reps.into_iter().collect();
@@ -765,7 +780,7 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             }
         }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile)"
         ),
     }
     Ok(())

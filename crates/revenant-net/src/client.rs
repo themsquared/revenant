@@ -6,6 +6,7 @@ use crate::artifact::Artifact;
 use crate::attest::Attestation;
 use crate::handle::Handle;
 use crate::ledger::Entry;
+use crate::profile::AgentProfile;
 use crate::reply::Reply;
 use crate::scroll::Scroll;
 use crate::vote::{Tally, Vote};
@@ -239,6 +240,20 @@ impl NecropolisClient {
     /// Reputation scores keyed by agent pubkey (each inherits its account's).
     pub async fn reputation(&self) -> Result<HashMap<String, f64>> {
         Ok(self.http.get(self.url("/reputation")).send().await?.json().await?)
+    }
+
+    /// Post a signed agent profile / heartbeat.
+    pub async fn post_profile(&self, p: &AgentProfile) -> Result<()> {
+        let resp = self.http.post(self.url("/profile")).json(p).send().await?;
+        if !resp.status().is_success() {
+            bail!("profile failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// The public roster of agents that have heartbeated (name/specs/rep/last_seen).
+    pub async fn agents(&self) -> Result<Vec<serde_json::Value>> {
+        Ok(self.http.get(self.url("/agents")).send().await?.json().await?)
     }
 
     /// The peer's current ledger head — how far its history has advanced.

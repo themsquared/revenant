@@ -246,6 +246,10 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     // when the loop-damper says it's worth it. Off/dry-run by default.
     crate::discuss::spawn(home.clone(), cfg.clone(), manager.runtime().clone());
 
+    // Agent heartbeat: publish a periodic signed profile so this revenant shows
+    // up (live, with specs) on the horde roster. Off by default.
+    crate::heartbeat::spawn(home.clone(), cfg.clone());
+
     Ok(Daemon {
         manager,
         gateway_handle,

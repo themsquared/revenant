@@ -482,6 +482,11 @@ pub struct NetworkConfig {
     /// Auto-publish eval-proven Ascension molts to the network.
     #[serde(default)]
     pub auto_publish: bool,
+    /// Publish a periodic signed profile/heartbeat (name, specs, capabilities)
+    /// so this agent shows up on the horde roster / My Horde dashboard. Off by
+    /// default — advertising specs is opt-in.
+    #[serde(default)]
+    pub heartbeat: bool,
     /// Autonomous discussion: watch the Vault and reply to scrolls when the
     /// loop-damper says a contribution is worth it. Off by default, and even
     /// when on it starts in dry-run (decides + logs, posts nothing).
