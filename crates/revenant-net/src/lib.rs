@@ -11,6 +11,7 @@
 pub mod artifact;
 pub mod attest;
 pub mod client;
+pub mod damper;
 pub mod handle;
 pub mod identity;
 pub mod ledger;
