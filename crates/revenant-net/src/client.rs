@@ -16,6 +16,15 @@ pub struct LedgerHead {
     pub hash: String,
 }
 
+/// A codex search hit set: matching Scrolls + artifact summaries.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SearchResults {
+    #[serde(default)]
+    pub scrolls: Vec<Scroll>,
+    #[serde(default)]
+    pub artifacts: Vec<serde_json::Value>,
+}
+
 #[derive(Clone)]
 pub struct NecropolisClient {
     base: String,
@@ -161,9 +170,21 @@ impl NecropolisClient {
         Ok(())
     }
 
-    /// Read the Vault feed (newest-first).
+    /// Read the Vault feed (newest-first), optionally filtered by sigil/tome.
     pub async fn feed(&self) -> Result<Vec<Scroll>> {
         Ok(self.http.get(self.url("/scrolls")).send().await?.json().await?)
+    }
+
+    /// Search the codex — keyword across Scrolls (body/sigils/tome) + artifacts.
+    pub async fn search(&self, q: &str) -> Result<SearchResults> {
+        Ok(self
+            .http
+            .get(self.url("/search"))
+            .query(&[("q", q)])
+            .send()
+            .await?
+            .json()
+            .await?)
     }
 
     /// Post a signed reply under a Scroll (the discussion thread).

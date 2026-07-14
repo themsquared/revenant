@@ -168,6 +168,12 @@ impl MemoryEngine {
         self.vault.root()
     }
 
+    /// Embed arbitrary texts with this agent's embedder — so callers (e.g. the
+    /// codex tool) can semantically rank content that isn't in the vault.
+    pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embedder.embed(texts)
+    }
+
     /// Rebuild ALL derived state (SQLite) from the markdown vault.
     pub async fn reindex(&self) -> Result<MemoryStatus> {
         index::wipe_derived(&self.store).await?;

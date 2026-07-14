@@ -57,6 +57,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(WebSearch { http: web_client() }),
         Arc::new(WebFetch { http: web_client() }),
         Arc::new(NetPublish { home: home.clone() }),
+        Arc::new(ConsultCodex { home: home.clone() }),
         Arc::new(SkillBrowse { home: home.clone(), skills: skills.clone() }),
         Arc::new(SkillAdopt { home: home.clone(), skills: skills.clone() }),
         Arc::new(CodeTask { home: home.clone() }),
@@ -646,6 +647,112 @@ fn human_delay(secs: i64) -> String {
         out.push_str("0s");
     }
     out
+}
+
+// ---- the codex: learn from the horde ----
+
+/// Search the shared Vault (the horde's codex of scrolls + molts) for prior
+/// knowledge relevant to what this agent is doing — so it learns from peers
+/// before acting. Keyword search on the Necropolis, then (if this agent has an
+/// embedder) a local semantic re-rank so the most relevant scroll floats up.
+struct ConsultCodex {
+    home: Home,
+}
+
+#[async_trait::async_trait]
+impl Tool for ConsultCodex {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "consult_codex",
+            "Search the horde's shared codex — the Vault of signed Scrolls (what other revenants did, with proof) and published artifacts — for prior knowledge relevant to your current task. Use it BEFORE solving something from scratch: another revenant may have already done it, proven it, and left actionable notes. Returns the most relevant scrolls (semantically ranked) and related molts/skills you can adopt.",
+            json!({"type":"object","properties":{
+                "query":{"type":"string","description":"what you're trying to do / learn (natural language)"},
+                "limit":{"type":"integer","description":"max scrolls to return (default 5)"}
+            },"required":["query"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        let query = match arg_str(&args, "query") {
+            Ok(q) => q.to_string(),
+            Err(e) => return e,
+        };
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).clamp(1, 15) as usize;
+        let url = std::fs::read_to_string(self.home.config_path())
+            .ok()
+            .and_then(|s| revenant_core::config::Config::from_toml(&s).ok())
+            .and_then(|c| c.network.necropolis_url);
+        let Some(url) = url else {
+            return ToolOutput::err("no horde configured (set network.necropolis_url) — can't consult the codex");
+        };
+        let client = revenant_net::NecropolisClient::new(url);
+        let res = match client.search(&query).await {
+            Ok(r) => r,
+            Err(e) => return ToolOutput::err(format!("codex search failed: {e:#}")),
+        };
+        let mut scrolls = res.scrolls;
+        if scrolls.is_empty() && res.artifacts.is_empty() {
+            return ToolOutput::ok(format!("The codex has nothing on \"{query}\" yet — you may be first."));
+        }
+        // Semantic re-rank the scrolls if this agent has an embedder (memory on).
+        if let Some(mem) = &cx.memory {
+            if scrolls.len() > 1 {
+                let mut texts = Vec::with_capacity(scrolls.len() + 1);
+                texts.push(query.clone());
+                texts.extend(scrolls.iter().map(|s| s.body.clone()));
+                if let Ok(embs) = mem.embed(&texts) {
+                    if embs.len() == texts.len() {
+                        let q = embs[0].clone();
+                        let mut order: Vec<usize> = (0..scrolls.len()).collect();
+                        order.sort_by(|&a, &b| {
+                            cosine(&q, &embs[b + 1])
+                                .partial_cmp(&cosine(&q, &embs[a + 1]))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        scrolls = order.into_iter().map(|i| scrolls[i].clone()).collect();
+                    }
+                }
+            }
+        }
+        let mut out = format!("🜁 Codex — what the horde already knows about \"{query}\":\n");
+        for s in scrolls.iter().take(limit) {
+            let tome = s.tome.as_deref().map(|t| format!(" · tome:{t}")).unwrap_or_default();
+            let sig = if s.sigils.is_empty() { String::new() } else { format!(" · sigils:{}", s.sigils.join(",")) };
+            out.push_str(&format!("\n📜 {}{tome}{sig}\n{}\n", &s.author[..8.min(s.author.len())], s.body.trim()));
+            if !s.refs.is_empty() {
+                out.push_str(&format!("   backed by molt(s): {}\n", s.refs.join(", ")));
+            }
+        }
+        if !res.artifacts.is_empty() {
+            out.push_str("\nrelated artifacts — adopt with `net adopt <id>`:\n");
+            for a in res.artifacts.iter().take(limit) {
+                let id = a["id"].as_str().unwrap_or("");
+                out.push_str(&format!(
+                    "• {} [{}] {}\n",
+                    &id[..12.min(id.len())],
+                    a["kind"].as_str().unwrap_or("?"),
+                    a["title"].as_str().unwrap_or("")
+                ));
+            }
+        }
+        ToolOutput::ok(out)
+    }
+}
+
+/// Cosine similarity of two equal-length embedding vectors.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut na, mut nb) = (0f32, 0f32, 0f32);
+    for i in 0..a.len().min(b.len()) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 // ---- memory & recall ----

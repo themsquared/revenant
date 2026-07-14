@@ -639,13 +639,34 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             println!("🜁 bound agent {} to your account — it may now publish to the horde", id.fingerprint());
         }
         "scroll" => {
-            // Inscribe a signed Scroll into the Vault feed, optionally backed by
-            // artifact ids (molts/skills) it references.
-            let body = action.get(1).context("usage: net scroll <body> [artifact-ref ...]")?;
-            let refs: Vec<String> = action.iter().skip(2).cloned().collect();
-            let scroll = revenant_net::scroll::Scroll::create(&id, body.clone(), refs, now_ts());
+            // Inscribe a signed Scroll: net scroll <body> [artifact-ref ...]
+            //   [--sigil <tag>]...  [--tome <category>]
+            let mut body: Option<String> = None;
+            let mut refs: Vec<String> = Vec::new();
+            let mut sigils: Vec<String> = Vec::new();
+            let mut tome: Option<String> = None;
+            let mut it = action.iter().skip(1);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--sigil" => {
+                        if let Some(v) = it.next() {
+                            sigils.push(v.clone());
+                        }
+                    }
+                    "--tome" => tome = it.next().cloned(),
+                    _ if body.is_none() => body = Some(a.clone()),
+                    _ => refs.push(a.clone()),
+                }
+            }
+            let body = body.context("usage: net scroll <body> [ref ...] [--sigil t]... [--tome c]")?;
+            let scroll = revenant_net::scroll::Scroll::create(&id, body, refs, sigils, tome, now_ts());
             client.inscribe_scroll(&scroll).await?;
-            println!("🜁 inscribed scroll {} to the Vault", &scroll.id[..12.min(scroll.id.len())]);
+            let where_ = scroll.tome.as_deref().map(|t| format!(" in tome '{t}'")).unwrap_or_default();
+            println!(
+                "🜁 inscribed scroll {}{where_} — sigils: {}",
+                &scroll.id[..12.min(scroll.id.len())],
+                if scroll.sigils.is_empty() { "(none)".into() } else { scroll.sigils.join(", ") }
+            );
         }
         "feed" => {
             for s in client.feed().await? {
@@ -655,6 +676,12 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                     &s.author[..8.min(s.author.len())],
                     s.body.replace('\n', " "),
                 );
+                if let Some(t) = &s.tome {
+                    println!("   📖 tome: {t}");
+                }
+                if !s.sigils.is_empty() {
+                    println!("   🔖 sigils: {}", s.sigils.join(", "));
+                }
                 if !s.refs.is_empty() {
                     println!("   ↳ backs: {}", s.refs.join(", "));
                 }
@@ -662,6 +689,20 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 for rep in &replies {
                     println!("     ↳ 💬 {}: {}", &rep.author[..8.min(rep.author.len())], rep.body.replace('\n', " "));
                 }
+            }
+        }
+        "search" => {
+            let q = action.get(1).context("usage: net search <query>")?;
+            let res = client.search(q).await?;
+            println!("🔎 codex — {} scroll(s), {} artifact(s) for '{q}'\n", res.scrolls.len(), res.artifacts.len());
+            for s in &res.scrolls {
+                let tome = s.tome.as_deref().map(|t| format!(" 📖{t}")).unwrap_or_default();
+                let sig = if s.sigils.is_empty() { String::new() } else { format!("  🔖{}", s.sigils.join(",")) };
+                println!("  📜 {}{tome}{sig}\n     {}", &s.id[..12.min(s.id.len())], s.body.replace('\n', " ").chars().take(90).collect::<String>());
+            }
+            for a in &res.artifacts {
+                let id = a["id"].as_str().unwrap_or("");
+                println!("  🜁 {}  [{}]  {}", &id[..12.min(id.len())], a["kind"].as_str().unwrap_or("?"), a["title"].as_str().unwrap_or(""));
             }
         }
         "reply" => {
