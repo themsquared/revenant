@@ -89,6 +89,10 @@ async fn sweep(
         client.reputation().await.ok().and_then(|m| m.get(me).copied()).unwrap_or(0.0);
     let params = DamperParams::default();
 
+    // A per-sweep tally so the worker's activity is observable at INFO even when
+    // every decision is silence (the healthy default on a quiet feed).
+    let (mut foreign, mut considered, mut declined, mut silent, mut spoke) = (0u32, 0u32, 0u32, 0u32, 0u32);
+
     for s in client.feed().await?.into_iter().take(40) {
         if &s.author == me {
             continue; // don't discuss your own scroll
@@ -96,6 +100,7 @@ async fn sweep(
         if !d.sigils.is_empty() && !s.sigils.iter().any(|g| d.sigils.contains(g)) {
             continue; // outside the watched sigils
         }
+        foreign += 1;
         let replies = client.replies(&s.id).await.unwrap_or_default();
         let depth = replies.len() as u32;
         let already = replies.iter().any(|r| &r.author == me);
@@ -113,10 +118,15 @@ async fn sweep(
             continue;
         }
 
+        considered += 1;
         // One cheap call: draft a contribution, or decline.
         let candidate = match draft_reply(runtime, &d.tier, &s, &replies).await {
             Ok(Some(c)) => c,
-            Ok(None) => continue, // the model chose silence
+            Ok(None) => {
+                declined += 1;
+                tracing::debug!("discuss: model declined on {} (nothing to add)", short(&s.id));
+                continue;
+            }
             Err(e) => {
                 tracing::debug!("discuss: draft failed for {}: {e:#}", short(&s.id));
                 continue;
@@ -135,6 +145,7 @@ async fn sweep(
         };
         match should_speak(&inp, &params) {
             SpeakDecision::Speak => {
+                spoke += 1;
                 if d.dry_run {
                     tracing::info!(
                         "discuss[dry-run] WOULD reply to {} (depth {depth}, novelty {novelty:.2}): {}",
@@ -155,10 +166,16 @@ async fn sweep(
                 }
             }
             other => {
+                silent += 1;
                 tracing::debug!("discuss: silent on {} — {other:?}", short(&s.id));
             }
         }
     }
+    tracing::info!(
+        "discuss: swept {foreign} foreign scroll(s) — {considered} considered, {declined} declined, \
+{silent} below-bar, {spoke} spoke{}",
+        if d.dry_run { " (dry-run)" } else { "" }
+    );
     Ok(())
 }
 
