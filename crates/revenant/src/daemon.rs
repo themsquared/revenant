@@ -240,7 +240,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
 
     // Behavioral self-review: journal friction always; run the periodic review
     // that rewrites the operating notes unless [introspection] is disabled.
-    crate::introspect::spawn(cfg.clone(), manager.runtime().clone());
+    crate::introspect::spawn(home.clone(), cfg.clone(), manager.runtime().clone());
 
     Ok(Daemon {
         manager,

@@ -562,6 +562,12 @@ async fn introspect(State(state): State<AppState>) -> Result<Json<serde_json::Va
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("self-review failed: {e:#}"),
         })?;
+    // On-demand: the owner asked, so always surface it to chat surfaces too.
+    state.manager.runtime().events.emit(revenant_core::event::Event::SelfReviewCompleted {
+        summary: review.summary.clone(),
+        lessons: review.lessons.len() as u32,
+        suggestions: review.suggestions.clone(),
+    });
     Ok(Json(json!({
         "summary": review.summary,
         "lessons": review.lessons,

@@ -1605,11 +1605,11 @@ Return via record_self_review."
             }
         }
 
-        self.events.emit(Event::SelfReviewCompleted {
-            summary: summary.clone(),
-            lessons: lessons.len() as u32,
-            suggestions: suggestions.clone(),
-        });
+        // NOTE: self_review does the work + writes the notes silently. It does
+        // NOT emit SelfReviewCompleted — the CALLER decides whether to surface
+        // it to chat, so the background timer can stay quiet (dedup + interval
+        // gate) while an on-demand `revenant introspect` always reports. This
+        // is what stops the "every restart → another suggestions ping" spam.
         Ok(SelfReview { summary, lessons, suggestions })
     }
 }
@@ -1620,6 +1620,14 @@ pub struct SelfReview {
     pub summary: String,
     pub lessons: Vec<String>,
     pub suggestions: Vec<String>,
+}
+
+impl SelfReview {
+    /// A stable fingerprint of what a reader would see, so a background review
+    /// that produced nothing new can stay silent.
+    pub fn fingerprint(&self) -> String {
+        format!("{}\u{1}{}", self.summary, self.suggestions.join("\u{1}"))
+    }
 }
 
 /// Extract the bullet lessons from an OPERATING_NOTES.md body (for reporting a
