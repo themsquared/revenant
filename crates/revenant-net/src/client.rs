@@ -76,6 +76,52 @@ impl NecropolisClient {
         Ok(())
     }
 
+    /// Begin a magic-link login for an existing verified account. Returns the
+    /// one-time token in dev mode; None means "check your email".
+    pub async fn login(&self, email: &str) -> Result<Option<String>> {
+        let resp = self
+            .http
+            .post(self.url("/account/login"))
+            .json(&serde_json::json!({ "email": email }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("login failed: {}", resp.text().await.unwrap_or_default());
+        }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v.get("login_token").and_then(|t| t.as_str()).map(String::from))
+    }
+
+    /// Exchange a one-time login token for a session bearer.
+    pub async fn open_session(&self, token: &str) -> Result<String> {
+        let resp = self
+            .http
+            .post(self.url("/account/session"))
+            .json(&serde_json::json!({ "token": token }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("session failed: {}", resp.text().await.unwrap_or_default());
+        }
+        let v: serde_json::Value = resp.json().await?;
+        v.get("session").and_then(|s| s.as_str()).map(String::from).context("no session in response")
+    }
+
+    /// Bind this agent to an account via a login session (magic-link path — no
+    /// account key needed). `sig` is this agent signing the session token.
+    pub async fn bind_via_session(&self, session: &str, pubkey: &str, sig: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url("/account/bind-session"))
+            .json(&serde_json::json!({ "session": session, "pubkey": pubkey, "sig": sig }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("bind failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
     /// Bind this agent's pubkey to a verified account (sig proves ownership).
     pub async fn bind_agent(&self, account_key: &str, pubkey: &str, sig: &str) -> Result<()> {
         let resp = self

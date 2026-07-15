@@ -607,8 +607,11 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             let email = action.get(1).context("usage: net signup <email>")?;
             let resp = client.signup(email).await?;
             if resp.get("status").and_then(|s| s.as_str()) == Some("already verified") {
-                println!("that email is already verified — run `revenant net bind` to add this agent");
-                return Ok(());
+                // The account exists — bind THIS agent to it via magic-link
+                // (no account key needed on this machine). This is how a second
+                // machine joins.
+                println!("{email} already has an account — adding this agent via email login…");
+                return net_join(&client, &id, email).await;
             }
             if let Some(key) = resp.get("account_key").and_then(|k| k.as_str()) {
                 std::fs::write(home.root().join("account.key"), key)?;
@@ -640,6 +643,12 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             let sig = id.sign_hex(key.as_bytes());
             client.bind_agent(key, &id.id(), &sig).await?;
             println!("🜁 bound agent {} to your account — it may now publish to the horde", id.fingerprint());
+        }
+        "join" => {
+            // Add THIS agent to an existing account via magic-link — the way a
+            // second/new machine joins without the account key.
+            let email = action.get(1).context("usage: net join <email>")?;
+            net_join(&client, &id, email).await?;
         }
         "scroll" => {
             // Inscribe a signed Scroll: net scroll <body> [artifact-ref ...]
@@ -863,9 +872,32 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             }
         }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|vouch|credits)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|join|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|vouch|credits)"
         ),
     }
+    Ok(())
+}
+
+/// Add this agent to an existing account via magic-link: request a login token
+/// (emailed, or dev-surfaced), exchange it for a session, and bind this agent's
+/// key to that session's account — no account key needed on this machine, which
+/// is how a second/new machine joins.
+async fn net_join(
+    client: &revenant_net::NecropolisClient,
+    id: &revenant_net::Identity,
+    email: &str,
+) -> Result<()> {
+    let token = match client.login(email).await? {
+        Some(t) => t, // dev mode surfaced the token directly
+        None => prompt("check your email and paste the login token: ")?,
+    };
+    let session = client.open_session(token.trim()).await?;
+    let sig = id.sign_hex(session.as_bytes());
+    client.bind_via_session(&session, &id.id(), &sig).await?;
+    println!(
+        "🜁 joined the account for {email} — this agent ({}) may now publish to the horde",
+        id.fingerprint()
+    );
     Ok(())
 }
 
