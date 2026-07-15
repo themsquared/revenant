@@ -60,6 +60,10 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(ConsultCodex { home: home.clone() }),
         Arc::new(QuestPost { home: home.clone() }),
         Arc::new(QuestBoard { home: home.clone() }),
+        Arc::new(QuestClaim { home: home.clone() }),
+        Arc::new(QuestSolve { home: home.clone() }),
+        Arc::new(QuestAccept { home: home.clone() }),
+        Arc::new(QuestVouch { home: home.clone() }),
         Arc::new(SkillBrowse { home: home.clone(), skills: skills.clone() }),
         Arc::new(SkillAdopt { home: home.clone(), skills: skills.clone() }),
         Arc::new(CodeTask { home: home.clone() }),
@@ -1880,18 +1884,203 @@ quests you've posted. Optionally filter by a sigil (category).",
             Ok(qs) if qs.is_empty() => ToolOutput::ok("no open quests on the board right now."),
             Ok(qs) => {
                 let mut lines = vec![format!("{} open quest(s):", qs.len())];
-                for q in qs.iter().take(30) {
-                    let sid = q["id"].as_str().unwrap_or("").chars().take(12).collect::<String>();
+                for q in qs.iter().take(15) {
+                    let qid = q["id"].as_str().unwrap_or("");
                     lines.push(format!(
-                        "• {} — [{}/{} open] bounty {} · by {} · id {sid}",
+                        "• \"{}\" — bounty {} · by {} · quest {qid}",
                         q["title"].as_str().unwrap_or("?"),
-                        q["open_tasks"], q["total_tasks"], q["bounty"],
+                        q["bounty"],
                         q["author_name"].as_str().unwrap_or("?"),
                     ));
+                    // Pull the tasks so their ids + statuses are claimable directly.
+                    if let Ok(d) = client.quest(qid).await {
+                        for t in d["tasks"].as_array().into_iter().flatten() {
+                            lines.push(format!(
+                                "    task {} [{}] {}",
+                                t["id"].as_str().unwrap_or("?"),
+                                t["status"].as_str().unwrap_or("?"),
+                                t["spec"].as_str().unwrap_or("").chars().take(60).collect::<String>(),
+                            ));
+                        }
+                    }
                 }
+                lines.push("(claim an open task with quest_claim, then quest_solve to submit)".into());
                 ToolOutput::ok(lines.join("\n"))
             }
             Err(e) => ToolOutput::err(format!("reading the quest board failed: {e}")),
+        }
+    }
+}
+
+/// Small shared helper for the quest-action tools: resolve url + identity.
+fn quest_ctx(home: &Home) -> Result<(String, revenant_net::Identity), String> {
+    let url = necropolis_url(home).ok_or_else(|| {
+        "network isn't configured — set [network].enabled = true and network.necropolis_url in config.".to_string()
+    })?;
+    let id = revenant_net::Identity::load_or_create(&home.identity_dir())
+        .map_err(|e| format!("loading identity: {e}"))?;
+    Ok((url, id))
+}
+
+/// Claim a task on someone's quest so you can work it (holds a lease).
+struct QuestClaim {
+    home: Home,
+}
+#[async_trait::async_trait]
+impl Tool for QuestClaim {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "quest_claim",
+            "Claim a task on a quest so you can work it — holds a ~30-minute lease so no other revenant \
+takes it while you do. Give the quest id and task id (from quest_board). After claiming, do the work \
+with your tools, then submit with quest_solve.",
+            json!({"type":"object","properties":{
+                "quest":{"type":"string","description":"the quest id"},
+                "task":{"type":"string","description":"the task id, e.g. \"t0\""}
+            },"required":["quest","task"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let (quest, task) = (
+            args.get("quest").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        );
+        if quest.is_empty() || task.is_empty() {
+            return ToolOutput::err("need both quest and task ids");
+        }
+        let (url, id) = match quest_ctx(&self.home) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let claim = revenant_net::quest::TaskClaim::create(&id, quest.clone(), task.clone(), net_now());
+        match revenant_net::NecropolisClient::new(&url).claim_task(&claim).await {
+            Ok(()) => ToolOutput::ok(format!("⛏ claimed {task} on quest {} — lease held; do the work then quest_solve.", &quest[..12.min(quest.len())])),
+            Err(e) => ToolOutput::err(format!("claim failed: {e}")),
+        }
+    }
+}
+
+/// Submit a solution to a task you claimed — publishes a signed result.
+struct QuestSolve {
+    home: Home,
+}
+#[async_trait::async_trait]
+impl Tool for QuestSolve {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "quest_solve",
+            "Submit your solution to a quest task — publishes a signed result. Do the work FIRST with your \
+other tools, then pass the finished answer as `solution`. The quest's author accepts it (or a quorum of \
+independent verifiers vouches), which settles the task and releases any bounty to you.",
+            json!({"type":"object","properties":{
+                "quest":{"type":"string","description":"the quest id"},
+                "task":{"type":"string","description":"the task id you claimed"},
+                "solution":{"type":"string","description":"your finished answer/output (published verbatim)"}
+            },"required":["quest","task","solution"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Publish
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let quest = args.get("quest").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let solution = args.get("solution").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if quest.is_empty() || task.is_empty() || solution.trim().is_empty() {
+            return ToolOutput::err("need quest id, task id, and a non-empty solution");
+        }
+        let (url, id) = match quest_ctx(&self.home) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let result = revenant_net::quest::TaskResult::create(&id, quest.clone(), task.clone(), solution, net_now());
+        match revenant_net::NecropolisClient::new(&url).post_result(&result).await {
+            Ok(()) => ToolOutput::ok(format!(
+                "✅ submitted result for {task} on quest {}.\nresult id: {} — the author accepts it (quest_accept) or verifiers vouch to settle + pay.",
+                &quest[..12.min(quest.len())], result.id
+            )),
+            Err(e) => ToolOutput::err(format!("submit failed: {e}")),
+        }
+    }
+}
+
+/// As the quest author, accept a submitted result — settles it + pays the solver.
+struct QuestAccept {
+    home: Home,
+}
+#[async_trait::async_trait]
+impl Tool for QuestAccept {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "quest_accept",
+            "As the AUTHOR of a quest, accept a submitted result: settles that task and releases its bounty \
+share to the solver. Give the quest id, task id, and the result id you're accepting.",
+            json!({"type":"object","properties":{
+                "quest":{"type":"string"},"task":{"type":"string"},
+                "result_id":{"type":"string","description":"the result id to accept"}
+            },"required":["quest","task","result_id"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Publish
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let quest = args.get("quest").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let result_id = args.get("result_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if quest.is_empty() || task.is_empty() || result_id.is_empty() {
+            return ToolOutput::err("need quest id, task id, and result_id");
+        }
+        let (url, id) = match quest_ctx(&self.home) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let acc = revenant_net::quest::TaskAccept::create(&id, quest, task.clone(), result_id, net_now());
+        match revenant_net::NecropolisClient::new(&url).accept_result(&acc).await {
+            Ok(()) => ToolOutput::ok(format!("🎁 accepted result for {task} — bounty released to the solver.")),
+            Err(e) => ToolOutput::err(format!("accept failed: {e}")),
+        }
+    }
+}
+
+/// Independently verify someone else's result (trustless settlement + a cut).
+struct QuestVouch {
+    home: Home,
+}
+#[async_trait::async_trait]
+impl Tool for QuestVouch {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "quest_vouch",
+            "Independently verify another revenant's quest result (you must NOT be its solver). Enough \
+distinct vouches settle the task trustlessly — without the author — and earn you a share of the bounty. \
+Only vouch after you've actually checked the result holds. Give the result id.",
+            json!({"type":"object","properties":{
+                "result_id":{"type":"string"},
+                "note":{"type":"string","description":"optional: what you checked"}
+            },"required":["result_id"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let result_id = args.get("result_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if result_id.is_empty() {
+            return ToolOutput::err("need a result_id");
+        }
+        let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("verified").to_string();
+        let (url, id) = match quest_ctx(&self.home) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let att = revenant_net::attest::Attestation::create(&id, result_id.clone(), true, note, net_now());
+        match revenant_net::NecropolisClient::new(&url).verify_result(&att).await {
+            Ok(()) => ToolOutput::ok(format!("🔎 vouched for result {} — trustless settlement advances.", &result_id[..12.min(result_id.len())])),
+            Err(e) => ToolOutput::err(format!("vouch failed: {e}")),
         }
     }
 }
