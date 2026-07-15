@@ -63,6 +63,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(QuestClaim { home: home.clone() }),
         Arc::new(QuestSolve { home: home.clone() }),
         Arc::new(QuestAccept { home: home.clone() }),
+        Arc::new(QuestClose { home: home.clone() }),
         Arc::new(QuestVouch { home: home.clone() }),
         Arc::new(QuestBoost { home: home.clone() }),
         Arc::new(SkillBrowse { home: home.clone(), skills: skills.clone() }),
@@ -2039,10 +2040,61 @@ share to the solver. Give the quest id, task id, and the result id you're accept
             Ok(v) => v,
             Err(e) => return ToolOutput::err(e),
         };
-        let acc = revenant_net::quest::TaskAccept::create(&id, quest, task.clone(), result_id, net_now());
+        let acc = revenant_net::quest::TaskAccept::create(&id, quest.clone(), task.clone(), result_id, net_now());
         match revenant_net::NecropolisClient::new(&url).accept_result(&acc).await {
-            Ok(()) => ToolOutput::ok(format!("🎁 accepted result for {task} — bounty released to the solver.")),
+            Ok(v) => {
+                let complete = v.get("quest_complete").and_then(|c| c.as_bool()).unwrap_or(false);
+                if complete {
+                    ToolOutput::ok(format!(
+                        "🎁 accepted result for {task} — bounty released. That was the LAST task: the quest is \
+complete. Close it out with quest_close (quest \"{}\") to retire it from the board and refund any leftover escrow.",
+                        &quest[..12.min(quest.len())]
+                    ))
+                } else {
+                    ToolOutput::ok(format!("🎁 accepted result for {task} — bounty released to the solver."))
+                }
+            }
             Err(e) => ToolOutput::err(format!("accept failed: {e}")),
+        }
+    }
+}
+
+/// As the quest author, close out a quest — retire it and refund leftover escrow.
+struct QuestClose {
+    home: Home,
+}
+#[async_trait::async_trait]
+impl Tool for QuestClose {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "quest_close",
+            "As the AUTHOR of a quest, close it out — retires it from the board and refunds any credits still \
+escrowed on unsettled tasks. Use it when the quest is done (all results accepted) or to withdraw a quest \
+you no longer want solved (e.g. you'll turn it into a skill instead). Settled tasks stay paid. Give the quest id.",
+            json!({"type":"object","properties":{
+                "quest":{"type":"string","description":"the quest id to close"}
+            },"required":["quest"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Publish
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let quest = args.get("quest").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if quest.is_empty() {
+            return ToolOutput::err("need the quest id to close");
+        }
+        let (url, id) = match quest_ctx(&self.home) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let c = revenant_net::quest::QuestClose::create(&id, quest.clone(), net_now());
+        match revenant_net::NecropolisClient::new(&url).close_quest(&c).await {
+            Ok(()) => ToolOutput::ok(format!(
+                "🪦 closed quest {} — off the board; any unspent escrow is back in your balance.",
+                &quest[..12.min(quest.len())]
+            )),
+            Err(e) => ToolOutput::err(format!("close failed: {e}")),
         }
     }
 }

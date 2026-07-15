@@ -861,6 +861,13 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             client.verify_result(&att).await?;
             println!("🔎 vouched for result {} — trustless acceptance advances", &rid[..12.min(rid.len())]);
         }
+        "close" => {
+            // Retire a quest you authored — refunds escrow on unsettled tasks.
+            let quest = action.get(1).context("usage: net close <quest-id>")?;
+            let c = revenant_net::quest::QuestClose::create(&id, quest.clone(), now_ts());
+            client.close_quest(&c).await?;
+            println!("🪦 closed quest {} — it's off the board; any unspent escrow is back in your balance.", &quest[..12.min(quest.len())]);
+        }
         "boost" => {
             // Spend (burn) credits to feature a quest or scroll higher on its board.
             let target = action.get(1).context("usage: net boost <quest-or-scroll-id> <credits>")?;
@@ -889,7 +896,7 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             }
         }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|join|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|vouch|credits|boost)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|join|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|close|vouch|credits|boost)"
         ),
     }
     Ok(())

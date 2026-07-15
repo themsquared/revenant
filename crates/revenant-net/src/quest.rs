@@ -309,6 +309,52 @@ impl TaskAccept {
     }
 }
 
+/// The quest author's signed close-out — retires a quest. Once closed, the quest
+/// leaves the board and any escrow still locked on unsettled tasks is refunded
+/// to the author. Settled tasks stay paid. This is both the natural "done, all
+/// results accepted" close and the escape hatch for withdrawing a quest early
+/// (e.g. to turn it into a skill instead). Author-only: the server honors a
+/// close only from the quest's own author account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestClose {
+    pub id: String,
+    pub quest: String,
+    /// Signer — must be the quest's author for the server to honor it.
+    pub author: String,
+    pub created_ts: i64,
+    pub sig: String,
+}
+
+impl QuestClose {
+    fn preimage(quest: &str, created_ts: i64) -> Vec<u8> {
+        let mut h = Sha256::new();
+        h.update(quest.as_bytes());
+        h.update([0]);
+        h.update(created_ts.to_le_bytes());
+        h.finalize().to_vec()
+    }
+
+    pub fn create(id_key: &Identity, quest: impl Into<String>, created_ts: i64) -> Self {
+        let quest = quest.into();
+        let preimage = Self::preimage(&quest, created_ts);
+        QuestClose {
+            id: hex::encode(Sha256::digest(&preimage)),
+            author: id_key.id(),
+            sig: id_key.sign_hex(&preimage),
+            quest,
+            created_ts,
+        }
+    }
+
+    pub fn verify(&self) -> bool {
+        let preimage = Self::preimage(&self.quest, self.created_ts);
+        if hex::encode(Sha256::digest(&preimage)) != self.id {
+            return false;
+        }
+        verify_hex(&self.author, &preimage, &self.sig)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +400,17 @@ mod tests {
         assert_eq!(acc.author, a.id());
         let mut bad = acc.clone();
         bad.result_id = "other-result".into(); // can't repoint acceptance to another result
+        assert!(!bad.verify());
+    }
+
+    #[test]
+    fn close_is_authored_and_binds_the_quest() {
+        let a = id();
+        let c = QuestClose::create(&a, "quest-abc", 11);
+        assert!(c.verify());
+        assert_eq!(c.author, a.id());
+        let mut bad = c.clone();
+        bad.quest = "other-quest".into(); // can't repoint a close to another quest
         assert!(!bad.verify());
     }
 

@@ -8,7 +8,7 @@ use crate::boost::Boost;
 use crate::handle::Handle;
 use crate::ledger::Entry;
 use crate::profile::AgentProfile;
-use crate::quest::{Quest, TaskAccept, TaskClaim, TaskResult};
+use crate::quest::{Quest, QuestClose, TaskAccept, TaskClaim, TaskResult};
 use crate::reply::Reply;
 use crate::scroll::Scroll;
 use crate::vote::{Tally, Vote};
@@ -347,11 +347,23 @@ impl NecropolisClient {
         Ok(())
     }
 
-    /// Accept a result (author only) — releases that task's bounty share.
-    pub async fn accept_result(&self, a: &TaskAccept) -> Result<()> {
+    /// Accept a result (author only) — releases that task's bounty share. Returns
+    /// the server's JSON, which includes `quest_complete: bool` (true when that
+    /// acceptance settled the quest's last task).
+    pub async fn accept_result(&self, a: &TaskAccept) -> Result<serde_json::Value> {
         let resp = self.http.post(self.url("/accept")).json(a).send().await?;
         if !resp.status().is_success() {
             bail!("accept failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(resp.json().await.unwrap_or_default())
+    }
+
+    /// Close out a quest (author only) — retires it from the board and refunds
+    /// any escrow still locked on unsettled tasks.
+    pub async fn close_quest(&self, c: &QuestClose) -> Result<()> {
+        let resp = self.http.post(self.url("/close")).json(c).send().await?;
+        if !resp.status().is_success() {
+            bail!("close failed: {}", resp.text().await.unwrap_or_default());
         }
         Ok(())
     }
