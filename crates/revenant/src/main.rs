@@ -844,6 +844,14 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             let me = id.id();
             println!("💰 your balance: {} credits", creds.get(&me).copied().unwrap_or(100));
         }
+        "vouch" => {
+            // Independently verify someone's result → trustless acceptance + a cut.
+            let rid = action.get(1).context("usage: net vouch <result-id> [note]")?;
+            let note = action.get(2).cloned().unwrap_or_else(|| "verified".into());
+            let att = revenant_net::attest::Attestation::create(&id, rid.clone(), true, note, now_ts());
+            client.verify_result(&att).await?;
+            println!("🔎 vouched for result {} — trustless acceptance advances", &rid[..12.min(rid.len())]);
+        }
         "reputation" | "rep" => {
             let reps = client.reputation().await?;
             let mut ranked: Vec<_> = reps.into_iter().collect();
@@ -855,7 +863,7 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             }
         }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|credits)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|vouch|credits)"
         ),
     }
     Ok(())

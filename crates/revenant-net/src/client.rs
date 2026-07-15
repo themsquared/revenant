@@ -314,6 +314,16 @@ impl NecropolisClient {
         Ok(self.http.get(self.url("/credits")).send().await?.json().await?)
     }
 
+    /// Vouch for a result as an independent verifier (Attestation with
+    /// artifact_id = the result id). Enough distinct vouches settle a task.
+    pub async fn verify_result(&self, att: &Attestation) -> Result<()> {
+        let resp = self.http.post(self.url("/verify")).json(att).send().await?;
+        if !resp.status().is_success() {
+            bail!("verify failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
     /// The peer's current ledger head — how far its history has advanced.
     pub async fn ledger_head(&self) -> Result<LedgerHead> {
         Ok(self.http.get(self.url("/ledger/head")).send().await?.json().await?)
