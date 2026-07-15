@@ -769,6 +769,80 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 specs.os, specs.arch, specs.cpus, specs.ram_mb, caps.join(",")
             );
         }
+        "quests" => {
+            // Browse the open quest board, optionally by sigil.
+            let sigil = action.get(1).map(|s| s.as_str());
+            let qs = client.quests(sigil).await?;
+            let short12 = |v: &serde_json::Value| v.as_str().unwrap_or("").chars().take(12).collect::<String>();
+            println!("⚔ {} open quest(s){}", qs.len(), sigil.map(|s| format!(" · sigil {s}")).unwrap_or_default());
+            for q in &qs {
+                println!(
+                    "  {} — {}  [{}/{} open] 🎁{} · by {}",
+                    short12(&q["id"]), q["title"].as_str().unwrap_or(""),
+                    q["open_tasks"], q["total_tasks"], q["bounty"],
+                    q["author_name"].as_str().unwrap_or("")
+                );
+            }
+        }
+        "quest" => {
+            // net quest <title> <spec> [--task <spec>]... [--bounty N] [--sigil s]... [--deadline ts]
+            let (mut bounty, mut deadline) = (0u64, 0i64);
+            let (mut tasks, mut sigils, mut pos) = (Vec::new(), Vec::new(), Vec::new());
+            let mut i = 1;
+            while i < action.len() {
+                match action[i].as_str() {
+                    "--task" => { i += 1; tasks.push(action.get(i).cloned().unwrap_or_default()); }
+                    "--bounty" => { i += 1; bounty = action.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); }
+                    "--sigil" => { i += 1; sigils.push(action.get(i).cloned().unwrap_or_default()); }
+                    "--deadline" => { i += 1; deadline = action.get(i).and_then(|v| v.parse().ok()).unwrap_or(0); }
+                    other => pos.push(other.to_string()),
+                }
+                i += 1;
+            }
+            let title = pos.first().cloned().context(
+                "usage: net quest <title> <spec> [--task <spec>]... [--bounty N] [--sigil s]...",
+            )?;
+            let spec = pos.get(1).cloned().unwrap_or_default();
+            let task_vec: Vec<revenant_net::quest::Task> = if tasks.is_empty() {
+                vec![revenant_net::quest::Task { id: "t0".into(), spec: spec.clone(), verify: String::new() }]
+            } else {
+                tasks.iter().enumerate()
+                    .map(|(n, s)| revenant_net::quest::Task { id: format!("t{n}"), spec: s.clone(), verify: String::new() })
+                    .collect()
+            };
+            let n = task_vec.len();
+            let q = revenant_net::quest::Quest::create(&id, title.clone(), spec, task_vec, sigils, bounty, deadline, now_ts());
+            client.post_quest(&q).await?;
+            println!("⚔ posted quest {title} ({n} task(s), 🎁{bounty} bounty)\n   id: {}", q.id);
+        }
+        "claim" => {
+            let quest = action.get(1).context("usage: net claim <quest-id> <task-id>")?;
+            let task = action.get(2).context("usage: net claim <quest-id> <task-id>")?;
+            let c = revenant_net::quest::TaskClaim::create(&id, quest.clone(), task.clone(), now_ts());
+            client.claim_task(&c).await?;
+            println!("⛏  claimed {}/{task} — lease held", &quest[..12.min(quest.len())]);
+        }
+        "solve" => {
+            let quest = action.get(1).context("usage: net solve <quest-id> <task-id> <output>")?;
+            let task = action.get(2).context("usage: net solve <quest-id> <task-id> <output>")?;
+            let output = action.get(3).context("usage: net solve <quest-id> <task-id> <output>")?;
+            let r = revenant_net::quest::TaskResult::create(&id, quest.clone(), task.clone(), output.clone(), now_ts());
+            client.post_result(&r).await?;
+            println!("✅ result posted for {}/{task}\n   result id (for the author to accept): {}", &quest[..12.min(quest.len())], r.id);
+        }
+        "accept" => {
+            let quest = action.get(1).context("usage: net accept <quest-id> <task-id> <result-id>")?;
+            let task = action.get(2).context("usage: net accept <quest-id> <task-id> <result-id>")?;
+            let result_id = action.get(3).context("usage: net accept <quest-id> <task-id> <result-id>")?;
+            let a = revenant_net::quest::TaskAccept::create(&id, quest.clone(), task.clone(), result_id.clone(), now_ts());
+            client.accept_result(&a).await?;
+            println!("🎁 accepted {}/{task} — bounty share released to the solver", &quest[..12.min(quest.len())]);
+        }
+        "credits" => {
+            let creds = client.credits().await?;
+            let me = id.id();
+            println!("💰 your balance: {} credits", creds.get(&me).copied().unwrap_or(100));
+        }
         "reputation" | "rep" => {
             let reps = client.reputation().await?;
             let mut ranked: Vec<_> = reps.into_iter().collect();
@@ -780,7 +854,7 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             }
         }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|credits)"
         ),
     }
     Ok(())

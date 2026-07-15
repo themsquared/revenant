@@ -7,6 +7,7 @@ use crate::attest::Attestation;
 use crate::handle::Handle;
 use crate::ledger::Entry;
 use crate::profile::AgentProfile;
+use crate::quest::{Quest, TaskAccept, TaskClaim, TaskResult};
 use crate::reply::Reply;
 use crate::scroll::Scroll;
 use crate::vote::{Tally, Vote};
@@ -254,6 +255,63 @@ impl NecropolisClient {
     /// The public roster of agents that have heartbeated (name/specs/rep/last_seen).
     pub async fn agents(&self) -> Result<Vec<serde_json::Value>> {
         Ok(self.http.get(self.url("/agents")).send().await?.json().await?)
+    }
+
+    // --- distributed solving: the quest queue ---------------------------
+
+    /// Post a signed Quest (its bounty is escrowed by the server).
+    pub async fn post_quest(&self, q: &Quest) -> Result<()> {
+        let resp = self.http.post(self.url("/quests")).json(q).send().await?;
+        if !resp.status().is_success() {
+            bail!("quest failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Open quests with work left, optionally matched to a sigil.
+    pub async fn quests(&self, sigil: Option<&str>) -> Result<Vec<serde_json::Value>> {
+        let mut req = self.http.get(self.url("/quests"));
+        if let Some(s) = sigil {
+            req = req.query(&[("sigil", s)]);
+        }
+        Ok(req.send().await?.json().await?)
+    }
+
+    /// Full per-task state of one quest.
+    pub async fn quest(&self, id: &str) -> Result<serde_json::Value> {
+        Ok(self.http.get(self.url(&format!("/quests/{id}"))).send().await?.json().await?)
+    }
+
+    /// Claim a task under a lease.
+    pub async fn claim_task(&self, c: &TaskClaim) -> Result<()> {
+        let resp = self.http.post(self.url("/claims")).json(c).send().await?;
+        if !resp.status().is_success() {
+            bail!("claim failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Publish a signed result for a task.
+    pub async fn post_result(&self, r: &TaskResult) -> Result<()> {
+        let resp = self.http.post(self.url("/results")).json(r).send().await?;
+        if !resp.status().is_success() {
+            bail!("result failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Accept a result (author only) — releases that task's bounty share.
+    pub async fn accept_result(&self, a: &TaskAccept) -> Result<()> {
+        let resp = self.http.post(self.url("/accept")).json(a).send().await?;
+        if !resp.status().is_success() {
+            bail!("accept failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Credit balances keyed by agent pubkey.
+    pub async fn credits(&self) -> Result<HashMap<String, i64>> {
+        Ok(self.http.get(self.url("/credits")).send().await?.json().await?)
     }
 
     /// The peer's current ledger head — how far its history has advanced.
