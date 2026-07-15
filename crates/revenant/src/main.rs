@@ -1565,6 +1565,39 @@ async fn cmd_setup() -> Result<()> {
         return Ok(());
     }
 
+    // The network is opt-in (a personal agent needs no account), so setup never
+    // forces registration — but point the way, since it's easy to miss.
+    println!(
+        "\n{D}Join the horde anytime — {B}revenant net signup <email>{X}{D} — to publish skills, \
+         post quests, and earn. Optional; your agent works fully without it.{X}"
+    );
+
+    // Always-on: offer to install the background service so revenant keeps
+    // running (and reaches you over Telegram/web) without a terminal open, and
+    // relaunches on boot. Default yes — that's the point of an agent that
+    // "comes back."
+    println!();
+    let want_svc = prompt_default(
+        &format!("{P}Run revenant as an always-on background service?{X} (recommended) [Y/n]: "),
+        "y",
+    )?;
+    if want_svc.eq_ignore_ascii_case("y") {
+        match service::install() {
+            Ok(()) => {
+                println!(
+                    "\n{G}✓ You're set — revenant is always-on now{X} and will relaunch on boot.\n\
+                     {D}talk to it: {B}revenant chat{X}{D} (connects to the running service) · \
+                     logs: {} · stop: revenant service uninstall{X}\n",
+                    home.logs_dir().join("daemon.err.log").display()
+                );
+                return Ok(());
+            }
+            Err(e) => println!(
+                "  {Y}!{X} couldn't install the service ({e:#}) — starting a foreground session instead."
+            ),
+        }
+    }
+
     println!(
         "\n{G}✓ You're set.{X} Starting your first conversation — just type.\n\
          {D}(/help for commands · /persona to switch voice · Ctrl-C to leave.){X}\n"

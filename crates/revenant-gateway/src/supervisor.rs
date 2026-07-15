@@ -3,6 +3,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
@@ -60,8 +61,8 @@ impl GatewaySupervisor {
         let token = CancellationToken::new();
         let child_token = token.clone();
 
-        let mut child = self.spawn().context("spawning agentgateway")?;
-        self.wait_ready(&mut child).await?;
+        let (mut child, errbuf) = self.spawn().context("spawning agentgateway")?;
+        self.wait_ready(&mut child, &errbuf).await?;
 
         let task = tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
@@ -78,7 +79,7 @@ impl GatewaySupervisor {
                         }
                         backoff = (backoff * 2).min(Duration::from_secs(60));
                         match self.spawn() {
-                            Ok(new_child) => {
+                            Ok((new_child, _)) => {
                                 child = new_child;
                                 // Reset backoff only after it stays up a while.
                                 let healthy_after = tokio::time::Instant::now()
@@ -110,7 +111,10 @@ impl GatewaySupervisor {
         Ok(SupervisorHandle { token, task })
     }
 
-    fn spawn(&self) -> Result<tokio::process::Child> {
+    /// Spawn the gateway. Returns the child and a small ring buffer of its most
+    /// recent stderr lines, so a startup failure can surface the gateway's OWN
+    /// error (e.g. a port bind failure) instead of a bare exit code.
+    fn spawn(&self) -> Result<(tokio::process::Child, Arc<Mutex<Vec<String>>>)> {
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.arg("-f")
             .arg(&self.config_path)
@@ -124,22 +128,29 @@ impl GatewaySupervisor {
             .kill_on_drop(true);
         let mut child = cmd.spawn()?;
 
-        // Forward child output into our logs, tagged.
+        // Forward child output into our logs, tagged; also capture stderr.
         if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(forward_lines(stdout, "gateway"));
+            tokio::spawn(forward_lines(stdout, "gateway", None));
         }
+        let errbuf = Arc::new(Mutex::new(Vec::new()));
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(forward_lines(stderr, "gateway"));
+            tokio::spawn(forward_lines(stderr, "gateway", Some(errbuf.clone())));
         }
-        Ok(child)
+        Ok((child, errbuf))
     }
 
-    async fn wait_ready(&self, child: &mut tokio::process::Child) -> Result<()> {
+    async fn wait_ready(
+        &self,
+        child: &mut tokio::process::Child,
+        errbuf: &Arc<Mutex<Vec<String>>>,
+    ) -> Result<()> {
         let llm = revenant_llm::LlmClient::new(format!("http://127.0.0.1:{}", self.llm_port));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(Some(status)) = child.try_wait() {
-                bail!("agentgateway exited during startup: {status}");
+                // Let the stderr forwarder flush the exit lines, then surface them.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                bail!("agentgateway exited during startup: {status}{}", startup_diagnosis(errbuf));
             }
             if llm.models_ready().await {
                 tracing::info!("agentgateway ready on port {}", self.llm_port);
@@ -147,16 +158,53 @@ impl GatewaySupervisor {
             }
             if tokio::time::Instant::now() >= deadline {
                 let _ = child.start_kill();
-                bail!("agentgateway did not become ready within 30s");
+                bail!("agentgateway did not become ready within 30s{}", startup_diagnosis(errbuf));
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 }
 
-async fn forward_lines(reader: impl tokio::io::AsyncRead + Unpin, tag: &'static str) {
+/// Turn the captured gateway stderr into an actionable tail for an error — the
+/// gateway's own lines, plus a hint when it looks like a port is already taken
+/// (the most common fresh-install failure: a standalone agentgateway or a second
+/// revenant already holding a port).
+fn startup_diagnosis(errbuf: &Arc<Mutex<Vec<String>>>) -> String {
+    let tail = errbuf.lock().map(|b| b.join("\n")).unwrap_or_default();
+    let lc = tail.to_lowercase();
+    let hint = if (lc.contains("address") && lc.contains("use"))
+        || lc.contains("eaddrinuse")
+        || lc.contains("bind")
+    {
+        "\nhint: a port is already in use — a standalone agentgateway or another revenant \
+         instance may be running. Check `lsof -nP -iTCP -sTCP:LISTEN`, or change the \
+         [gateway] ports (llm_port/admin_port/…) in ~/.revenant/config.toml."
+    } else {
+        ""
+    };
+    if tail.is_empty() {
+        hint.to_string()
+    } else {
+        format!("\n--- gateway stderr ---\n{tail}{hint}")
+    }
+}
+
+async fn forward_lines(
+    reader: impl tokio::io::AsyncRead + Unpin,
+    tag: &'static str,
+    capture: Option<Arc<Mutex<Vec<String>>>>,
+) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::info!(target: "gateway", "[{tag}] {line}");
+        if let Some(buf) = &capture {
+            if let Ok(mut b) = buf.lock() {
+                b.push(line);
+                let len = b.len();
+                if len > 20 {
+                    b.drain(0..len - 20); // keep only the last 20 lines
+                }
+            }
+        }
     }
 }
