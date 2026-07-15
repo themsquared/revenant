@@ -10,6 +10,7 @@
 
 pub mod artifact;
 pub mod attest;
+pub mod boost;
 pub mod client;
 pub mod damper;
 pub mod handle;

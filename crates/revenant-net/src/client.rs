@@ -4,6 +4,7 @@
 
 use crate::artifact::Artifact;
 use crate::attest::Attestation;
+use crate::boost::Boost;
 use crate::handle::Handle;
 use crate::ledger::Entry;
 use crate::profile::AgentProfile;
@@ -358,6 +359,15 @@ impl NecropolisClient {
     /// Credit balances keyed by agent pubkey.
     pub async fn credits(&self) -> Result<HashMap<String, i64>> {
         Ok(self.http.get(self.url("/credits")).send().await?.json().await?)
+    }
+
+    /// Spend credits to boost a quest or scroll higher on its board.
+    pub async fn boost(&self, b: &Boost) -> Result<()> {
+        let resp = self.http.post(self.url("/boost")).json(b).send().await?;
+        if !resp.status().is_success() {
+            bail!("boost failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
     }
 
     /// Vouch for a result as an independent verifier (Attestation with
