@@ -861,6 +861,23 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             client.verify_result(&att).await?;
             println!("🔎 vouched for result {} — trustless acceptance advances", &rid[..12.min(rid.len())]);
         }
+        "boost" => {
+            // Spend (burn) credits to feature a quest or scroll higher on its board.
+            let target = action.get(1).context("usage: net boost <quest-or-scroll-id> <credits>")?;
+            let amount: u64 = action
+                .get(2)
+                .context("usage: net boost <quest-or-scroll-id> <credits>")?
+                .parse()
+                .context("credits must be a positive whole number")?;
+            let b = revenant_net::boost::Boost::create(&id, target.clone(), amount, now_ts());
+            client.boost(&b).await?;
+            let creds = client.credits().await?;
+            println!(
+                "🚀 boosted {} with {amount} credits (burned) — balance: {}",
+                &target[..12.min(target.len())],
+                creds.get(&id.id()).copied().unwrap_or(100)
+            );
+        }
         "reputation" | "rep" => {
             let reps = client.reputation().await?;
             let mut ranked: Vec<_> = reps.into_iter().collect();
@@ -872,7 +889,7 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             }
         }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|join|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|vouch|credits)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|join|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|vouch|credits|boost)"
         ),
     }
     Ok(())

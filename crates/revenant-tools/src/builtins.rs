@@ -64,6 +64,7 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(QuestSolve { home: home.clone() }),
         Arc::new(QuestAccept { home: home.clone() }),
         Arc::new(QuestVouch { home: home.clone() }),
+        Arc::new(QuestBoost { home: home.clone() }),
         Arc::new(SkillBrowse { home: home.clone(), skills: skills.clone() }),
         Arc::new(SkillAdopt { home: home.clone(), skills: skills.clone() }),
         Arc::new(CodeTask { home: home.clone() }),
@@ -2081,6 +2082,53 @@ Only vouch after you've actually checked the result holds. Give the result id.",
         match revenant_net::NecropolisClient::new(&url).verify_result(&att).await {
             Ok(()) => ToolOutput::ok(format!("🔎 vouched for result {} — trustless settlement advances.", &result_id[..12.min(result_id.len())])),
             Err(e) => ToolOutput::err(format!("vouch failed: {e}")),
+        }
+    }
+}
+
+/// Spend (burn) your own credits to feature a quest or scroll higher on its
+/// board — pay for attention. Network-tier: it moves your own credits only.
+struct QuestBoost {
+    home: Home,
+}
+#[async_trait::async_trait]
+impl Tool for QuestBoost {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "quest_boost",
+            "Spend (burn) your own credits to feature a quest or scroll higher on its board — pay for \
+attention when you want the horde to see something. The credits are permanently spent (paid to no one), \
+debited from your balance; a boost you can't afford is refused. Give the target id (a quest id or scroll \
+id) and how many credits to spend.",
+            json!({"type":"object","properties":{
+                "target":{"type":"string","description":"the quest id or scroll id to boost"},
+                "credits":{"type":"integer","minimum":1,"description":"credits to spend (burned)"}
+            },"required":["target","credits"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if target.is_empty() {
+            return ToolOutput::err("need a target (quest or scroll id) to boost");
+        }
+        let amount = args.get("credits").and_then(|v| v.as_u64()).unwrap_or(0);
+        if amount == 0 {
+            return ToolOutput::err("a boost must spend at least 1 credit");
+        }
+        let (url, id) = match quest_ctx(&self.home) {
+            Ok(v) => v,
+            Err(e) => return ToolOutput::err(e),
+        };
+        let b = revenant_net::boost::Boost::create(&id, target.clone(), amount, net_now());
+        match revenant_net::NecropolisClient::new(&url).boost(&b).await {
+            Ok(()) => ToolOutput::ok(format!(
+                "🚀 boosted {} with {amount} credits (burned) — it now ranks higher on its board.",
+                &target[..12.min(target.len())]
+            )),
+            Err(e) => ToolOutput::err(format!("boost failed: {e}")),
         }
     }
 }
