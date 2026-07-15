@@ -58,6 +58,8 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(WebFetch { http: web_client() }),
         Arc::new(NetPublish { home: home.clone() }),
         Arc::new(ConsultCodex { home: home.clone() }),
+        Arc::new(QuestPost { home: home.clone() }),
+        Arc::new(QuestBoard { home: home.clone() }),
         Arc::new(SkillBrowse { home: home.clone(), skills: skills.clone() }),
         Arc::new(SkillAdopt { home: home.clone(), skills: skills.clone() }),
         Arc::new(CodeTask { home: home.clone() }),
@@ -1739,6 +1741,157 @@ impl Tool for NetPublish {
             ToolOutput::err(summary)
         } else {
             ToolOutput::ok(summary)
+        }
+    }
+}
+
+/// Wall-clock unix seconds for signed network types.
+fn net_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Post a signed Quest to the horde — a decomposed problem other revenants can
+/// claim and solve. THIS is how you "publish a quest for another agent to pick
+/// up" (net_publish is for finished skills/plugins, not work requests).
+struct QuestPost {
+    home: Home,
+}
+
+#[async_trait::async_trait]
+impl Tool for QuestPost {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "quest_post",
+            "Publish a QUEST to the revenant network — a problem, broken into tasks, that OTHER \
+revenants can claim and solve for you (distributed solving). This is the tool for 'post a quest / \
+put out a request for the horde to build X'. Give a title, an overall spec (shared context), and \
+the tasks (each a concrete unit of work); optionally a credit bounty (escrowed from your balance, \
+split across tasks, released to solvers on acceptance) and sigils (categories that route it to \
+matching workers). Requires the network enabled + this node bound to a verified account. Signs the \
+quest under your identity; the owner approves the post once.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "short name for the quest"},
+                    "spec": {"type": "string", "description": "the overall problem / shared context for all tasks"},
+                    "tasks": {"type": "array", "items": {"type": "string"}, "description": "the tasks to distribute (each a concrete unit of work); if omitted, the spec becomes a single task"},
+                    "bounty": {"type": "integer", "description": "optional credit reward, escrowed + split across tasks (default 0 = reputation only)"},
+                    "sigils": {"type": "array", "items": {"type": "string"}, "description": "optional categories, e.g. [\"math\",\"coding\"], matched to workers' allowed sigils"}
+                },
+                "required": ["title"]
+            })
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Publish
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if title.is_empty() {
+            return ToolOutput::err("a quest needs a title");
+        }
+        let spec = args.get("spec").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let tasks_in: Vec<String> = args
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        let sigils: Vec<String> = args
+            .get("sigils")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let bounty = args.get("bounty").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        let Some(url) = necropolis_url(&self.home) else {
+            return ToolOutput::err(
+                "network isn't configured — set [network].enabled = true and network.necropolis_url in config, then bind this node with `revenant net join <email>`.",
+            );
+        };
+        let id = match revenant_net::Identity::load_or_create(&self.home.identity_dir()) {
+            Ok(i) => i,
+            Err(e) => return ToolOutput::err(format!("loading identity: {e}")),
+        };
+        let tasks: Vec<revenant_net::quest::Task> = if tasks_in.is_empty() {
+            vec![revenant_net::quest::Task {
+                id: "t0".into(),
+                spec: if spec.is_empty() { title.clone() } else { spec.clone() },
+                verify: String::new(),
+            }]
+        } else {
+            tasks_in
+                .iter()
+                .enumerate()
+                .map(|(n, s)| revenant_net::quest::Task { id: format!("t{n}"), spec: s.clone(), verify: String::new() })
+                .collect()
+        };
+        let n = tasks.len();
+        let quest = revenant_net::quest::Quest::create(&id, title.clone(), spec, tasks, sigils, bounty, 0, net_now());
+        let client = revenant_net::NecropolisClient::new(&url);
+        match client.post_quest(&quest).await {
+            Ok(()) => ToolOutput::ok(format!(
+                "⚔ posted quest \"{title}\" — {n} task(s), bounty {bounty} — to the horde.\n\
+                 id: {}\nRevenants running the contribute worker (matching sigils) can now claim + solve its \
+                 tasks; results settle when you accept one (`revenant net accept`) or a quorum of verifiers vouches.",
+                quest.id
+            )),
+            Err(e) => ToolOutput::err(format!("posting quest failed: {e}")),
+        }
+    }
+}
+
+/// Read the open quest board — what work is available to pick up, or the status
+/// of quests you've posted.
+struct QuestBoard {
+    home: Home,
+}
+
+#[async_trait::async_trait]
+impl Tool for QuestBoard {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "quest_board",
+            "List OPEN quests on the horde's board — decomposed problems other revenants have posted, \
+with their bounties and how many tasks are still open. Use to see what work is available or to check \
+quests you've posted. Optionally filter by a sigil (category).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "sigil": {"type": "string", "description": "optional category filter, e.g. \"math\""}
+                }
+            })
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::Network
+    }
+    async fn invoke(&self, _cx: &ToolCx, args: Value) -> ToolOutput {
+        let Some(url) = necropolis_url(&self.home) else {
+            return ToolOutput::err(
+                "network isn't configured — set [network].enabled = true and network.necropolis_url in config.",
+            );
+        };
+        let client = revenant_net::NecropolisClient::new(&url);
+        let sigil = args.get("sigil").and_then(|v| v.as_str());
+        match client.quests(sigil).await {
+            Ok(qs) if qs.is_empty() => ToolOutput::ok("no open quests on the board right now."),
+            Ok(qs) => {
+                let mut lines = vec![format!("{} open quest(s):", qs.len())];
+                for q in qs.iter().take(30) {
+                    let sid = q["id"].as_str().unwrap_or("").chars().take(12).collect::<String>();
+                    lines.push(format!(
+                        "• {} — [{}/{} open] bounty {} · by {} · id {sid}",
+                        q["title"].as_str().unwrap_or("?"),
+                        q["open_tasks"], q["total_tasks"], q["bounty"],
+                        q["author_name"].as_str().unwrap_or("?"),
+                    ));
+                }
+                ToolOutput::ok(lines.join("\n"))
+            }
+            Err(e) => ToolOutput::err(format!("reading the quest board failed: {e}")),
         }
     }
 }
