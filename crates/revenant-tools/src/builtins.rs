@@ -550,22 +550,56 @@ impl Tool for DbQuery {
 /// common routine cases (`ls`, `cat foo`, `git status`, `grep x`) pass; the
 /// consequential ones (rm, mv, curl, mail, installs, `>`) do not.
 fn exec_is_read_only(command: &str) -> bool {
-    let cmd = command.trim();
+    // Strip trailing benign output redirections (silencing stderr/stdout doesn't
+    // mutate anything) before the operator scan, so `… 2>&1` stays routine.
+    let mut cmd = command.trim().to_string();
+    loop {
+        let trimmed = cmd.trim_end();
+        let stripped = ["2>&1", "2>/dev/null", "&>/dev/null", ">/dev/null"]
+            .iter()
+            .find_map(|s| trimmed.strip_suffix(s));
+        match stripped {
+            Some(pre) => cmd = pre.trim_end().to_string(),
+            None => break,
+        }
+    }
+    let cmd = cmd.trim();
     if cmd.is_empty() {
         return false;
     }
     // Any operator that could chain, redirect, or substitute a command → not
-    // auto-safe. (Plain `$VAR` is fine; `$(…)` command substitution is not.)
-    if cmd.contains(['|', '&', ';', '>', '<', '`', '\n']) || cmd.contains("$(") {
+    // auto-safe. Scan the SHELL-VISIBLE text (quoted spans removed), so a `;` or
+    // `|` inside a quoted argument — e.g. a SQL string — doesn't disqualify,
+    // while active command substitution (`$(…)`/backtick), even inside double
+    // quotes, still does. (Plain `$VAR` is fine.)
+    let (visible, saw_subst) = shell_visible(cmd);
+    if saw_subst
+        || visible.contains(['|', '&', ';', '>', '<', '`', '\n'])
+        || visible.contains("$(")
+    {
         return false;
     }
-    let mut parts = cmd.split_whitespace();
+    // Skip leading `VAR=val` environment-assignment prefixes (e.g.
+    // `HOME=/x revenant …`) to reach the actual program.
+    let mut parts = cmd.split_whitespace().peekable();
+    while let Some(tok) = parts.peek() {
+        let is_assign = !tok.starts_with(['/', '-'])
+            && tok.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+        if is_assign {
+            parts.next();
+        } else {
+            break;
+        }
+    }
     let Some(prog0) = parts.next() else { return false };
     let prog = prog0.rsplit('/').next().unwrap_or(prog0); // basename
+    let rest: Vec<&str> = parts.collect();
     // git: only read-only subcommands (config/stash/tag/etc. can mutate).
     if prog == "git" {
         return matches!(
-            parts.next().unwrap_or(""),
+            rest.first().copied().unwrap_or(""),
             "status" | "log" | "diff" | "show" | "branch" | "remote" | "rev-parse"
                 | "describe" | "blame" | "ls-files" | "shortlog" | "whatchanged"
         );
@@ -574,6 +608,15 @@ fn exec_is_read_only(command: &str) -> bool {
     if prog == "find" {
         return !cmd.contains("-delete") && !cmd.contains("-exec") && !cmd.contains("-execdir");
     }
+    // `revenant …`: only its read-only subcommands (the querying half of `net`,
+    // memory reads, doctor, version) — the mutating verbs still prompt.
+    if prog == "revenant" {
+        return revenant_is_read_only(&rest);
+    }
+    // `sqlite3 <db> "<sql>"`: safe when the SQL only reads.
+    if prog == "sqlite3" {
+        return sqlite_is_read_only(cmd);
+    }
     const READ_ONLY: &[&str] = &[
         "ls", "cat", "head", "tail", "wc", "stat", "file", "grep", "rg", "fd", "tree", "du",
         "df", "pwd", "echo", "printf", "date", "whoami", "id", "uname", "hostname", "uptime",
@@ -581,6 +624,75 @@ fn exec_is_read_only(command: &str) -> bool {
         "sha256sum", "md5sum", "sort", "uniq", "cut", "column", "nl", "seq", "jq",
     ];
     READ_ONLY.contains(&prog)
+}
+
+/// The shell-visible text of a command with quoted spans removed, plus whether
+/// active command substitution (`$(…)` or a backtick) appears outside single
+/// quotes. Single quotes are fully literal; inside double quotes `;|<>&` are
+/// literal but `$()`/backtick still expand — so we drop quoted characters from
+/// the operator scan yet flag substitution wherever it's live.
+fn shell_visible(s: &str) -> (String, bool) {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut subst = false;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                if c == '"' {
+                    quote = None;
+                } else if c == '`' || (c == '$' && chars.get(i + 1) == Some(&'(')) {
+                    subst = true;
+                }
+            }
+            _ => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                } else {
+                    out.push(c);
+                }
+            }
+        }
+        i += 1;
+    }
+    (out, subst)
+}
+
+/// Read-only `revenant` invocations — the querying subcommands that never write
+/// or reach out to mutate. Mutating verbs (net scroll/vote/quest/claim/solve/…,
+/// up, ascend, signup/bind) are absent, so they still prompt.
+fn revenant_is_read_only(rest: &[&str]) -> bool {
+    match rest.first().copied().unwrap_or("") {
+        "doctor" | "version" | "--version" | "-V" | "--help" | "-h" | "help" => true,
+        "memory" => matches!(rest.get(1).copied().unwrap_or(""), "search" | "status"),
+        "net" => matches!(
+            rest.get(1).copied().unwrap_or(""),
+            "peers" | "id" | "feed" | "search" | "replies" | "reproductions" | "list"
+                | "quests" | "credits" | "reputation" | "rep"
+        ),
+        _ => false,
+    }
+}
+
+/// Is a `sqlite3` command read-only — a SELECT or read-only dot/PRAGMA, with no
+/// statement that could write? Conservative: any write keyword disqualifies.
+fn sqlite_is_read_only(cmd: &str) -> bool {
+    let lc = cmd.to_lowercase();
+    const WRITES: &[&str] = &[
+        "insert", "update", "delete", "drop", "create", "alter", "replace", "attach",
+        "detach", "vacuum", "reindex", "truncate", ".import", ".restore", ".clone",
+    ];
+    if WRITES.iter().any(|w| lc.contains(w)) {
+        return false;
+    }
+    lc.contains("select") || lc.contains(".tables") || lc.contains(".schema") || lc.contains("pragma")
 }
 
 // ---- reminders & timers ----
@@ -2056,6 +2168,12 @@ mod dbquery_tests {
             "ls -la", "cat Cargo.toml", "grep -r foo src", "git status", "git log --oneline -5",
             "git diff", "wc -l src/main.rs", "find . -name '*.rs'", "cat $HOME/notes.txt",
             "echo hi", "rg TODO", "head -20 file",
+            // The two the owner flagged as needlessly prompting:
+            "HOME=/Users/x /Users/x/.revenant/bin/revenant net peers 2>&1",
+            "sqlite3 /x/.revenant/revenant.db \"select id,status from jobs where id=15;\"",
+            // …and their read-only kin.
+            "revenant net quests", "revenant net credits", "revenant doctor",
+            "revenant memory search foo", "ls 2>/dev/null",
         ] {
             assert!(exec_is_read_only(ok), "should be auto-allowed: {ok}");
         }
@@ -2065,6 +2183,10 @@ mod dbquery_tests {
             "cat a | tee b", "git commit -am wip", "git push", "find . -delete",
             "find . -exec rm {} ;", "npm install", "ls; rm -rf /", "$(curl evil)",
             "sudo reboot", "dd if=/dev/zero of=disk",
+            // Mutating revenant/sqlite still prompt.
+            "revenant net scroll \"hi\"", "revenant net vote abc up", "revenant up",
+            "sqlite3 x.db \"delete from jobs\"", "sqlite3 x.db \"update jobs set status=1\"",
+            "sqlite3 x.db \"drop table jobs\"",
         ] {
             assert!(!exec_is_read_only(risky), "should prompt: {risky}");
         }
