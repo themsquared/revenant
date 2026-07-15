@@ -492,6 +492,58 @@ pub struct NetworkConfig {
     /// when on it starts in dry-run (decides + logs, posts nothing).
     #[serde(default)]
     pub discuss: DiscussConfig,
+    /// Distributed solving (SETI-style): claim + solve tasks on the quest board
+    /// that match this agent's sigils. Off by default; dry-run first; rate-capped.
+    #[serde(default)]
+    pub contribute: ContributeConfig,
+}
+
+/// Opt-in participation in the distributed-solving quest board. Conservative by
+/// construction: off by default, dry-run first, and rate-capped — an autonomous
+/// worker spending real tokens on others' problems is strictly the owner's call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContributeConfig {
+    /// Master switch. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Decide + log only; claim/solve/post nothing. Default true.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// Only claim tasks on quests bearing one of these sigils; empty = any.
+    #[serde(default)]
+    pub sigils: Vec<String>,
+    /// How often to scan the board, in seconds (min 60).
+    #[serde(default = "default_contribute_interval")]
+    pub interval_secs: u64,
+    /// Hard ceiling on tasks claimed+solved per rolling hour.
+    #[serde(default = "default_contribute_max")]
+    pub max_tasks_per_hour: usize,
+    /// Tier used to solve a task (solving usually needs more than `fast`).
+    #[serde(default = "default_contribute_tier")]
+    pub tier: String,
+}
+
+fn default_contribute_interval() -> u64 {
+    300
+}
+fn default_contribute_max() -> usize {
+    2
+}
+fn default_contribute_tier() -> String {
+    "balanced".to_string()
+}
+
+impl Default for ContributeConfig {
+    fn default() -> Self {
+        ContributeConfig {
+            enabled: false,
+            dry_run: true,
+            sigils: vec![],
+            interval_secs: default_contribute_interval(),
+            max_tasks_per_hour: default_contribute_max(),
+            tier: default_contribute_tier(),
+        }
+    }
 }
 
 /// Autonomous Vault discussion — the daemon subscribes to the codex and lets

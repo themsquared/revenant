@@ -250,6 +250,10 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     // up (live, with specs) on the horde roster. Off by default.
     crate::heartbeat::spawn(home.clone(), cfg.clone());
 
+    // Distributed solving: scan the quest board and claim+solve matching tasks.
+    // Off/dry-run by default.
+    crate::contribute::spawn(home.clone(), cfg.clone(), manager.runtime().clone());
+
     Ok(Daemon {
         manager,
         gateway_handle,

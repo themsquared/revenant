@@ -7,6 +7,7 @@
 mod ascend_loop;
 mod autoupdate;
 mod budget;
+mod contribute;
 mod daemon;
 mod discuss;
 mod heartbeat;
