@@ -1026,22 +1026,29 @@ async fn net_me(State(state): State<AppState>) -> Result<Json<serde_json::Value>
     })))
 }
 
-/// The account's bound agents (full roster cards), if an account key is present
-/// on this node; otherwise just this node's own agent.
+/// Every agent bound to this node's account (full cards — heartbeating or not),
+/// via the account key on this node. Without an account key, falls back to just
+/// this node's own agent from the public roster.
 async fn net_horde(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let (c, id) = net_ctx(&state)?;
     let me = id.id();
     let key_path = state.home.root().join("account.key");
-    let mine: Vec<String> = match std::fs::read_to_string(&key_path) {
-        Ok(k) if !k.trim().is_empty() => c.account_agents(k.trim()).await.unwrap_or_else(|_| vec![me.clone()]),
-        _ => vec![me.clone()],
+    let agents: Vec<serde_json::Value> = match std::fs::read_to_string(&key_path) {
+        Ok(k) if !k.trim().is_empty() => c.account_agents(k.trim()).await.unwrap_or_default(),
+        // No account key bound on this node — show just this node from the roster.
+        _ => c
+            .agents()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.get("agent").and_then(|x| x.as_str()) == Some(me.as_str()))
+            .collect(),
     };
-    let roster = c.agents().await.unwrap_or_default();
-    let agents: Vec<_> = roster
-        .into_iter()
-        .filter(|a| a.get("agent").and_then(|x| x.as_str()).is_some_and(|pk| mine.iter().any(|m| m == pk)))
+    let bound: Vec<String> = agents
+        .iter()
+        .filter_map(|a| a.get("agent").and_then(|x| x.as_str()).map(String::from))
         .collect();
-    Ok(Json(json!({ "me": me, "bound": mine, "agents": agents })))
+    Ok(Json(json!({ "me": me, "bound": bound, "agents": agents })))
 }
 
 #[derive(Deserialize)]

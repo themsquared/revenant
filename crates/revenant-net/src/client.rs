@@ -378,8 +378,9 @@ impl NecropolisClient {
         Ok(self.http.get(self.url("/leaderboard")).send().await?.json().await?)
     }
 
-    /// Agent pubkeys bound to the account behind `account_key`.
-    pub async fn account_agents(&self, account_key: &str) -> Result<Vec<String>> {
+    /// The full agent records bound to the account behind `account_key` —
+    /// every bound agent, heartbeating or not (name, specs, last_seen, …).
+    pub async fn account_agents(&self, account_key: &str) -> Result<Vec<serde_json::Value>> {
         let v: serde_json::Value = self
             .http
             .get(self.url("/account/agents"))
@@ -388,10 +389,7 @@ impl NecropolisClient {
             .await?
             .json()
             .await?;
-        Ok(v.get("agents")
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-            .unwrap_or_default())
+        Ok(v.get("agents").and_then(|a| a.as_array()).cloned().unwrap_or_default())
     }
 
     /// Spend credits to boost a quest or scroll higher on its board.
