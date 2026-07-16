@@ -22,12 +22,16 @@ pub struct Registration {
     pub capabilities: Vec<String>,
     /// Unix seconds; the server rejects registrations outside a freshness window.
     pub ts: i64,
+    /// SHA-256 fingerprint of this agent's TLS certificate (lowercase hex) —
+    /// the identity-signed pin peers verify a TLS session against (SEC-4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_fp: Option<String>,
     /// Ed25519 signature (hex) over the signing preimage.
     pub sig: String,
 }
 
 impl Registration {
-    fn preimage(endpoint: &str, capabilities: &[String], ts: i64) -> Vec<u8> {
+    fn preimage(endpoint: &str, capabilities: &[String], ts: i64, tls_fp: Option<&str>) -> Vec<u8> {
         let mut h = Sha256::new();
         h.update(endpoint.as_bytes());
         h.update([0]);
@@ -37,6 +41,11 @@ impl Registration {
         }
         h.update([1]);
         h.update(ts.to_le_bytes());
+        // Present-only fold: pre-mTLS signers/records verify unchanged.
+        if let Some(fp) = tls_fp {
+            h.update([2]);
+            h.update(fp.as_bytes());
+        }
         h.finalize().to_vec()
     }
 
@@ -45,22 +54,25 @@ impl Registration {
         endpoint: impl Into<String>,
         capabilities: Vec<String>,
         ts: i64,
+        tls_fp: Option<String>,
     ) -> Self {
         let endpoint = endpoint.into();
-        let preimage = Self::preimage(&endpoint, &capabilities, ts);
+        let preimage = Self::preimage(&endpoint, &capabilities, ts, tls_fp.as_deref());
         Registration {
             id: id_key.id(),
             sig: id_key.sign_hex(&preimage),
             endpoint,
             capabilities,
             ts,
+            tls_fp,
         }
     }
 
     /// Authentic for the stated id + content. Callers separately enforce the
     /// timestamp freshness window.
     pub fn verify(&self) -> bool {
-        let preimage = Self::preimage(&self.endpoint, &self.capabilities, self.ts);
+        let preimage =
+            Self::preimage(&self.endpoint, &self.capabilities, self.ts, self.tls_fp.as_deref());
         verify_hex(&self.id, &preimage, &self.sig)
     }
 }
@@ -76,7 +88,7 @@ mod tests {
     #[test]
     fn registration_roundtrips_and_rejects_tampering() {
         let k = id();
-        let r = Registration::create(&k, "https://node.example/a2a", vec!["chat".into()], 1000);
+        let r = Registration::create(&k, "https://node.example/a2a", vec!["chat".into()], 1000, None);
         assert!(r.verify());
         assert_eq!(r.id, k.id());
         // Repointing the endpoint under a different key must fail: the sig is

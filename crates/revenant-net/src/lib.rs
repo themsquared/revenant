@@ -25,6 +25,7 @@ pub mod register;
 pub mod reply;
 pub mod reputation;
 pub mod scroll;
+pub mod tls;
 pub mod vote;
 
 pub use artifact::{Artifact, ArtifactKind};

@@ -487,11 +487,13 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 .as_ref()
                 .and_then(|c| c.network.endpoint.clone())
                 .unwrap_or_else(|| "http://127.0.0.1:7717/a2a".to_string());
+            let tls_fp = revenant_net::tls::load_or_create(&home.identity_dir()).ok().map(|m| m.fingerprint);
             let reg = revenant_net::register::Registration::create(
                 &id,
                 endpoint.clone(),
                 vec!["chat".into(), "ascension".into()],
                 now_ts(),
+                tls_fp,
             );
             client.register(&reg).await?;
             println!("mustered at {url} as {} (endpoint {endpoint})", id.fingerprint());
@@ -777,8 +779,9 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             let specs = crate::heartbeat::detect_specs();
             let name = client.name_of(&id.id()).await.unwrap_or_default();
             let caps = cfg.as_ref().map(crate::heartbeat::capabilities).unwrap_or_else(|| vec!["chat".into()]);
+            let tls_fp = revenant_net::tls::load_or_create(&home.identity_dir()).ok().map(|m| m.fingerprint);
             let p = revenant_net::profile::AgentProfile::create(
-                &id, name.clone(), specs.clone(), caps.clone(), now_ts(),
+                &id, name.clone(), specs.clone(), caps.clone(), now_ts(), tls_fp,
             );
             client.post_profile(&p).await?;
             println!(

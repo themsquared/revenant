@@ -33,6 +33,9 @@ pub fn spawn(home: Home, cfg: Config) {
         };
         let specs = detect_specs();
         let caps = capabilities(&cfg);
+        // The transport pin: this agent's TLS cert fingerprint travels in the
+        // signed heartbeat so peers can bind the wire to the identity (SEC-4).
+        let tls_fp = revenant_net::tls::load_or_create(&home.identity_dir()).ok().map(|m| m.fingerprint);
         tracing::info!(
             "heartbeat: advertising {}·{} {}c/{}MB every {}s",
             specs.os, specs.arch, specs.cpus, specs.ram_mb, INTERVAL_SECS
@@ -40,8 +43,9 @@ pub fn spawn(home: Home, cfg: Config) {
         loop {
             // Mirror the claimed handle (falls back to the deterministic lore-name).
             let name = client.name_of(&id.id()).await.unwrap_or_default();
-            let profile =
-                AgentProfile::create(&id, name, specs.clone(), caps.clone(), crate::now_ts());
+            let profile = AgentProfile::create(
+                &id, name, specs.clone(), caps.clone(), crate::now_ts(), tls_fp.clone(),
+            );
             match client.post_profile(&profile).await {
                 Ok(()) => tracing::debug!("heartbeat: posted"),
                 Err(e) => tracing::debug!("heartbeat: post failed (will retry): {e:#}"),

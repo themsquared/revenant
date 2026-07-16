@@ -48,6 +48,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 sha2 = "0.10"
 hex = "0.4"
+rcgen = "0.13"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
