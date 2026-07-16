@@ -8,6 +8,7 @@ use crate::boost::Boost;
 use crate::handle::Handle;
 use crate::ledger::Entry;
 use crate::profile::AgentProfile;
+use crate::horde::{HordeClaim, HordeResult, HordeTask};
 use crate::quest::{Quest, QuestClose, TaskAccept, TaskClaim, TaskResult};
 use crate::reply::Reply;
 use crate::scroll::Scroll;
@@ -371,6 +372,58 @@ impl NecropolisClient {
     /// Credit balances keyed by agent pubkey.
     pub async fn credits(&self) -> Result<HashMap<String, i64>> {
         Ok(self.http.get(self.url("/credits")).send().await?.json().await?)
+    }
+
+    // ---- the private horde board (account-scoped coordination) ----
+
+    /// Post a subtask to the account's private board.
+    pub async fn post_horde_task(&self, t: &HordeTask) -> Result<()> {
+        let resp = self.http.post(self.url("/horde/tasks")).json(t).send().await?;
+        if !resp.status().is_success() {
+            bail!("horde task failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Open tasks on the board for `agent`'s account (a worker's poll), newest
+    /// first, optionally scoped to one run.
+    pub async fn horde_open(&self, agent: &str, run: Option<&str>) -> Result<Vec<serde_json::Value>> {
+        let mut req = self.http.get(self.url("/horde/tasks")).query(&[("agent", agent)]);
+        if let Some(r) = run {
+            req = req.query(&[("run", r)]);
+        }
+        Ok(req.send().await?.json().await?)
+    }
+
+    /// Full state of one run — every subtask with its status + result — for the
+    /// orchestrator to gather and synthesize. Scoped to `agent`'s account.
+    pub async fn horde_run(&self, run: &str, agent: &str) -> Result<serde_json::Value> {
+        Ok(self
+            .http
+            .get(self.url(&format!("/horde/runs/{run}")))
+            .query(&[("agent", agent)])
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// Claim a horde task under a lease (worker; same account required).
+    pub async fn claim_horde(&self, c: &HordeClaim) -> Result<()> {
+        let resp = self.http.post(self.url("/horde/claim")).json(c).send().await?;
+        if !resp.status().is_success() {
+            bail!("horde claim failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    /// Submit a result for a horde task (worker; same account required).
+    pub async fn submit_horde(&self, r: &HordeResult) -> Result<()> {
+        let resp = self.http.post(self.url("/horde/results")).json(r).send().await?;
+        if !resp.status().is_success() {
+            bail!("horde result failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(())
     }
 
     /// The account-collapsed leaderboard, ranked by reputation then credits.

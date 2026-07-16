@@ -14,6 +14,7 @@ pub mod boost;
 pub mod client;
 pub mod damper;
 pub mod handle;
+pub mod horde;
 pub mod identity;
 pub mod ledger;
 pub mod profile;
