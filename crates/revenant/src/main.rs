@@ -862,11 +862,33 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
             println!("🔎 vouched for result {} — trustless acceptance advances", &rid[..12.min(rid.len())]);
         }
         "close" => {
-            // Retire a quest you authored — refunds escrow on unsettled tasks.
-            let quest = action.get(1).context("usage: net close <quest-id>")?;
+            // Retire a quest you authored. A quest is only COMPLETED when every
+            // task is actually settled; closing an unsolved quest is a withdrawal
+            // and requires --withdraw so proof can't be faked by closing.
+            let quest = action.get(1).context("usage: net close <quest-id> [--withdraw]")?;
+            let withdraw = action.iter().any(|a| a == "--withdraw");
+            let short = &quest[..12.min(quest.len())];
+            let state = client.quest(quest).await?;
+            let tasks = state.get("tasks").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+            let unsettled: Vec<String> = tasks
+                .iter()
+                .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("solved"))
+                .filter_map(|t| t.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect();
+            if !unsettled.is_empty() && !withdraw {
+                bail!(
+                    "quest {short} has {} of {} task(s) unsettled ({}) — nothing was proven solved. \
+Closing now is a withdrawal, not a completion. Re-run with --withdraw to abandon the unsolved work.",
+                    unsettled.len(), tasks.len(), unsettled.join(", ")
+                );
+            }
             let c = revenant_net::quest::QuestClose::create(&id, quest.clone(), now_ts());
             client.close_quest(&c).await?;
-            println!("🪦 closed quest {} — it's off the board; any unspent escrow is back in your balance.", &quest[..12.min(quest.len())]);
+            if unsettled.is_empty() {
+                println!("✅ quest {short} completed — every task settled. Retired from the board.");
+            } else {
+                println!("🪦 withdrew quest {short} — {} unsolved task(s) abandoned, escrow refunded (NOT a completion).", unsettled.len());
+            }
         }
         "boost" => {
             // Spend (burn) credits to feature a quest or scroll higher on its board.

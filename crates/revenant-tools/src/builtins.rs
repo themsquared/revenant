@@ -2068,11 +2068,14 @@ impl Tool for QuestClose {
     fn spec(&self) -> ToolSpec {
         spec!(
             "quest_close",
-            "As the AUTHOR of a quest, close it out — retires it from the board and refunds any credits still \
-escrowed on unsettled tasks. Use it when the quest is done (all results accepted) or to withdraw a quest \
-you no longer want solved (e.g. you'll turn it into a skill instead). Settled tasks stay paid. Give the quest id.",
+            "As the AUTHOR of a quest, retire it from the board. A quest is only COMPLETED when every task has \
+been actually settled — a solver's result accepted, or verified by a quorum. You cannot mark a quest done \
+by closing it: proof lives in the settlements, not in this call. If any task is still unsettled, closing is \
+a WITHDRAWAL that abandons the unsolved work (escrow is refunded) — and it will only proceed when you pass \
+withdraw=true, so you can never pass off unproven work as finished. Settled tasks stay paid.",
             json!({"type":"object","properties":{
-                "quest":{"type":"string","description":"the quest id to close"}
+                "quest":{"type":"string","description":"the quest id to close"},
+                "withdraw":{"type":"boolean","description":"required true to retire a quest that still has unsettled tasks (an explicit abandonment of unsolved work)"}
             },"required":["quest"]})
         )
     }
@@ -2084,15 +2087,47 @@ you no longer want solved (e.g. you'll turn it into a skill instead). Settled ta
         if quest.is_empty() {
             return ToolOutput::err("need the quest id to close");
         }
+        let withdraw = args.get("withdraw").and_then(|v| v.as_bool()).unwrap_or(false);
         let (url, id) = match quest_ctx(&self.home) {
             Ok(v) => v,
             Err(e) => return ToolOutput::err(e),
         };
+        let client = revenant_net::NecropolisClient::new(&url);
+
+        // Proof gate: derive real completion from the quest's task settlements
+        // before touching it. An unsettled task means this is a withdrawal, and we
+        // refuse to let it pass silently as a completion.
+        let state = match client.quest(&quest).await {
+            Ok(s) => s,
+            Err(e) => return ToolOutput::err(format!("couldn't read quest state: {e}")),
+        };
+        let tasks = state.get("tasks").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+        let unsettled: Vec<String> = tasks
+            .iter()
+            .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("solved"))
+            .filter_map(|t| t.get("id").and_then(|i| i.as_str()).map(String::from))
+            .collect();
+        let short = &quest[..12.min(quest.len())];
+
+        if !unsettled.is_empty() && !withdraw {
+            return ToolOutput::err(format!(
+                "Refusing to close quest {short} as done: {} of {} task(s) are unsettled ({}) — no result was \
+accepted or verified, so nothing has been PROVEN solved. Closing now would be a withdrawal (abandoning \
+unsolved work), not a completion. If that's what you mean (e.g. you'll build it yourself instead), call \
+quest_close again with withdraw=true. If you expected it to be finished, it isn't.",
+                unsettled.len(), tasks.len(), unsettled.join(", ")
+            ));
+        }
+
         let c = revenant_net::quest::QuestClose::create(&id, quest.clone(), net_now());
-        match revenant_net::NecropolisClient::new(&url).close_quest(&c).await {
+        match client.close_quest(&c).await {
+            Ok(()) if unsettled.is_empty() => ToolOutput::ok(format!(
+                "✅ quest {short} completed — every task was settled. Retired from the board.",
+            )),
             Ok(()) => ToolOutput::ok(format!(
-                "🪦 closed quest {} — off the board; any unspent escrow is back in your balance.",
-                &quest[..12.min(quest.len())]
+                "🪦 WITHDREW quest {short} — {} unsolved task(s) abandoned, escrow refunded. This was NOT a \
+completion; nothing was proven solved.",
+                unsettled.len()
             )),
             Err(e) => ToolOutput::err(format!("close failed: {e}")),
         }
