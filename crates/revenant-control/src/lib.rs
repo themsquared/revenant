@@ -30,6 +30,14 @@ pub struct AppState {
     /// Gateway admin/analytics port — for the authoritative spend view.
     pub admin_port: u16,
     event_seq: Arc<AtomicU64>,
+    /// A2A envelope replay guard: nonce → first-seen ts, pruned past freshness.
+    a2a_nonces: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// Cached network standing per sender pubkey: (reputation, fetched_ts).
+    a2a_rep: Arc<std::sync::Mutex<std::collections::HashMap<String, (f64, i64)>>>,
+    /// Cached set of this account's bound agent pubkeys: (set, fetched_ts).
+    a2a_kin: Arc<std::sync::Mutex<(Vec<String>, i64)>>,
+    /// Rolling-hour call timestamps per capability-limited sender.
+    a2a_rate: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<i64>>>>,
 }
 
 impl AppState {
@@ -49,6 +57,10 @@ impl AppState {
             home,
             admin_port,
             event_seq: Arc::new(AtomicU64::new(1)),
+            a2a_nonces: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            a2a_rep: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            a2a_kin: Arc::new(std::sync::Mutex::new((Vec::new(), 0))),
+            a2a_rate: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -104,14 +116,16 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/net/horde/run", post(net_horde_run_start))
         .route("/v1/net/horde/run/:run", get(net_horde_run_get))
         .route("/v1/net/horde/synthesize", post(net_horde_synthesize))
-        // A2A: revenant as a callable node in the agent mesh (authed).
-        .route("/a2a", post(a2a_message))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
 
     // The A2A agent card is discovery — served unauthenticated (loopback).
+    // /a2a itself does NOT sit behind the bearer: it authenticates each request
+    // with a signed envelope (sender identity + freshness + nonce) and scales
+    // capability by the sender's standing — see a2a_message.
     Router::new()
         .route("/.well-known/agent-card.json", get(agent_card))
+        .route("/a2a", post(a2a_message))
         .with_state(state)
         .merge(api)
         .fallback(serve_ui)
@@ -160,19 +174,131 @@ struct A2aRpc {
     params: serde_json::Value,
 }
 
-/// A2A JSON-RPC endpoint. Implements `message/send`: extract the text parts,
-/// run a full revenant turn, return the reply as an A2A agent message.
+/// How the receiver treats a verified A2A sender, by standing.
+const A2A_TRUST_REP: f64 = 10.0; // ≥ this network reputation → full turn
+const A2A_REJECT_REP: f64 = 0.0; // < this → rejected outright
+const A2A_LIMITED_PER_HOUR: usize = 10; // rate cap for capability-limited senders
+const A2A_CACHE_SECS: i64 = 300; // reputation / kin-roster cache TTL
+
+/// The trust tier a verified sender lands in.
+enum A2aTier {
+    /// Same account, explicitly trusted, or high reputation: full agent turn.
+    Full,
+    /// Validly signed but unknown/low standing: no-tools reply, rate-capped.
+    Limited,
+    /// Negative standing: rejected.
+    Rejected(f64),
+}
+
+/// Resolve a verified sender's trust tier: kin (bound to this account) and
+/// configured peers get Full; otherwise network reputation decides. Lookups
+/// are cached; an unreachable Necropolis fails CLOSED to Limited, never Full.
+async fn a2a_tier(state: &AppState, sender: &str) -> A2aTier {
+    let now = net_now();
+    // Explicitly trusted pubkeys from config.
+    let trusted = revenant_core::config::Config::from_toml(
+        &std::fs::read_to_string(state.home.config_path()).unwrap_or_default(),
+    )
+    .map(|c| c.network.a2a_trusted)
+    .unwrap_or_default();
+    if trusted.iter().any(|p| p == sender) {
+        return A2aTier::Full;
+    }
+    // Kin: agents bound to the same account (via the account key on this node).
+    let kin_fresh = { state.a2a_kin.lock().unwrap().1 + A2A_CACHE_SECS > now };
+    if !kin_fresh {
+        if let Ok((c, _)) = net_ctx(state) {
+            if let Ok(key) = std::fs::read_to_string(state.home.root().join("account.key")) {
+                if let Ok(agents) = c.account_agents(key.trim()).await {
+                    let pks = agents
+                        .iter()
+                        .filter_map(|a| a.get("agent").and_then(|x| x.as_str()).map(String::from))
+                        .collect();
+                    *state.a2a_kin.lock().unwrap() = (pks, now);
+                }
+            }
+        }
+    }
+    if state.a2a_kin.lock().unwrap().0.iter().any(|p| p == sender) {
+        return A2aTier::Full;
+    }
+    // Network reputation, cached. Unreachable directory → unknown → Limited.
+    let cached = state.a2a_rep.lock().unwrap().get(sender).copied();
+    let rep = match cached {
+        Some((r, at)) if at + A2A_CACHE_SECS > now => r,
+        _ => {
+            let fetched = match net_ctx(state) {
+                Ok((c, _)) => c.reputation().await.ok().and_then(|m| m.get(sender).copied()),
+                Err(_) => None,
+            }
+            .unwrap_or(0.0);
+            state.a2a_rep.lock().unwrap().insert(sender.to_string(), (fetched, now));
+            fetched
+        }
+    };
+    if rep >= A2A_TRUST_REP {
+        A2aTier::Full
+    } else if rep < A2A_REJECT_REP {
+        A2aTier::Rejected(rep)
+    } else {
+        A2aTier::Limited
+    }
+}
+
+/// A2A JSON-RPC endpoint. Every request must carry a signed envelope (sender
+/// pubkey + ts + nonce + signature over the exact body bytes) — the bearer
+/// token proves nothing about identity, so it is not used here. Capability
+/// scales with the sender's standing: kin/trusted/high-rep senders get a full
+/// agent turn; unknown-but-verified senders get a rate-capped, no-tools reply;
+/// negative-standing senders are refused. Implements `message/send`.
 async fn a2a_message(
     State(state): State<AppState>,
-    Json(rpc): Json<A2aRpc>,
-) -> Json<serde_json::Value> {
-    let rpc_err = |id: &serde_json::Value, code: i64, msg: &str| {
-        Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } }))
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use revenant_net::a2a as env;
+    let rpc_err = |status: StatusCode, id: serde_json::Value, code: i64, msg: &str| {
+        (status, Json(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } })))
+    };
+    let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+
+    // 1. The envelope must be present, fresh, unreplayed, and validly signed
+    //    over exactly these body bytes.
+    let (Some(sender), Some(ts), Some(nonce), Some(sig)) =
+        (hdr(env::HDR_AGENT), hdr(env::HDR_TS), hdr(env::HDR_NONCE), hdr(env::HDR_SIG))
+    else {
+        return rpc_err(
+            StatusCode::UNAUTHORIZED,
+            json!(null),
+            -32000,
+            "missing signed envelope (x-rev-agent/x-rev-ts/x-rev-nonce/x-rev-sig)",
+        );
+    };
+    let ts: i64 = ts.parse().unwrap_or(0);
+    let now = net_now();
+    if (now - ts).abs() > env::A2A_FRESHNESS_SECS {
+        return rpc_err(StatusCode::UNAUTHORIZED, json!(null), -32000, "envelope timestamp outside freshness window");
+    }
+    {
+        let mut nonces = state.a2a_nonces.lock().unwrap();
+        nonces.retain(|_, seen| now - *seen <= env::A2A_FRESHNESS_SECS);
+        if nonces.contains_key(&nonce) {
+            return rpc_err(StatusCode::UNAUTHORIZED, json!(null), -32000, "replayed envelope nonce");
+        }
+        nonces.insert(nonce.clone(), now);
+    }
+    if !env::verify(&sender, &body, ts, &nonce, &sig) {
+        return rpc_err(StatusCode::UNAUTHORIZED, json!(null), -32000, "envelope signature verification failed");
+    }
+
+    // 2. Parse the JSON-RPC body (only after authentication).
+    let rpc: A2aRpc = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return rpc_err(StatusCode::BAD_REQUEST, json!(null), -32700, &format!("parse error: {e}")),
     };
     if rpc.method != "message/send" {
-        return rpc_err(&rpc.id, -32601, &format!("unsupported A2A method '{}'", rpc.method));
+        return rpc_err(StatusCode::OK, rpc.id, -32601, &format!("unsupported A2A method '{}'", rpc.method));
     }
-    // Concatenate the text parts of the incoming message.
     let text: String = rpc
         .params
         .pointer("/message/parts")
@@ -186,28 +312,66 @@ async fn a2a_message(
         })
         .unwrap_or_default();
     if text.trim().is_empty() {
-        return rpc_err(&rpc.id, -32602, "message has no text parts");
+        return rpc_err(StatusCode::OK, rpc.id, -32602, "message has no text parts");
     }
 
-    let runtime = state.manager.runtime();
-    let session_id = match runtime.store.ensure_session("a2a", "peer", "chat").await {
-        Ok(id) => id,
-        Err(err) => return rpc_err(&rpc.id, -32603, &format!("session: {err:#}")),
+    // 3. Authorization: capability scales with the sender's standing.
+    let reply = |id: serde_json::Value, text: String, tier: &str| {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "role": "agent",
+                    "parts": [{ "kind": "text", "text": text }],
+                    "kind": "message",
+                    "metadata": { "trust": tier }
+                }
+            })),
+        )
     };
-    match runtime
-        .run_turn(session_id, state.default_tier, vec![revenant_core::ContentBlock::text(text)])
-        .await
-    {
-        Ok(stats) => Json(json!({
-            "jsonrpc": "2.0",
-            "id": rpc.id,
-            "result": {
-                "role": "agent",
-                "parts": [{ "kind": "text", "text": stats.final_text }],
-                "kind": "message"
+    match a2a_tier(&state, &sender).await {
+        A2aTier::Rejected(rep) => {
+            tracing::warn!("a2a: rejected sender {} (reputation {rep:.1})", &sender[..12.min(sender.len())]);
+            rpc_err(StatusCode::FORBIDDEN, rpc.id, -32001, "sender's network standing is negative — refused")
+        }
+        A2aTier::Limited => {
+            // Rate-cap unknown senders, then answer WITHOUT tools or owner
+            // context — a plain model reply, never an agent turn.
+            {
+                let mut rate = state.a2a_rate.lock().unwrap();
+                let hits = rate.entry(sender.clone()).or_default();
+                hits.retain(|t| now - *t < 3600);
+                if hits.len() >= A2A_LIMITED_PER_HOUR {
+                    return rpc_err(StatusCode::TOO_MANY_REQUESTS, rpc.id, -32002, "rate limit for unrecognized senders");
+                }
+                hits.push(now);
             }
-        })),
-        Err(err) => rpc_err(&rpc.id, -32603, &format!("turn failed: {err:#}")),
+            let sys = "You are a revenant answering a message from an agent you don't know. You have \
+NO tools and NO access to your owner's data in this reply. Be brief and helpful on general questions; \
+decline anything that asks about your owner, their systems, or actions on their behalf.";
+            match llm_text(&state, sys, text, 800).await {
+                Ok(t) => reply(rpc.id, t, "limited"),
+                Err(e) => rpc_err(StatusCode::OK, rpc.id, -32603, &format!("reply failed: {}", e.message)),
+            }
+        }
+        A2aTier::Full => {
+            let runtime = state.manager.runtime();
+            // Per-sender session so distinct peers never share one thread.
+            let peer = format!("{}", &sender[..12.min(sender.len())]);
+            let session_id = match runtime.store.ensure_session("a2a", &peer, "chat").await {
+                Ok(id) => id,
+                Err(err) => return rpc_err(StatusCode::OK, rpc.id, -32603, &format!("session: {err:#}")),
+            };
+            match runtime
+                .run_turn(session_id, state.default_tier, vec![revenant_core::ContentBlock::text(text)])
+                .await
+            {
+                Ok(stats) => reply(rpc.id, stats.final_text, "full"),
+                Err(err) => rpc_err(StatusCode::OK, rpc.id, -32603, &format!("turn failed: {err:#}")),
+            }
+        }
     }
 }
 

@@ -1129,16 +1129,18 @@ impl Tool for SkillWrite {
 pub struct CallAgent {
     targets: Vec<A2aTarget>,
     http: reqwest::Client,
+    home: Home,
 }
 
 impl CallAgent {
-    pub fn new(targets: Vec<A2aTarget>) -> Self {
+    pub fn new(targets: Vec<A2aTarget>, home: Home) -> Self {
         CallAgent {
             targets,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("reqwest client"),
+            home,
         }
     }
 }
@@ -1184,7 +1186,31 @@ impl Tool for CallAgent {
             "method": "message/send",
             "params": { "message": { "role": "user", "parts": [{ "kind": "text", "text": message }] } }
         });
-        let mut req = self.http.post(&target.url).json(&body);
+        // Sign the exact body bytes with this node's identity so the receiver
+        // can authenticate WHO is calling (and scale trust by our standing) —
+        // a bearer token alone proves nothing about identity.
+        let raw = serde_json::to_vec(&body).unwrap_or_default();
+        let mut req = self.http.post(&target.url).body(raw.clone());
+        req = req.header("content-type", "application/json");
+        if let Ok(idk) = revenant_net::Identity::load_or_create(&self.home.identity_dir()) {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let nonce = format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let sig = revenant_net::a2a::sign(&idk, &raw, ts, &nonce);
+            req = req
+                .header(revenant_net::a2a::HDR_AGENT, idk.id())
+                .header(revenant_net::a2a::HDR_TS, ts.to_string())
+                .header(revenant_net::a2a::HDR_NONCE, nonce)
+                .header(revenant_net::a2a::HDR_SIG, sig);
+        }
         if let Some(token) = &target.token {
             req = req.bearer_auth(token);
         }

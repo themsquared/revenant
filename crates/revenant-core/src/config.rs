@@ -501,6 +501,11 @@ pub struct NetworkConfig {
     /// by default; dry-run first; rate-capped. No economy — it's your own work.
     #[serde(default)]
     pub horde: HordeConfig,
+    /// Peer agent pubkeys granted FULL inbound A2A turns regardless of their
+    /// network reputation (in addition to agents bound to this account). Every
+    /// other validly-signed sender is capability-limited; unsigned is rejected.
+    #[serde(default)]
+    pub a2a_trusted: Vec<String>,
 }
 
 /// Opt-in participation in the account's private horde board (distributed

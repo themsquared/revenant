@@ -8,6 +8,7 @@
 //! own box. Identity is a self-sovereign Ed25519 keypair; authenticity is
 //! cryptographic, not directory-asserted.
 
+pub mod a2a;
 pub mod artifact;
 pub mod attest;
 pub mod boost;

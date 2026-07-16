@@ -99,7 +99,7 @@ impl ToolRegistry {
             tools.insert(tool.spec().name.clone(), tool);
         }
         if !a2a.is_empty() {
-            let t = Arc::new(builtins::CallAgent::new(a2a));
+            let t = Arc::new(builtins::CallAgent::new(a2a, home.clone()));
             tools.insert(t.spec().name.clone(), t);
         }
         if plugin_count > 0 {
