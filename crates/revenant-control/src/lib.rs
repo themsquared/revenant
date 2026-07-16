@@ -20,6 +20,14 @@ use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+mod mtls;
+pub use mtls::serve_a2a_tls;
+
+/// The TLS client-cert fingerprint a connection presented, injected per
+/// connection by the mTLS A2A listener. Absent on the plain loopback listener.
+#[derive(Clone)]
+pub struct PeerCertFp(pub Option<String>);
+
 #[derive(Clone)]
 pub struct AppState {
     pub manager: SessionManager,
@@ -38,6 +46,8 @@ pub struct AppState {
     a2a_kin: Arc<std::sync::Mutex<(Vec<String>, i64)>>,
     /// Rolling-hour call timestamps per capability-limited sender.
     a2a_rate: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<i64>>>>,
+    /// Cached published TLS pins per sender pubkey: (tls_fp, fetched_ts).
+    a2a_pins: Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<String>, i64)>>>,
 }
 
 impl AppState {
@@ -61,6 +71,7 @@ impl AppState {
             a2a_rep: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             a2a_kin: Arc::new(std::sync::Mutex::new((Vec::new(), 0))),
             a2a_rate: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            a2a_pins: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -245,14 +256,42 @@ async fn a2a_tier(state: &AppState, sender: &str) -> A2aTier {
     }
 }
 
+/// The sender's published (identity-signed) TLS pin, from the directory's
+/// agent profiles — cached. `None` = the sender hasn't published one (pre-mTLS
+/// peer) or the directory is unreachable.
+async fn published_pin(state: &AppState, sender: &str) -> Option<String> {
+    let now = net_now();
+    if let Some((pin, at)) = state.a2a_pins.lock().unwrap().get(sender).cloned() {
+        if at + A2A_CACHE_SECS > now {
+            return pin;
+        }
+    }
+    let fetched: Option<String> = match net_ctx(state) {
+        Ok((c, _)) => c.agents().await.ok().and_then(|agents| {
+            agents
+                .iter()
+                .find(|a| a.get("agent").and_then(|x| x.as_str()) == Some(sender))
+                .and_then(|a| a.get("tls_fp").and_then(|x| x.as_str()).map(String::from))
+        }),
+        Err(_) => None,
+    };
+    state.a2a_pins.lock().unwrap().insert(sender.to_string(), (fetched.clone(), now));
+    fetched
+}
+
 /// A2A JSON-RPC endpoint. Every request must carry a signed envelope (sender
 /// pubkey + ts + nonce + signature over the exact body bytes) — the bearer
 /// token proves nothing about identity, so it is not used here. Capability
 /// scales with the sender's standing: kin/trusted/high-rep senders get a full
 /// agent turn; unknown-but-verified senders get a rate-capped, no-tools reply;
 /// negative-standing senders are refused. Implements `message/send`.
+///
+/// Over the mTLS listener, the presented client certificate is additionally
+/// bound to the envelope identity: if the sender has published a pin, a
+/// presented cert that doesn't match it is refused (wire ↔ identity).
 async fn a2a_message(
     State(state): State<AppState>,
+    peer_fp: Option<axum::Extension<PeerCertFp>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -289,6 +328,27 @@ async fn a2a_message(
     }
     if !env::verify(&sender, &body, ts, &nonce, &sig) {
         return rpc_err(StatusCode::UNAUTHORIZED, json!(null), -32000, "envelope signature verification failed");
+    }
+
+    // 1b. mTLS binding: when the connection presented a client certificate and
+    // the sender has PUBLISHED a pin, the two must match — a valid envelope
+    // over someone else's wire is refused. (No presented cert / no published
+    // pin ⇒ the envelope alone authenticates, as on the plain listener.)
+    if let Some(axum::Extension(PeerCertFp(Some(presented)))) = peer_fp {
+        if let Some(pin) = published_pin(&state, &sender).await {
+            if pin != presented {
+                tracing::warn!(
+                    "a2a: client cert fingerprint does not match {}'s published pin — refused",
+                    &sender[..12.min(sender.len())]
+                );
+                return rpc_err(
+                    StatusCode::UNAUTHORIZED,
+                    json!(null),
+                    -32000,
+                    "client certificate does not match the sender's published pin",
+                );
+            }
+        }
     }
 
     // 2. Parse the JSON-RPC body (only after authentication).

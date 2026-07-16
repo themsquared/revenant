@@ -1126,6 +1126,90 @@ impl Tool for SkillWrite {
 /// Delegate to another agent over A2A. By default the call is proxied through
 /// the gateway (governed egress); `via_gateway=false` means a direct call on a
 /// trusted substrate. Never talks to an unlisted URL.
+/// Verify a peer's TLS cert by exact SHA-256 fingerprint (no CA — the pin is
+/// resolved from the peer's identity-signed profile or config; see
+/// docs/DESIGN-MTLS.md). Handshake signatures are still cryptographically
+/// verified, so the peer must hold the pinned cert's private key.
+#[derive(Debug)]
+struct PinnedServerCert {
+    pin: String,
+    schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl PinnedServerCert {
+    fn new(pin: &str) -> Self {
+        let provider = rustls::crypto::CryptoProvider::get_default().expect("crypto provider").clone();
+        PinnedServerCert {
+            pin: pin.to_ascii_lowercase(),
+            schemes: provider.signature_verification_algorithms.supported_schemes(),
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServerCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let fp = revenant_net::tls::fingerprint_der(end_entity.as_ref());
+        if fp == self.pin {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "peer certificate fingerprint {fp} does not match the pinned {}",
+                self.pin
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::CryptoProvider::get_default().expect("provider");
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::CryptoProvider::get_default().expect("provider");
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.schemes.clone()
+    }
+}
+
+/// A reqwest client that (a) accepts ONLY the pinned peer cert and (b)
+/// presents this agent's own cert for the peer's mTLS binding.
+fn pinned_a2a_client(pin: &str, home: &Home) -> anyhow::Result<reqwest::Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mat = revenant_net::tls::load_or_create(&home.identity_dir())?;
+    let certs: Vec<rustls::pki_types::CertificateDer> =
+        rustls_pemfile::certs(&mut mat.cert_pem.as_bytes()).collect::<Result<_, _>>()?;
+    let key = rustls_pemfile::private_key(&mut mat.key_pem.as_bytes())?
+        .ok_or_else(|| anyhow::anyhow!("no private key in TLS material"))?;
+    let tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PinnedServerCert::new(pin)))
+        .with_client_auth_cert(certs, key)?;
+    Ok(reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?)
+}
+
 pub struct CallAgent {
     targets: Vec<A2aTarget>,
     http: reqwest::Client,
@@ -1190,7 +1274,17 @@ impl Tool for CallAgent {
         // can authenticate WHO is calling (and scale trust by our standing) —
         // a bearer token alone proves nothing about identity.
         let raw = serde_json::to_vec(&body).unwrap_or_default();
-        let mut req = self.http.post(&target.url).body(raw.clone());
+        // Pinned target ⇒ a dedicated mTLS client: the peer's cert must match
+        // its pin exactly, and we present our own cert for its binding check.
+        let client = if let Some(pin) = &target.tls_fp {
+            match pinned_a2a_client(pin, &self.home) {
+                Ok(c) => c,
+                Err(e) => return ToolOutput::err(format!("mTLS setup for '{agent}' failed: {e:#}")),
+            }
+        } else {
+            self.http.clone()
+        };
+        let mut req = client.post(&target.url).body(raw.clone());
         req = req.header("content-type", "application/json");
         if let Ok(idk) = revenant_net::Identity::load_or_create(&self.home.identity_dir()) {
             let ts = std::time::SystemTime::now()
@@ -2756,5 +2850,126 @@ mod web_tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0, "Rust Lang");
         assert_eq!(r[0].1, "https://rust-lang.org");
+    }
+}
+
+#[cfg(test)]
+mod mtls_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Test-side accept-any client-cert verifier (mirrors the listener's): the
+    /// content is unchecked but handshake signatures are verified, so the
+    /// client must hold the key of whatever cert it presents.
+    #[derive(Debug)]
+    struct AcceptAny(Vec<rustls::SignatureScheme>);
+    impl rustls::server::danger::ClientCertVerifier for AcceptAny {
+        fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+            &[]
+        }
+        fn offer_client_auth(&self) -> bool {
+            true
+        }
+        fn client_auth_mandatory(&self) -> bool {
+            true // the test asserts mutual TLS: a client cert is REQUIRED
+        }
+        fn verify_client_cert(
+            &self,
+            _e: &rustls::pki_types::CertificateDer<'_>,
+            _i: &[rustls::pki_types::CertificateDer<'_>],
+            _n: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            m: &[u8],
+            c: &rustls::pki_types::CertificateDer<'_>,
+            d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            let p = rustls::crypto::CryptoProvider::get_default().unwrap();
+            rustls::crypto::verify_tls12_signature(m, c, d, &p.signature_verification_algorithms)
+        }
+        fn verify_tls13_signature(
+            &self,
+            m: &[u8],
+            c: &rustls::pki_types::CertificateDer<'_>,
+            d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            let p = rustls::crypto::CryptoProvider::get_default().unwrap();
+            rustls::crypto::verify_tls13_signature(m, c, d, &p.signature_verification_algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.clone()
+        }
+    }
+
+    /// Full mutual-TLS round trip over a real socket: the pinned dialer accepts
+    /// the correct fingerprint, presents a client cert (mutual), and refuses a
+    /// wrong pin at the handshake.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pinned_dialer_mutual_tls_roundtrip_and_wrong_pin_fails() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Server agent's TLS material (as the daemon's listener would use).
+        let server_dir = tempfile::tempdir().unwrap();
+        let mat = revenant_net::tls::load_or_create(server_dir.path()).unwrap();
+        let pin = mat.fingerprint.clone();
+        let certs: Vec<rustls::pki_types::CertificateDer> =
+            rustls_pemfile::certs(&mut mat.cert_pem.as_bytes()).collect::<Result<_, _>>().unwrap();
+        let key = rustls_pemfile::private_key(&mut mat.key_pem.as_bytes()).unwrap().unwrap();
+        let provider = rustls::crypto::CryptoProvider::get_default().unwrap().clone();
+        let sc = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(AcceptAny(
+                provider.signature_verification_algorithms.supported_schemes(),
+            )))
+            .with_single_cert(certs, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(sc));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Serve two connections: handshake (client cert REQUIRED), tiny HTTP 200.
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                    assert!(
+                        tls.get_ref().1.peer_certificates().is_some(),
+                        "mutual TLS: the dialer must present a client cert"
+                    );
+                    let mut buf = [0u8; 4096];
+                    let _ = tls.read(&mut buf).await;
+                    let _ = tls
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        // Client agent home (its own identity + cert material).
+        let client_dir = tempfile::tempdir().unwrap();
+        let home = Home::at(client_dir.path().to_path_buf());
+        std::fs::create_dir_all(home.identity_dir()).unwrap();
+
+        // Correct pin: handshake + request succeed.
+        let ok_client = pinned_a2a_client(&pin, &home).unwrap();
+        let resp = ok_client.get(format!("https://127.0.0.1:{port}/")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        // Wrong pin: the handshake itself is refused.
+        let wrong = if pin.starts_with('0') { format!("1{}", &pin[1..]) } else { format!("0{}", &pin[1..]) };
+        let bad_client = pinned_a2a_client(&wrong, &home).unwrap();
+        let err = bad_client.get(format!("https://127.0.0.1:{port}/")).send().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match the pinned")
+                || format!("{err:?}").contains("does not match the pinned"),
+            "wrong pin must fail closed at the handshake: {err:?}"
+        );
     }
 }

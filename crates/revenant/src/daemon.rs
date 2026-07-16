@@ -86,7 +86,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
                     true,
                 )
             };
-            revenant_tools::A2aTarget { name: a.name.clone(), url, token, via_gateway }
+            revenant_tools::A2aTarget { name: a.name.clone(), url, token, via_gateway, tls_fp: a.tls_fp.clone() }
         })
         .collect();
     let wasm_tools = revenant_wasm::load_dir(&home.plugins_dir());
@@ -422,6 +422,25 @@ pub async fn cmd_up() -> Result<()> {
         daemon.llm_endpoint,
         bind
     );
+
+    // mTLS A2A listener (SEC-4): serves /a2a over TLS with the identity-pinned
+    // cert, binding presented client certs to published pins. Off by default.
+    if let Some(port) = cfg.network.a2a_tls_port {
+        match revenant_net::tls::load_or_create(&home.identity_dir()) {
+            Ok(mat) => {
+                let addr = format!("{}:{}", cfg.network.a2a_tls_bind, port);
+                let tls_state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        revenant_control::serve_a2a_tls(tls_state, addr, mat.cert_pem, mat.key_pem).await
+                    {
+                        tracing::warn!("mTLS A2A listener failed: {e:#}");
+                    }
+                });
+            }
+            Err(e) => tracing::warn!("mTLS A2A listener disabled — no TLS material: {e:#}"),
+        }
+    }
 
     let server = axum::serve(listener, revenant_control::router(state));
     tokio::select! {

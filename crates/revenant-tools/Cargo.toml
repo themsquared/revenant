@@ -15,7 +15,13 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 inventory = { workspace = true }
 reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 regex = "1"
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-rustls = { workspace = true }
+tempfile = "3"

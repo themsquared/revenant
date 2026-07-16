@@ -148,6 +148,11 @@ pub struct A2aAgent {
     pub token_env: Option<String>,
     #[serde(default)]
     pub direct: bool,
+    /// Pin the peer's TLS certificate: SHA-256 fingerprint (lowercase hex) the
+    /// presented server cert must match exactly (SEC-4). Only meaningful for
+    /// `direct` https targets — the connection fails closed on mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_fp: Option<String>,
 }
 
 /// Privacy router: when enabled, a turn whose input contains sensitive data
@@ -506,6 +511,19 @@ pub struct NetworkConfig {
     /// other validly-signed sender is capability-limited; unsigned is rejected.
     #[serde(default)]
     pub a2a_trusted: Vec<String>,
+    /// Enable the mTLS A2A listener on this port (SEC-4): serves /a2a over TLS
+    /// with this agent's identity-pinned certificate and requests client certs,
+    /// binding the wire to the sender's published pin. Off (None) by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a_tls_port: Option<u16>,
+    /// Interface the mTLS A2A listener binds. Defaults to loopback; set to
+    /// "0.0.0.0" deliberately to expose it to the LAN.
+    #[serde(default = "default_a2a_tls_bind")]
+    pub a2a_tls_bind: String,
+}
+
+fn default_a2a_tls_bind() -> String {
+    "127.0.0.1".to_string()
 }
 
 /// Opt-in participation in the account's private horde board (distributed

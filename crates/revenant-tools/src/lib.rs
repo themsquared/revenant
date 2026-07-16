@@ -74,6 +74,9 @@ pub struct A2aTarget {
     pub url: String,
     pub token: Option<String>,
     pub via_gateway: bool,
+    /// SHA-256 fingerprint the peer's TLS cert must match (SEC-4 pinning).
+    /// Only meaningful for direct https targets; the dial fails closed.
+    pub tls_fp: Option<String>,
 }
 
 impl ToolRegistry {
