@@ -6,6 +6,7 @@ use crate::artifact::Artifact;
 use crate::attest::Attestation;
 use crate::boost::Boost;
 use crate::handle::Handle;
+use crate::identity::Identity;
 use crate::ledger::Entry;
 use crate::profile::AgentProfile;
 use crate::horde::{HordeClaim, HordeResult, HordeTask};
@@ -386,27 +387,53 @@ impl NecropolisClient {
         Ok(())
     }
 
-    /// Open tasks on the board for `agent`'s account (a worker's poll), newest
-    /// first, optionally scoped to one run.
-    pub async fn horde_open(&self, agent: &str, run: Option<&str>) -> Result<Vec<serde_json::Value>> {
-        let mut req = self.http.get(self.url("/horde/tasks")).query(&[("agent", agent)]);
+    /// Attach a signed read proof for `resource` (the request path) — the
+    /// server scopes private reads to the account of the key that signed.
+    fn read_proof(req: reqwest::RequestBuilder, id: &Identity, resource: &str) -> reqwest::RequestBuilder {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let nonce = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let sig = crate::proof::sign(id, resource, ts, &nonce);
+        req.header(crate::a2a::HDR_AGENT, id.id())
+            .header(crate::a2a::HDR_TS, ts.to_string())
+            .header(crate::a2a::HDR_NONCE, nonce)
+            .header(crate::a2a::HDR_SIG, sig)
+    }
+
+    /// Open tasks on the reader's account board (a worker's poll), newest
+    /// first, optionally scoped to one run. The read is proven: it's scoped to
+    /// the account of the identity that signs it.
+    pub async fn horde_open(&self, id: &Identity, run: Option<&str>) -> Result<Vec<serde_json::Value>> {
+        let mut req = Self::read_proof(self.http.get(self.url("/horde/tasks")), id, "/horde/tasks");
         if let Some(r) = run {
             req = req.query(&[("run", r)]);
         }
-        Ok(req.send().await?.json().await?)
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            bail!("horde read failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(resp.json().await?)
     }
 
     /// Full state of one run — every subtask with its status + result — for the
-    /// orchestrator to gather and synthesize. Scoped to `agent`'s account.
-    pub async fn horde_run(&self, run: &str, agent: &str) -> Result<serde_json::Value> {
-        Ok(self
-            .http
-            .get(self.url(&format!("/horde/runs/{run}")))
-            .query(&[("agent", agent)])
+    /// orchestrator to gather and synthesize. Signed read, account-scoped.
+    pub async fn horde_run(&self, run: &str, id: &Identity) -> Result<serde_json::Value> {
+        let resource = format!("/horde/runs/{run}");
+        let resp = Self::read_proof(self.http.get(self.url(&resource)), id, &resource)
             .send()
-            .await?
-            .json()
-            .await?)
+            .await?;
+        if !resp.status().is_success() {
+            bail!("horde run read failed: {}", resp.text().await.unwrap_or_default());
+        }
+        Ok(resp.json().await?)
     }
 
     /// Claim a horde task under a lease (worker; same account required).

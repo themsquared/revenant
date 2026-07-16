@@ -19,6 +19,7 @@ pub mod horde;
 pub mod identity;
 pub mod ledger;
 pub mod profile;
+pub mod proof;
 pub mod quest;
 pub mod register;
 pub mod reply;

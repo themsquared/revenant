@@ -36,7 +36,6 @@ pub fn spawn(home: Home, cfg: Config, runtime: Arc<AgentRuntime>) {
                 return;
             }
         };
-        let me = id.id();
         let interval = h.interval_secs.max(5);
         tracing::info!(
             "horde worker: polling the account board every {interval}s (dry_run={}, max/hr={})",
@@ -45,7 +44,7 @@ pub fn spawn(home: Home, cfg: Config, runtime: Arc<AgentRuntime>) {
         let mut done: Vec<i64> = Vec::new(); // solve timestamps this rolling hour
         loop {
             tokio::time::sleep(Duration::from_secs(interval)).await;
-            if let Err(e) = sweep(&client, &id, &me, &cfg, &runtime, &mut done).await {
+            if let Err(e) = sweep(&client, &id, &cfg, &runtime, &mut done).await {
                 tracing::debug!("horde sweep failed (will retry): {e:#}");
             }
         }
@@ -55,7 +54,6 @@ pub fn spawn(home: Home, cfg: Config, runtime: Arc<AgentRuntime>) {
 async fn sweep(
     client: &NecropolisClient,
     id: &Identity,
-    me: &str,
     cfg: &Config,
     runtime: &Arc<AgentRuntime>,
     done: &mut Vec<i64>,
@@ -68,7 +66,7 @@ async fn sweep(
     }
 
     // Open subtasks on my account's board, oldest first (fair FIFO within a run).
-    let mut open = client.horde_open(me, None).await?;
+    let mut open = client.horde_open(id, None).await?;
     open.reverse(); // horde_open is newest-first; take the oldest waiting first
     for t in open {
         if done.len() >= h.max_tasks_per_hour {

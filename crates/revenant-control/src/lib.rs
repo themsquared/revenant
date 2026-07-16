@@ -1498,7 +1498,7 @@ async fn net_horde_run_get(
     Path(run): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (c, k) = net_ctx(&state)?;
-    Ok(Json(c.horde_run(&run, &k.id()).await?))
+    Ok(Json(c.horde_run(&run, &k).await?))
 }
 
 #[derive(Deserialize)]
@@ -1513,7 +1513,7 @@ async fn net_horde_synthesize(
     Json(b): Json<SynthBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (c, k) = net_ctx(&state)?;
-    let run = c.horde_run(&b.run, &k.id()).await?;
+    let run = c.horde_run(&b.run, &k).await?;
     let empty = vec![];
     let tasks = run.get("tasks").and_then(|t| t.as_array()).unwrap_or(&empty);
     let mut parts = String::new();
