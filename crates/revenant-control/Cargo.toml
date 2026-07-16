@@ -12,6 +12,8 @@ revenant-security = { workspace = true }
 revenant-skills = { workspace = true }
 revenant-net = { workspace = true }
 revenant-llm = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 revenant-gateway = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

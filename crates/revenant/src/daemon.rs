@@ -254,6 +254,10 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     // Off/dry-run by default.
     crate::contribute::spawn(home.clone(), cfg.clone(), manager.runtime().clone());
 
+    // Private horde board: help this account's own distributed-thinking runs by
+    // claiming + solving subtasks off the account board. Off/dry-run by default.
+    crate::horde_worker::spawn(home.clone(), cfg.clone(), manager.runtime().clone());
+
     Ok(Daemon {
         manager,
         gateway_handle,

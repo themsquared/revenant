@@ -78,6 +78,10 @@ export const api = {
   netInstall: (id) => request('POST', `/v1/net/bazaar/${encodeURIComponent(id)}/install`),
   netMe: () => request('GET', '/v1/net/me'),
   netHorde: () => request('GET', '/v1/net/horde'),
+  // distributed thinking (private horde board)
+  hordeRunStart: (goal, subtasks) => request('POST', '/v1/net/horde/run', { goal, subtasks }),
+  hordeRun: (run) => request('GET', `/v1/net/horde/run/${encodeURIComponent(run)}`),
+  hordeSynthesize: (goal, run) => request('POST', '/v1/net/horde/synthesize', { goal, run }),
 }
 
 export function eventStream(onEvent) {

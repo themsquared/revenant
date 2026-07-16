@@ -11,6 +11,7 @@ mod contribute;
 mod daemon;
 mod discuss;
 mod heartbeat;
+mod horde_worker;
 mod introspect;
 mod reproduce;
 mod repl;

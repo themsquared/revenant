@@ -100,6 +100,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/net/bazaar/:id/install", post(net_install))
         .route("/v1/net/me", get(net_me))
         .route("/v1/net/horde", get(net_horde))
+        // Distributed thinking: orchestrate a run across the private board.
+        .route("/v1/net/horde/run", post(net_horde_run_start))
+        .route("/v1/net/horde/run/:run", get(net_horde_run_get))
+        .route("/v1/net/horde/synthesize", post(net_horde_synthesize))
         // A2A: revenant as a callable node in the agent mesh (authed).
         .route("/a2a", post(a2a_message))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
@@ -1195,6 +1199,172 @@ async fn net_install(
     // Best-effort adoption attestation (feeds the author's reputation).
     let _ = c.attest(&full_id, &k.id(), true).await;
     Ok(Json(json!({ "ok": true, "slug": slug, "title": artifact.title })))
+}
+
+// ---- distributed thinking: orchestrate a run across the private horde board --
+//
+// One goal → decomposed (one LLM call) into subtasks posted to the account's
+// private board → the horde's workers claim + solve them → gathered + synthesized
+// (one LLM call) into a final answer. The board is the durable source of truth;
+// the UI polls /v1/net/horde/run/:run to watch the fan-out.
+
+/// One tier'd, non-streaming LLM call returning the joined text.
+async fn llm_text(state: &AppState, system: &str, user: String, max_tokens: u32) -> Result<String, ApiError> {
+    let req = revenant_llm::MessagesRequest {
+        model: state.default_tier.to_string(),
+        max_tokens,
+        system: Some(serde_json::Value::String(system.to_string())),
+        messages: vec![revenant_llm::WireMessage::new(
+            revenant_core::Role::User,
+            vec![revenant_core::ContentBlock::text(user)],
+        )],
+        tools: vec![],
+        tool_choice: None,
+        stream: true,
+        identity: Some("horde-orchestrator".to_string()),
+    };
+    let outcome = state
+        .manager
+        .runtime()
+        .llm
+        .stream_message(&req, |_| {})
+        .await
+        .map_err(ApiError::from)?;
+    Ok(outcome
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            revenant_core::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(""))
+}
+
+#[derive(Deserialize)]
+struct RunStartBody {
+    goal: String,
+    #[serde(default)]
+    subtasks: Option<usize>,
+}
+
+/// Start a distributed run: decompose the goal, post subtasks to the board.
+async fn net_horde_run_start(
+    State(state): State<AppState>,
+    Json(b): Json<RunStartBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let goal = b.goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(ApiError::bad_request("a goal is required"));
+    }
+    let n = b.subtasks.unwrap_or(4).clamp(1, 8);
+    let (c, k) = net_ctx(&state)?;
+
+    // Decompose into independent subtasks (JSON array of {title, spec}).
+    let sys = "You break a goal into INDEPENDENT subtasks that can be solved in parallel by separate \
+agents, then combined. Return ONLY a JSON array (no prose) of objects with \"title\" (short) and \
+\"spec\" (a self-contained instruction). Each subtask must stand alone — no subtask may depend on \
+another's output. Prefer fewer, meatier subtasks over many trivial ones.";
+    let raw = llm_text(
+        &state,
+        sys,
+        format!("GOAL: {goal}\n\nDecompose into at most {n} independent subtasks. JSON array only."),
+        1200,
+    )
+    .await?;
+    let subtasks = parse_subtasks(&raw, n);
+    if subtasks.is_empty() {
+        return Err(ApiError::bad_request("could not decompose the goal into subtasks"));
+    }
+
+    // A run id anchored to the goal + time so concurrent runs never collide.
+    let now = net_now();
+    let mut hsh = sha2::Sha256::new();
+    use sha2::Digest;
+    hsh.update(goal.as_bytes());
+    hsh.update(now.to_le_bytes());
+    let run = format!("run-{}", &hex::encode(hsh.finalize())[..16]);
+
+    let mut posted = Vec::new();
+    for (title, spec) in &subtasks {
+        let t = revenant_net::horde::HordeTask::create(&k, &run, title.clone(), spec.clone(), vec![], now);
+        c.post_horde_task(&t).await?;
+        posted.push(json!({ "id": t.id, "title": title, "spec": spec }));
+    }
+    Ok(Json(json!({ "run": run, "goal": goal, "tasks": posted })))
+}
+
+/// Best-effort parse of an LLM JSON array of {title, spec}.
+fn parse_subtasks(raw: &str, max: usize) -> Vec<(String, String)> {
+    let start = raw.find('[');
+    let end = raw.rfind(']');
+    let slice = match (start, end) {
+        (Some(s), Some(e)) if e > s => &raw[s..=e],
+        _ => return Vec::new(),
+    };
+    let arr: Vec<serde_json::Value> = serde_json::from_str(slice).unwrap_or_default();
+    arr.into_iter()
+        .filter_map(|v| {
+            let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let spec = v.get("spec").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            if spec.is_empty() {
+                None
+            } else {
+                Some((if title.is_empty() { spec.chars().take(48).collect() } else { title }, spec))
+            }
+        })
+        .take(max)
+        .collect()
+}
+
+/// Poll a run's live state (proxies the board): each subtask's status + output.
+async fn net_horde_run_get(
+    State(state): State<AppState>,
+    Path(run): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, k) = net_ctx(&state)?;
+    Ok(Json(c.horde_run(&run, &k.id()).await?))
+}
+
+#[derive(Deserialize)]
+struct SynthBody {
+    goal: String,
+    run: String,
+}
+
+/// Gather a run's solved subtasks and synthesize the final answer.
+async fn net_horde_synthesize(
+    State(state): State<AppState>,
+    Json(b): Json<SynthBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, k) = net_ctx(&state)?;
+    let run = c.horde_run(&b.run, &k.id()).await?;
+    let empty = vec![];
+    let tasks = run.get("tasks").and_then(|t| t.as_array()).unwrap_or(&empty);
+    let mut parts = String::new();
+    let mut used = 0usize;
+    for t in tasks {
+        if t.get("status").and_then(|s| s.as_str()) == Some("solved") {
+            let title = t.get("title").and_then(|x| x.as_str()).unwrap_or("subtask");
+            let out = t.get("output").and_then(|x| x.as_str()).unwrap_or("");
+            parts.push_str(&format!("### {title}\n{out}\n\n"));
+            used += 1;
+        }
+    }
+    if used == 0 {
+        return Err(ApiError::bad_request("no solved subtasks to synthesize yet"));
+    }
+    let sys = "You are synthesizing the results of subtasks your horde solved in parallel into one \
+coherent answer to the original goal. Integrate the pieces, resolve overlaps, and produce the final \
+deliverable — not a summary of who did what.";
+    let answer = llm_text(
+        &state,
+        sys,
+        format!("ORIGINAL GOAL: {}\n\nSUBTASK RESULTS:\n\n{parts}\nProduce the final answer.", b.goal),
+        2000,
+    )
+    .await?;
+    Ok(Json(json!({ "answer": answer.trim(), "synthesized_from": used })))
 }
 
 // ---- error plumbing ----

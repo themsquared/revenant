@@ -496,6 +496,53 @@ pub struct NetworkConfig {
     /// that match this agent's sigils. Off by default; dry-run first; rate-capped.
     #[serde(default)]
     pub contribute: ContributeConfig,
+    /// Private horde board: this agent helps its OWN account's distributed-
+    /// thinking runs by claiming + solving subtasks off the account board. Off
+    /// by default; dry-run first; rate-capped. No economy — it's your own work.
+    #[serde(default)]
+    pub horde: HordeConfig,
+}
+
+/// Opt-in participation in the account's private horde board (distributed
+/// thinking). Like [`ContributeConfig`] but for your own account's work, so no
+/// sigil gate and a more responsive default cadence. Still off by default and
+/// dry-run first — an autonomous worker spending tokens is the owner's call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HordeConfig {
+    /// Master switch. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Decide + log only; claim/solve/post nothing. Default true.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// How often to poll the account board, in seconds (min 5).
+    #[serde(default = "default_horde_interval")]
+    pub interval_secs: u64,
+    /// Hard ceiling on subtasks claimed+solved per rolling hour.
+    #[serde(default = "default_horde_max")]
+    pub max_tasks_per_hour: usize,
+    /// Tier used to solve a subtask.
+    #[serde(default = "default_contribute_tier")]
+    pub tier: String,
+}
+
+fn default_horde_interval() -> u64 {
+    15
+}
+fn default_horde_max() -> usize {
+    20
+}
+
+impl Default for HordeConfig {
+    fn default() -> Self {
+        HordeConfig {
+            enabled: false,
+            dry_run: true,
+            interval_secs: default_horde_interval(),
+            max_tasks_per_hour: default_horde_max(),
+            tier: default_contribute_tier(),
+        }
+    }
 }
 
 /// Opt-in participation in the distributed-solving quest board. Conservative by

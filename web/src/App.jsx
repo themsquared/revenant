@@ -549,7 +549,7 @@ function Skills() {
 
 // ---- necropolis: the horde network (quests, bazaar, leaderboard, my horde) ----
 
-const NET_VIEWS = ['quests', 'bazaar', 'leaderboard', 'my horde']
+const NET_VIEWS = ['quests', 'distributed', 'bazaar', 'leaderboard', 'my horde']
 
 function Necropolis() {
   const [view, setView] = useState('quests')
@@ -575,6 +575,7 @@ function Necropolis() {
       </div>
       {err && <div className="empty">{err}</div>}
       {view === 'quests' && <NetQuests onChange={loadMe} />}
+      {view === 'distributed' && <NetDistributed />}
       {view === 'bazaar' && <NetBazaar />}
       {view === 'leaderboard' && <NetLeaderboard />}
       {view === 'my horde' && <NetHorde />}
@@ -756,6 +757,109 @@ function NetHorde() {
           </div>
         )
       })}
+    </>
+  )
+}
+
+function NetDistributed() {
+  const [goal, setGoal] = useState('')
+  const [n, setN] = useState(4)
+  const [run, setRun] = useState(null) // { run, goal }
+  const [state, setState] = useState(null) // board run state
+  const [answer, setAnswer] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState(null)
+
+  // Poll the run while it's active and not yet synthesized.
+  useEffect(() => {
+    if (!run || answer) return
+    let live = true
+    const tick = async () => {
+      try { const s = await api.hordeRun(run.run); if (live) setState(s) } catch (_) {}
+    }
+    tick()
+    const h = setInterval(tick, 3000)
+    return () => { live = false; clearInterval(h) }
+  }, [run, answer])
+
+  const start = async () => {
+    if (!goal.trim()) return
+    setBusy(true); setErr(null); setAnswer(null); setState(null)
+    try {
+      const r = await api.hordeRunStart(goal.trim(), n)
+      setRun({ run: r.run, goal: r.goal })
+    } catch (e) { setErr(e.message || String(e)) }
+    finally { setBusy(false) }
+  }
+  const synthesize = async () => {
+    setBusy(true); setErr(null)
+    try { const r = await api.hordeSynthesize(run.goal, run.run); setAnswer(r.answer) }
+    catch (e) { setErr(e.message || String(e)) }
+    finally { setBusy(false) }
+  }
+  const reset = () => { setRun(null); setState(null); setAnswer(null); setGoal('') }
+
+  const complete = state?.complete
+  return (
+    <>
+      <div className="card-meta" style={{ marginTop: 0 }}>
+        Split a goal across your horde: it's decomposed into independent subtasks, posted to your
+        private board, solved in parallel by your bound agents, then synthesized. (Agents solve only
+        when their <code>[network.horde] enabled</code>.)
+      </div>
+
+      {!run && (
+        <div className="card">
+          <div className="field">
+            <span>Goal</span>
+            <textarea rows={3} value={goal} onChange={(e) => setGoal(e.target.value)}
+              placeholder="e.g. Research and draft a launch plan for the horde board feature" />
+          </div>
+          <div className="row-between">
+            <label style={{ color: 'var(--dim)', fontSize: 13 }}>
+              subtasks:{' '}
+              <select value={n} onChange={(e) => setN(+e.target.value)}>
+                {[2, 3, 4, 5, 6, 8].map((x) => <option key={x} value={x}>{x}</option>)}
+              </select>
+            </label>
+            <button disabled={busy} onClick={start}>{busy ? 'decomposing…' : '⚡ distribute'}</button>
+          </div>
+        </div>
+      )}
+      {err && <div className="empty">{err}</div>}
+
+      {run && (
+        <div className="card">
+          <div className="row-between">
+            <div className="card-title">{run.goal}<small>run {short(run.run.replace('run-', ''), 8)}</small></div>
+            <button onClick={reset}>new run</button>
+          </div>
+          <div className="card-meta" style={{ marginTop: 4 }}>
+            {state ? `${state.solved}/${state.total} subtasks solved${complete ? ' · complete' : ' · working…'}` : 'posting subtasks…'}
+          </div>
+          {(state?.tasks || []).map((t) => (
+            <div key={t.id} className="tool-row">
+              <span className="pill sm" style={{ background: TASK_COLOR[t.status] || '#7a828d' }}>{t.status}</span>
+              <span style={{ flex: 1 }}>{t.title}</span>
+              {t.worker && <small style={{ color: 'var(--dim)' }}>by {short(t.worker, 8)}</small>}
+            </div>
+          ))}
+          {(state?.tasks || []).some((t) => t.status === 'solved') && (
+            <div className="card-actions">
+              <button className="ok" disabled={busy} onClick={synthesize}>
+                {busy ? 'synthesizing…' : complete ? '✦ synthesize' : '✦ synthesize solved so far'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {answer && (
+        <div className="card">
+          <div className="card-title">✦ Synthesis</div>
+          <div dangerouslySetInnerHTML={{ __html: mdToHtml(answer) }} />
+        </div>
+      )}
     </>
   )
 }
