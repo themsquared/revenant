@@ -1372,7 +1372,9 @@ async fn net_install(
 // (one LLM call) into a final answer. The board is the durable source of truth;
 // the UI polls /v1/net/horde/run/:run to watch the fan-out.
 
-/// One tier'd, non-streaming LLM call returning the joined text.
+/// One tier'd, non-streaming LLM call returning the joined text. Transient
+/// provider pressure (529 Overloaded) is retried with backoff — the agent turn
+/// pipeline already rides these out; a single raw call must too.
 async fn llm_text(state: &AppState, system: &str, user: String, max_tokens: u32) -> Result<String, ApiError> {
     let req = revenant_llm::MessagesRequest {
         model: state.default_tier.to_string(),
@@ -1387,13 +1389,22 @@ async fn llm_text(state: &AppState, system: &str, user: String, max_tokens: u32)
         stream: true,
         identity: Some("horde-orchestrator".to_string()),
     };
-    let outcome = state
-        .manager
-        .runtime()
-        .llm
-        .stream_message(&req, |_| {})
-        .await
-        .map_err(ApiError::from)?;
+    let llm = state.manager.runtime().llm.clone();
+    let mut outcome = Err(anyhow::anyhow!("unreached"));
+    for (attempt, delay_ms) in [(1u32, 0u64), (2, 2000), (3, 6000)] {
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        outcome = llm.stream_message(&req, |_| {}).await;
+        match &outcome {
+            Ok(_) => break,
+            Err(e) if format!("{e:#}").to_lowercase().contains("overloaded") => {
+                tracing::debug!("llm_text: provider overloaded (attempt {attempt}) — backing off");
+            }
+            Err(_) => break, // non-transient: surface it
+        }
+    }
+    let outcome = outcome.map_err(ApiError::from)?;
     Ok(outcome
         .content
         .iter()
