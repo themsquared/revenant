@@ -3,7 +3,7 @@
 //! Errors are returned as `ToolOutput::err` (visible to the model), never as
 //! Rust errors — a failing tool must not kill the turn.
 
-mod builtins;
+pub mod builtins;
 mod jail;
 
 pub use jail::Jail;

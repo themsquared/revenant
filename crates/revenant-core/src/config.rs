@@ -153,6 +153,11 @@ pub struct A2aAgent {
     /// `direct` https targets — the connection fails closed on mismatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_fp: Option<String>,
+    /// The peer agent's network pubkey. When set and `tls_fp` is not, the pin
+    /// is auto-resolved at daemon start from the peer's identity-signed profile
+    /// on the directory (an explicit `tls_fp` always wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// Privacy router: when enabled, a turn whose input contains sensitive data

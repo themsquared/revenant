@@ -1193,7 +1193,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServerCert {
 
 /// A reqwest client that (a) accepts ONLY the pinned peer cert and (b)
 /// presents this agent's own cert for the peer's mTLS binding.
-fn pinned_a2a_client(pin: &str, home: &Home) -> anyhow::Result<reqwest::Client> {
+pub fn pinned_a2a_client(pin: &str, home: &Home) -> anyhow::Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mat = revenant_net::tls::load_or_create(&home.identity_dir())?;
     let certs: Vec<rustls::pki_types::CertificateDer> =

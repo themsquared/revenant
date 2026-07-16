@@ -89,6 +89,47 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
             revenant_tools::A2aTarget { name: a.name.clone(), url, token, via_gateway, tls_fp: a.tls_fp.clone() }
         })
         .collect();
+    let mut a2a_targets = a2a_targets;
+    // Auto-pin (SEC-4): resolve missing pins from the directory by the peer's
+    // pubkey — the pin is the peer's own identity-signed claim; an explicit
+    // config tls_fp always wins. Fail-open: no pin ⇒ the dial stays unpinned.
+    let needs_pin: Vec<usize> = cfg
+        .a2a_agents
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.tls_fp.is_none() && a.agent.is_some() && a.direct)
+        .map(|(i, _)| i)
+        .collect();
+    if !needs_pin.is_empty() && cfg.network.enabled {
+        if let Some(url) = &cfg.network.necropolis_url {
+            match revenant_net::NecropolisClient::new(url).agents().await {
+                Ok(roster) => {
+                    for i in needs_pin {
+                        let want = cfg.a2a_agents[i].agent.as_deref().unwrap_or_default();
+                        let pin = roster
+                            .iter()
+                            .find(|r| r.get("agent").and_then(|x| x.as_str()) == Some(want))
+                            .and_then(|r| r.get("tls_fp").and_then(|x| x.as_str()).map(String::from));
+                        match pin {
+                            Some(fp) => {
+                                tracing::info!(
+                                    "a2a: pinned '{}' from its published claim ({}…)",
+                                    a2a_targets[i].name,
+                                    &fp[..16.min(fp.len())]
+                                );
+                                a2a_targets[i].tls_fp = Some(fp);
+                            }
+                            None => tracing::warn!(
+                                "a2a: '{}' has no published pin — dialing unpinned",
+                                a2a_targets[i].name
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("a2a: pin auto-resolution skipped (directory unreachable: {e:#})"),
+            }
+        }
+    }
     let wasm_tools = revenant_wasm::load_dir(&home.plugins_dir());
     if !wasm_tools.is_empty() {
         tracing::info!("loaded {} sandboxed wasm plugin tool(s)", wasm_tools.len());

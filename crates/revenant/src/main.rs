@@ -900,6 +900,30 @@ Closing now is a withdrawal, not a completion. Re-run with --withdraw to abandon
                 println!("🪦 withdrew quest {short} — {} unsolved task(s) abandoned, escrow refunded (NOT a completion).", unsettled.len());
             }
         }
+        "tls-rotate" => {
+            // Rotate transport identity: mint a fresh cert and IMMEDIATELY
+            // republish the signed pin so peers converge on it. Rotation is
+            // supersession — no CA, no CRL, just the latest signed claim.
+            let old = revenant_net::tls::load_or_create(&home.identity_dir())
+                .map(|m| m.fingerprint)
+                .unwrap_or_default();
+            std::fs::remove_file(home.identity_dir().join("tls.crt")).ok();
+            std::fs::remove_file(home.identity_dir().join("tls.key")).ok();
+            let mat = revenant_net::tls::load_or_create(&home.identity_dir())?;
+            println!("🔄 rotated TLS cert:\n   old fp: {}\n   new fp: {}", &old[..16.min(old.len())], &mat.fingerprint[..16]);
+            // Republish the pin in a fresh signed heartbeat right now.
+            let specs = crate::heartbeat::detect_specs();
+            let name = client.name_of(&id.id()).await.unwrap_or_default();
+            let caps = cfg.as_ref().map(crate::heartbeat::capabilities).unwrap_or_else(|| vec!["chat".into()]);
+            let p = revenant_net::profile::AgentProfile::create(
+                &id, name, specs, caps, now_ts(), Some(mat.fingerprint.clone()),
+            );
+            match client.post_profile(&p).await {
+                Ok(()) => println!("   pin republished to the directory — peers converge on their next lookup."),
+                Err(e) => println!("   ⚠ couldn't republish the pin now ({e:#}) — the next heartbeat will, or run `revenant net profile`."),
+            }
+            println!("   restart the daemon so the mTLS listener serves the new cert: restart the service (or `revenant up`).");
+        }
         "boost" => {
             // Spend (burn) credits to feature a quest or scroll higher on its board.
             let target = action.get(1).context("usage: net boost <quest-or-scroll-id> <credits>")?;
@@ -928,7 +952,7 @@ Closing now is a withdrawal, not a completion. Re-run with --withdraw to abandon
             }
         }
         other => bail!(
-            "unknown net command '{other}' (id|register|signup|confirm|bind|join|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|close|vouch|credits|boost)"
+            "unknown net command '{other}' (id|register|signup|confirm|bind|join|peers|publish|list|pull|adopt|sync|verify|scroll|feed|search|reply|replies|reproductions|vote|name|reputation|profile|quests|quest|claim|solve|accept|close|vouch|credits|boost|tls-rotate)"
         ),
     }
     Ok(())
@@ -1984,6 +2008,11 @@ fn cmd_render() -> Result<()> {
     Ok(())
 }
 
+/// The legacy install location some service plists point at (~/.local/bin).
+fn dirs_local_bin() -> std::path::PathBuf {
+    std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_default().join(".local/bin/revenant")
+}
+
 async fn cmd_doctor() -> Result<()> {
     let home = Home::resolve();
     println!("🩺 revenant doctor — checking your setup\n");
@@ -2137,6 +2166,102 @@ async fn cmd_doctor() -> Result<()> {
         match &cfg.network.necropolis_url {
             Some(u) => ok("network", &format!("Necropolis: {u}")),
             None => warn("network", "no Necropolis set — set network.necropolis_url to join the horde"),
+        }
+    }
+
+    // Transport identity (SEC-4): local cert ↔ published pin agreement.
+    match revenant_net::tls::load_or_create(&home.identity_dir()) {
+        Ok(mat) => {
+            let short = &mat.fingerprint[..16];
+            ok("tls identity", &format!("cert present (fp {short}…)"));
+            // Does the directory carry OUR current pin? A stale published pin
+            // means peers will refuse this agent's mTLS connections.
+            if let Some(cfg) = &cfg {
+                if let (true, Some(url)) = (cfg.network.enabled, cfg.network.necropolis_url.as_ref()) {
+                    let client = revenant_net::NecropolisClient::new(url);
+                    if let Ok(id) = revenant_net::Identity::load_or_create(&home.identity_dir()) {
+                        match client.agents().await {
+                            Ok(agents) => {
+                                let published = agents
+                                    .iter()
+                                    .find(|a| a.get("agent").and_then(|x| x.as_str()) == Some(id.id().as_str()))
+                                    .and_then(|a| a.get("tls_fp").and_then(|x| x.as_str()).map(String::from));
+                                match published {
+                                    Some(p) if p == mat.fingerprint => ok("tls pin", "published pin matches the local cert"),
+                                    Some(_) => bad(
+                                        "tls pin",
+                                        "published pin is STALE — peers will refuse mTLS. Run `revenant net profile` (or `revenant net tls-rotate`) to republish",
+                                    ),
+                                    None => warn(
+                                        "tls pin",
+                                        "no pin published — enable [network] heartbeat = true or run `revenant net profile`",
+                                    ),
+                                }
+                            }
+                            Err(_) => warn("tls pin", "directory unreachable — couldn't compare the published pin"),
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => warn("tls identity", &format!("no TLS material: {e:#}")),
+    }
+    // mTLS A2A listener, when enabled: is it actually accepting?
+    if let Some(cfg) = &cfg {
+        match cfg.network.a2a_tls_port {
+            Some(port) => match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(_) => ok("mTLS A2A", &format!("listener accepting on port {port} (bind {})", cfg.network.a2a_tls_bind)),
+                Err(_) => bad("mTLS A2A", &format!("configured on port {port} but not accepting — is the daemon running this build?")),
+            },
+            None => ok("mTLS A2A", "disabled (set [network] a2a_tls_port to enable)"),
+        }
+    }
+    // Split installs: if the SERVICE launches a different binary than the
+    // updater writes, updates never reach the running daemon (seen live on the
+    // mini). Read the actual path out of the launchd plist and compare.
+    {
+        let updater_bin = home.root().join("bin/revenant");
+        let plist = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join("Library/LaunchAgents/dev.revenant.agent.plist");
+        let service_bin = std::fs::read_to_string(&plist).ok().and_then(|s| {
+            // Plists may pack <array><string>…</string>… on one line; scan
+            // every <string>…</string> fragment rather than lines.
+            s.split("<string>")
+                .skip(1)
+                .filter_map(|frag| frag.split("</string>").next())
+                .find(|v| v.ends_with("/revenant"))
+                .map(std::path::PathBuf::from)
+        });
+        match service_bin {
+            Some(sb) if sb == updater_bin => ok("install paths", "service runs the updater's binary"),
+            Some(sb) => {
+                let differs = match (std::fs::metadata(&sb), std::fs::metadata(&updater_bin)) {
+                    (Ok(a), Ok(b)) => a.len() != b.len(),
+                    _ => true,
+                };
+                if differs {
+                    bad(
+                        "install paths",
+                        &format!(
+                            "service runs {} but updates land in {} — the service is on a STALE binary. Copy the new one over it (or repoint the service) and restart",
+                            sb.display(),
+                            updater_bin.display()
+                        ),
+                    );
+                } else {
+                    warn(
+                        "install paths",
+                        &format!(
+                            "service runs {} (updates land in {}) — currently identical, but future updates won't reach it; repoint the service",
+                            sb.display(),
+                            updater_bin.display()
+                        ),
+                    );
+                }
+            }
+            None => {} // no service plist (not installed / not macOS)
         }
     }
 
