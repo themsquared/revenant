@@ -487,7 +487,13 @@ async fn cmd_net(action: Vec<String>) -> Result<()> {
                 .as_ref()
                 .and_then(|c| c.network.endpoint.clone())
                 .unwrap_or_else(|| "http://127.0.0.1:7717/a2a".to_string());
-            client.register(&id.id(), &endpoint, &["chat".into(), "ascension".into()]).await?;
+            let reg = revenant_net::register::Registration::create(
+                &id,
+                endpoint.clone(),
+                vec!["chat".into(), "ascension".into()],
+                now_ts(),
+            );
+            client.register(&reg).await?;
             println!("mustered at {url} as {} (endpoint {endpoint})", id.fingerprint());
         }
         "peers" => {

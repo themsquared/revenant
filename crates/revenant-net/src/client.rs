@@ -139,11 +139,12 @@ impl NecropolisClient {
         Ok(())
     }
 
-    pub async fn register(&self, id: &str, endpoint: &str, capabilities: &[String]) -> Result<()> {
+    /// Advertise presence with a signed registration (proves key control).
+    pub async fn register(&self, reg: &crate::register::Registration) -> Result<()> {
         let resp = self
             .http
             .post(self.url("/register"))
-            .json(&serde_json::json!({ "id": id, "endpoint": endpoint, "capabilities": capabilities }))
+            .json(reg)
             .send()
             .await
             .context("registering with necropolis")?;
