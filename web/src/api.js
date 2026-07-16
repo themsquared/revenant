@@ -61,6 +61,23 @@ export const api = {
   loopRuns: (id) => request('GET', `/v1/loops/${encodeURIComponent(id)}/runs`),
   loopToggle: (id, enabled) => request('PATCH', `/v1/loops/${encodeURIComponent(id)}`, { enabled }),
   loopDelete: (id) => request('DELETE', `/v1/loops/${encodeURIComponent(id)}`),
+
+  // ---- Necropolis (the horde network) ----
+  netQuests: () => request('GET', '/v1/net/quests'),
+  netQuest: (id) => request('GET', `/v1/net/quests/${encodeURIComponent(id)}`),
+  netClaim: (id, task) => request('POST', `/v1/net/quests/${encodeURIComponent(id)}/claim`, { task }),
+  netSolve: (id, task, output) =>
+    request('POST', `/v1/net/quests/${encodeURIComponent(id)}/solve`, { task, output }),
+  netAccept: (id, task, result_id) =>
+    request('POST', `/v1/net/quests/${encodeURIComponent(id)}/accept`, { task, result_id }),
+  netClose: (id, withdraw) =>
+    request('POST', `/v1/net/quests/${encodeURIComponent(id)}/close`, { withdraw }),
+  netBoost: (target, amount) => request('POST', '/v1/net/boost', { target, amount }),
+  netLeaderboard: () => request('GET', '/v1/net/leaderboard'),
+  netBazaar: (q) => request('GET', `/v1/net/bazaar${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  netInstall: (id) => request('POST', `/v1/net/bazaar/${encodeURIComponent(id)}/install`),
+  netMe: () => request('GET', '/v1/net/me'),
+  netHorde: () => request('GET', '/v1/net/horde'),
 }
 
 export function eventStream(onEvent) {

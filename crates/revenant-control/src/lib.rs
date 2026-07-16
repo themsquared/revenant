@@ -87,6 +87,19 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/memory/status", get(memory_status))
         .route("/v1/gateway/status", get(gateway_status))
         .route("/v1/channels/pairings", post(pairing_create))
+        // Necropolis (the horde network) — read proxies + signed clickops.
+        .route("/v1/net/quests", get(net_quests))
+        .route("/v1/net/quests/:id", get(net_quest))
+        .route("/v1/net/quests/:id/claim", post(net_claim))
+        .route("/v1/net/quests/:id/solve", post(net_solve))
+        .route("/v1/net/quests/:id/accept", post(net_accept))
+        .route("/v1/net/quests/:id/close", post(net_close))
+        .route("/v1/net/boost", post(net_boost))
+        .route("/v1/net/leaderboard", get(net_leaderboard))
+        .route("/v1/net/bazaar", get(net_bazaar))
+        .route("/v1/net/bazaar/:id/install", post(net_install))
+        .route("/v1/net/me", get(net_me))
+        .route("/v1/net/horde", get(net_horde))
         // A2A: revenant as a callable node in the agent mesh (authed).
         .route("/a2a", post(a2a_message))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth))
@@ -915,6 +928,266 @@ async fn memory_status(State(state): State<AppState>) -> Result<Json<serde_json:
 async fn gateway_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let healthy = state.gateway_probe.models_ready().await;
     Json(json!({ "healthy": healthy }))
+}
+
+// ---- Necropolis (the horde network): read proxies + signed clickops --------
+//
+// Reads proxy through the daemon so the browser needs no CORS + no keys. Writes
+// are signed here with THIS node's identity (never exposed to the browser); the
+// server still enforces every rule (accounts, no-self-dealing, proof-of-work).
+
+/// Resolve the network directory URL: env override, else configured
+/// `network.necropolis_url` (only when the network is enabled).
+fn net_url(home: &revenant_core::home::Home) -> Option<String> {
+    if let Ok(u) = std::env::var("REVENANT_NECROPOLIS") {
+        if !u.trim().is_empty() {
+            return Some(u);
+        }
+    }
+    let cfg =
+        revenant_core::config::Config::from_toml(&std::fs::read_to_string(home.config_path()).ok()?).ok()?;
+    if !cfg.network.enabled {
+        return None;
+    }
+    cfg.network.necropolis_url
+}
+
+/// A Necropolis client + this node's signing identity, or a 400 if the network
+/// isn't configured / the identity can't load.
+fn net_ctx(
+    state: &AppState,
+) -> Result<(revenant_net::NecropolisClient, revenant_net::Identity), ApiError> {
+    let url = net_url(&state.home).ok_or_else(|| {
+        ApiError::bad_request(
+            "the network isn't configured — set [network] enabled = true and necropolis_url",
+        )
+    })?;
+    let id = revenant_net::Identity::load_or_create(&state.home.identity_dir())?;
+    Ok((revenant_net::NecropolisClient::new(&url), id))
+}
+
+fn net_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+async fn net_quests(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, _) = net_ctx(&state)?;
+    Ok(Json(json!({ "quests": c.quests(None).await? })))
+}
+
+async fn net_quest(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, _) = net_ctx(&state)?;
+    Ok(Json(c.quest(&id).await?))
+}
+
+async fn net_leaderboard(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, _) = net_ctx(&state)?;
+    Ok(Json(json!({ "leaderboard": c.leaderboard().await? })))
+}
+
+#[derive(Deserialize)]
+struct BazaarQuery {
+    #[serde(default)]
+    q: String,
+}
+
+async fn net_bazaar(
+    State(state): State<AppState>,
+    Query(q): Query<BazaarQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, _) = net_ctx(&state)?;
+    // A query searches the codex; otherwise list the whole artifact catalog.
+    let items = if q.q.trim().is_empty() {
+        c.list(None).await?
+    } else {
+        c.search(&q.q).await?.artifacts
+    };
+    Ok(Json(json!({ "items": items })))
+}
+
+/// This node's own standing: pubkey, credit balance, reputation.
+async fn net_me(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, id) = net_ctx(&state)?;
+    let me = id.id();
+    let credits = c.credits().await.unwrap_or_default();
+    let rep = c.reputation().await.unwrap_or_default();
+    Ok(Json(json!({
+        "pubkey": me,
+        "credits": credits.get(&me).copied().unwrap_or(100),
+        "reputation": rep.get(&me).copied().unwrap_or(0.0),
+    })))
+}
+
+/// The account's bound agents (full roster cards), if an account key is present
+/// on this node; otherwise just this node's own agent.
+async fn net_horde(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, id) = net_ctx(&state)?;
+    let me = id.id();
+    let key_path = state.home.root().join("account.key");
+    let mine: Vec<String> = match std::fs::read_to_string(&key_path) {
+        Ok(k) if !k.trim().is_empty() => c.account_agents(k.trim()).await.unwrap_or_else(|_| vec![me.clone()]),
+        _ => vec![me.clone()],
+    };
+    let roster = c.agents().await.unwrap_or_default();
+    let agents: Vec<_> = roster
+        .into_iter()
+        .filter(|a| a.get("agent").and_then(|x| x.as_str()).is_some_and(|pk| mine.iter().any(|m| m == pk)))
+        .collect();
+    Ok(Json(json!({ "me": me, "bound": mine, "agents": agents })))
+}
+
+#[derive(Deserialize)]
+struct ClaimBody {
+    task: String,
+}
+async fn net_claim(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(b): Json<ClaimBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, k) = net_ctx(&state)?;
+    let claim = revenant_net::quest::TaskClaim::create(&k, id, b.task, net_now());
+    c.claim_task(&claim).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SolveBody {
+    task: String,
+    output: String,
+}
+async fn net_solve(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(b): Json<SolveBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, k) = net_ctx(&state)?;
+    let r = revenant_net::quest::TaskResult::create(&k, id, b.task, b.output, net_now());
+    c.post_result(&r).await?;
+    Ok(Json(json!({ "ok": true, "result_id": r.id })))
+}
+
+#[derive(Deserialize)]
+struct AcceptBody {
+    task: String,
+    result_id: String,
+}
+async fn net_accept(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(b): Json<AcceptBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, k) = net_ctx(&state)?;
+    let a = revenant_net::quest::TaskAccept::create(&k, id, b.task, b.result_id, net_now());
+    Ok(Json(c.accept_result(&a).await?))
+}
+
+#[derive(Deserialize)]
+struct CloseBody {
+    #[serde(default)]
+    withdraw: bool,
+}
+async fn net_close(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(b): Json<CloseBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, k) = net_ctx(&state)?;
+    // Proof gate: a quest with unsettled tasks can only be *withdrawn*, never
+    // passed off as completed. Mirror the tool's guard so the UI can't fake it.
+    let state_json = c.quest(&id).await?;
+    let unsettled: Vec<String> = state_json
+        .get("tasks")
+        .and_then(|t| t.as_array())
+        .map(|ts| {
+            ts.iter()
+                .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("solved"))
+                .filter_map(|t| t.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !unsettled.is_empty() && !b.withdraw {
+        return Err(ApiError::bad_request(format!(
+            "quest has {} unsettled task(s) ({}) — nothing proven solved. Closing now is a withdrawal, not a completion; pass withdraw=true to abandon the unsolved work.",
+            unsettled.len(),
+            unsettled.join(", ")
+        )));
+    }
+    let close = revenant_net::quest::QuestClose::create(&k, id, net_now());
+    c.close_quest(&close).await?;
+    Ok(Json(json!({ "ok": true, "withdrawn": !unsettled.is_empty() })))
+}
+
+#[derive(Deserialize)]
+struct BoostBody {
+    target: String,
+    amount: u64,
+}
+async fn net_boost(
+    State(state): State<AppState>,
+    Json(b): Json<BoostBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if b.amount == 0 {
+        return Err(ApiError::bad_request("a boost must spend at least 1 credit"));
+    }
+    let (c, k) = net_ctx(&state)?;
+    let boost = revenant_net::boost::Boost::create(&k, b.target, b.amount, net_now());
+    c.boost(&boost).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// One-click install of a skill from the Bazaar: pull (verifies signature +
+/// content hash), confirm it's a skill, write it, and reindex — the same path
+/// the `skill_adopt` tool takes.
+async fn net_install(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (c, k) = net_ctx(&state)?;
+    // Resolve short id / title → full artifact id.
+    let full = id.len() == 64 && id.chars().all(|ch| ch.is_ascii_hexdigit());
+    let full_id = if full {
+        id.clone()
+    } else {
+        let items = c.list(Some("skill")).await?;
+        items
+            .iter()
+            .find(|a| {
+                a["title"].as_str().is_some_and(|t| t.eq_ignore_ascii_case(&id))
+                    || a["id"].as_str().is_some_and(|aid| aid.starts_with(&id))
+            })
+            .and_then(|a| a["id"].as_str().map(String::from))
+            .ok_or_else(|| ApiError::bad_request(format!("no skill matching \"{id}\" on the network")))?
+    };
+    let artifact = c.pull(&full_id).await.map_err(|e| ApiError::bad_request(format!("install refused: {e:#}")))?;
+    if artifact.kind != revenant_net::ArtifactKind::Skill {
+        return Err(ApiError::bad_request(format!("artifact is a {:?}, not a skill", artifact.kind)));
+    }
+    let payload = artifact.payload()?;
+    let slug: String = artifact
+        .title
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let slug = if slug.is_empty() { full_id[..12].to_string() } else { slug };
+    let dir = state.home.skills_dir().join(&slug);
+    std::fs::create_dir_all(&dir).map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
+    std::fs::write(dir.join("SKILL.md"), &payload).map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
+    let _ = state.manager.runtime().skills.scan(); // so use_skill sees it now
+    // Best-effort adoption attestation (feeds the author's reputation).
+    let _ = c.attest(&full_id, &k.id(), true).await;
+    Ok(Json(json!({ "ok": true, "slug": slug, "title": artifact.title })))
 }
 
 // ---- error plumbing ----

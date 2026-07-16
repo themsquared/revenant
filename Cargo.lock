@@ -2473,6 +2473,7 @@ dependencies = [
  "revenant-gateway",
  "revenant-llm",
  "revenant-memory",
+ "revenant-net",
  "revenant-security",
  "revenant-skills",
  "revenant-store",

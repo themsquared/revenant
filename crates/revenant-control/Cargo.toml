@@ -10,6 +10,7 @@ revenant-store = { workspace = true }
 revenant-agent = { workspace = true }
 revenant-security = { workspace = true }
 revenant-skills = { workspace = true }
+revenant-net = { workspace = true }
 revenant-llm = { workspace = true }
 revenant-gateway = { workspace = true }
 axum = { workspace = true }

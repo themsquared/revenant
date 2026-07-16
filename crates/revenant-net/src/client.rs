@@ -373,6 +373,27 @@ impl NecropolisClient {
         Ok(self.http.get(self.url("/credits")).send().await?.json().await?)
     }
 
+    /// The account-collapsed leaderboard, ranked by reputation then credits.
+    pub async fn leaderboard(&self) -> Result<Vec<serde_json::Value>> {
+        Ok(self.http.get(self.url("/leaderboard")).send().await?.json().await?)
+    }
+
+    /// Agent pubkeys bound to the account behind `account_key`.
+    pub async fn account_agents(&self, account_key: &str) -> Result<Vec<String>> {
+        let v: serde_json::Value = self
+            .http
+            .get(self.url("/account/agents"))
+            .query(&[("key", account_key)])
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(v.get("agents")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default())
+    }
+
     /// Spend credits to boost a quest or scroll higher on its board.
     pub async fn boost(&self, b: &Boost) -> Result<()> {
         let resp = self.http.post(self.url("/boost")).json(b).send().await?;

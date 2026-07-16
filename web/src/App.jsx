@@ -6,7 +6,7 @@ import { api, eventStream, getToken, setToken } from './api.js'
 // by how hard it is — everyday use (talk, approve, add skills, pick a voice)
 // stays visible; the machinery (tools, subagents, loops, spend, memory) hides
 // until asked for.
-const SIMPLE_TABS = ['chat', 'approvals', 'skills', 'personalities', 'settings']
+const SIMPLE_TABS = ['chat', 'approvals', 'necropolis', 'skills', 'personalities', 'settings']
 const ADVANCED_TABS = ['tools', 'subagents', 'loops', 'spend', 'memory']
 
 // Minimal, safe markdown -> HTML for assistant messages. Escapes first (no
@@ -112,6 +112,7 @@ export default function App() {
       <main>
         {tab === 'chat' && <Chat onApprovalCount={setPendingCount} setBanner={setBanner} />}
         {tab === 'approvals' && <Approvals onCount={setPendingCount} />}
+        {tab === 'necropolis' && <Necropolis />}
         {tab === 'skills' && <Skills />}
         {tab === 'tools' && <Tools />}
         {tab === 'subagents' && <Subagents />}
@@ -543,6 +544,219 @@ function Skills() {
         </div>
       ))}
     </div>
+  )
+}
+
+// ---- necropolis: the horde network (quests, bazaar, leaderboard, my horde) ----
+
+const NET_VIEWS = ['quests', 'bazaar', 'leaderboard', 'my horde']
+
+function Necropolis() {
+  const [view, setView] = useState('quests')
+  const [me, setMe] = useState(null)
+  const [err, setErr] = useState(null)
+
+  const loadMe = () => api.netMe().then(setMe).catch((e) => setErr(String(e.message || e)))
+  useEffect(() => { loadMe() }, [])
+
+  return (
+    <div className="list">
+      <div className="row-between">
+        <nav className="subnav">
+          {NET_VIEWS.map((v) => (
+            <button key={v} className={view === v ? 'tab active' : 'tab'} onClick={() => setView(v)}>{v}</button>
+          ))}
+        </nav>
+        {me && (
+          <span className="card-meta" style={{ margin: 0 }}>
+            💰 {me.credits} credits · 🏅 {me.reputation?.toFixed?.(1) ?? me.reputation}
+          </span>
+        )}
+      </div>
+      {err && <div className="empty">{err}</div>}
+      {view === 'quests' && <NetQuests onChange={loadMe} />}
+      {view === 'bazaar' && <NetBazaar />}
+      {view === 'leaderboard' && <NetLeaderboard />}
+      {view === 'my horde' && <NetHorde />}
+    </div>
+  )
+}
+
+function short(s, n = 12) { return s ? `${s.slice(0, n)}…` : '?' }
+
+function NetQuests({ onChange }) {
+  const [quests, setQuests] = useState(null)
+  const [open, setOpen] = useState(null) // expanded quest detail
+  const [busy, setBusy] = useState(false)
+
+  const load = () => api.netQuests().then((r) => setQuests(r.quests || [])).catch(() => setQuests([]))
+  useEffect(() => { load() }, [])
+
+  const expand = async (id) => {
+    if (open?.id === id) return setOpen(null)
+    setOpen(await api.netQuest(id))
+  }
+  const act = async (fn, refresh = true) => {
+    setBusy(true)
+    try { await fn(); if (refresh && open) setOpen(await api.netQuest(open.id)); load(); onChange?.() }
+    catch (e) { alert(e.message || e) }
+    finally { setBusy(false) }
+  }
+
+  if (!quests) return <div className="empty">reading the board…</div>
+  if (!quests.length) return <div className="empty">no open quests on the board</div>
+
+  return (
+    <>
+      {quests.map((q) => (
+        <div key={q.id} className="card">
+          <div className="row-between">
+            <div className="card-title clickable" onClick={() => expand(q.id)}>
+              {open?.id === q.id ? '▾ ' : '▸ '}{q.title || 'untitled'}
+              <small>by {q.author_name || short(q.author, 8)} · {q.open_tasks}/{q.total_tasks} open</small>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              {q.bounty > 0 && <span className="pill sm" style={{ background: '#d9b06a' }}>🎁 {q.bounty}</span>}
+              {q.boost > 0 && <span className="pill sm" style={{ background: '#a78bfa' }}>🚀 {q.boost}</span>}
+              <button disabled={busy} onClick={() => {
+                const n = parseInt(prompt(`Boost "${q.title}" — how many credits? (burned)`, '10'), 10)
+                if (n > 0) act(() => api.netBoost(q.id, n))
+              }}>🚀 boost</button>
+            </div>
+          </div>
+          {open?.id === q.id && (
+            <div style={{ marginTop: 10 }}>
+              <div className="card-meta" style={{ marginTop: 0 }}>{open.spec}</div>
+              {(open.tasks || []).map((t) => (
+                <div key={t.id} className="tool-row">
+                  <b>{t.id}</b>
+                  <span className="pill sm" style={{ background: TASK_COLOR[t.status] || '#7a828d' }}>{t.status}</span>
+                  <span style={{ flex: 1 }}>{t.spec}</span>
+                  {t.status === 'open' && (
+                    <button disabled={busy} onClick={() => act(() => api.netClaim(open.id, t.id))}>claim</button>
+                  )}
+                  {(t.status === 'claimed' || t.status === 'open') && (
+                    <button disabled={busy} onClick={() => {
+                      const out = prompt(`Submit your result for ${t.id}:`)
+                      if (out) act(() => api.netSolve(open.id, t.id, out))
+                    }}>submit</button>
+                  )}
+                  {t.status === 'pending' && (
+                    <button className="ok" disabled={busy} onClick={() => {
+                      const rid = prompt(`Result id to accept for ${t.id}:`)
+                      if (rid) act(() => api.netAccept(open.id, t.id, rid))
+                    }}>accept</button>
+                  )}
+                </div>
+              ))}
+              <div className="card-actions">
+                <button className="no" disabled={busy} onClick={() => {
+                  const anyOpen = (open.tasks || []).some((t) => t.status !== 'solved')
+                  if (anyOpen && !confirm('Tasks are unsettled — this CLOSES the quest as a withdrawal (not a completion), refunding escrow. Continue?')) return
+                  act(() => api.netClose(open.id, anyOpen), false).then(() => setOpen(null))
+                }}>close / withdraw</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+    </>
+  )
+}
+const TASK_COLOR = { open: '#7a828d', claimed: '#d9b06a', pending: '#60a5fa', solved: '#34d399' }
+
+function NetBazaar() {
+  const [q, setQ] = useState('')
+  const [items, setItems] = useState(null)
+  const [msg, setMsg] = useState(null)
+  const load = (query) => api.netBazaar(query).then((r) => setItems(r.items || [])).catch(() => setItems([]))
+  useEffect(() => { load('') }, [])
+  const install = async (it) => {
+    setMsg(`installing ${it.title}…`)
+    try { const r = await api.netInstall(it.id); setMsg(`✅ installed "${r.title}" as skill \`${r.slug}\``) }
+    catch (e) { setMsg(`✗ ${e.message || e}`) }
+  }
+  return (
+    <>
+      <div className="row-between">
+        <input placeholder="search skills & plugins…" value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && load(q)}
+          style={{ flex: 1, padding: '8px 12px', background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)' }} />
+      </div>
+      {msg && <div className="card-meta">{msg}</div>}
+      {!items && <div className="empty">browsing the bazaar…</div>}
+      {items && !items.length && <div className="empty">nothing matches</div>}
+      {items && items.map((it) => (
+        <div key={it.id} className="card">
+          <div className="row-between">
+            <div className="card-title">
+              {it.title}
+              <small>{it.kind} · by {short(it.author, 8)}</small>
+            </div>
+            {String(it.kind).toLowerCase() === 'skill' && (
+              <button className="ok" onClick={() => install(it)}>install</button>
+            )}
+          </div>
+          {it.description && <div className="card-meta" style={{ marginTop: 6 }}>{it.description}</div>}
+        </div>
+      ))}
+    </>
+  )
+}
+
+function NetLeaderboard() {
+  const [rows, setRows] = useState(null)
+  useEffect(() => { api.netLeaderboard().then((r) => setRows(r.leaderboard || [])).catch(() => setRows([])) }, [])
+  if (!rows) return <div className="empty">ranking the horde…</div>
+  if (!rows.length) return <div className="empty">no ranked accounts yet</div>
+  return (
+    <div className="card">
+      <table style={{ width: '100%' }}>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i}>
+              <td style={{ color: 'var(--dim)' }}>#{i + 1}</td>
+              <td><b>{r.name || short(r.pubkey || r.account, 10)}</b></td>
+              <td>🏅 {(r.reputation ?? 0).toFixed?.(1) ?? r.reputation}</td>
+              <td>💰 {r.credits ?? 0}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function NetHorde() {
+  const [data, setData] = useState(null)
+  useEffect(() => { api.netHorde().then(setData).catch(() => setData({ agents: [] })) }, [])
+  if (!data) return <div className="empty">mustering your horde…</div>
+  return (
+    <>
+      <div className="card-meta" style={{ marginTop: 0 }}>
+        {data.bound?.length || 0} agent(s) bound to your account. Bind more with <code>revenant net join &lt;email&gt;</code> on each node.
+      </div>
+      {(!data.agents || !data.agents.length) && <div className="empty">no bound agents heartbeating yet</div>}
+      {(data.agents || []).map((a) => {
+        const live = a.last_seen && (Date.now() / 1000 - a.last_seen) < 3600
+        return (
+          <div key={a.agent} className="card">
+            <div className="row-between">
+              <div className="card-title">
+                <span className="pill sm" style={{ background: live ? '#34d399' : '#7a828d' }}>{live ? 'live' : 'stale'}</span>
+                {' '}{a.name || short(a.agent, 10)}
+                {a.agent === data.me && <small>this node</small>}
+              </div>
+              {typeof a.reputation === 'number' && a.reputation !== 0 && <span>🏅 {a.reputation.toFixed(1)}</span>}
+            </div>
+            {a.specs && (
+              <div className="card-meta">{a.specs.os} · {a.specs.arch} · {a.specs.cpus} cores{a.capabilities?.length ? ` · ${a.capabilities.join(', ')}` : ''}</div>
+            )}
+          </div>
+        )
+      })}
+    </>
   )
 }
 
