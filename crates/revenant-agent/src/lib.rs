@@ -1469,16 +1469,63 @@ afterward. Use when you notice a recurring kind of subtask worth a dedicated age
 /// so a tool name is all we have — err toward prompting. Read verbs (get/list/
 /// describe/…) are NOT here, so inspection still runs freely.
 fn mcp_looks_destructive(name: &str) -> bool {
-    let n = name.to_lowercase();
+    // Match WHOLE tokens, not substrings — otherwise "get_settings" (set),
+    // "list_posts" (post), "compute_diff" (put), "get_run" (run) would all be
+    // falsely gated, reintroducing prompt fatigue. Tokenize on separators AND
+    // camelCase, then compare token-equal.
     const DANGER: &[&str] = &[
         "delete", "destroy", "remove", "rm", "drop", "truncate", "apply", "create", "update",
         "patch", "edit", "write", "put", "post", "set", "scale", "exec", "run", "restart",
         "rollout", "cordon", "drain", "evict", "kill", "stop", "start", "install", "uninstall",
         "upgrade", "deploy", "publish", "send", "push", "merge", "close", "cancel", "revoke",
-        "grant", "move", "rename", "copy", "upload", "purge", "flush", "reset",
+        "grant", "move", "rename", "copy", "upload", "purge", "flush", "reset", "wipe",
+        "terminate", "provision", "mount", "format", "modify", "disable", "enable", "add",
     ];
-    // Word-ish containment so "kubectl_delete" / "createIssue" / "deleteFile" hit.
-    DANGER.iter().any(|d| n.contains(d))
+    // Read verbs, checked as the LEADING token — the verb governs intent. This
+    // disambiguates nouns that collide with danger verbs: `get_run`,
+    // `list_runs`, `describe_deployment` are reads even though "run"/"deploy"
+    // appear later. A leading read verb wins outright.
+    const READ_LEAD: &[&str] = &[
+        "get", "list", "describe", "read", "show", "search", "explain", "view", "fetch", "find",
+        "inspect", "status", "count", "watch", "tail", "logs", "ls", "cat", "head", "query",
+        "lookup", "resolve", "check", "ping", "help", "version", "info", "diff", "history",
+    ];
+    let tokens = mcp_name_tokens(name);
+    if tokens.first().is_some_and(|t| READ_LEAD.contains(&t.as_str())) {
+        return false;
+    }
+    tokens.iter().any(|tok| DANGER.contains(&tok.as_str()))
+}
+
+/// Split an MCP tool name into lowercase tokens on separators (`_ - / . space`)
+/// and camelCase/boundary transitions, so `kubectl_delete` → [kubectl, delete],
+/// `createIssue` → [create, issue], `getSettings` → [get, settings].
+fn mcp_name_tokens(name: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut prev: Option<char> = None;
+    for c in name.chars() {
+        let boundary = matches!(c, '_' | '-' | '/' | '.' | ' ' | ':')
+            || (c.is_ascii_uppercase() && prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit()));
+        if c.is_ascii_uppercase() && prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit()) {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+        } else if matches!(c, '_' | '-' | '/' | '.' | ' ' | ':') {
+            if !cur.is_empty() {
+                tokens.push(std::mem::take(&mut cur));
+            }
+            prev = Some(c);
+            continue;
+        }
+        let _ = boundary;
+        cur.push(c.to_ascii_lowercase());
+        prev = Some(c);
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 /// Above this many MCP tools, stop injecting every spec each turn and expose
@@ -2323,9 +2370,23 @@ mod mcp_compose_tests {
             assert!(mcp_looks_destructive(danger), "should prompt: {danger}");
         }
         for safe in ["kubectl_get", "kubectl_describe", "list_events", "read_file",
-                     "explain_resource", "get_chunks", "search_notes", "ping"] {
+                     "explain_resource", "get_chunks", "search_notes", "ping",
+                     // The substring traps that motivated tokenization — these
+                     // are READS and must NOT be gated:
+                     "get_settings", "list_posts", "compute_diff", "get_run",
+                     "list_runs", "getSettings", "describe_output", "get_status"] {
             assert!(!mcp_looks_destructive(safe), "should run free: {safe}");
         }
+    }
+
+    #[test]
+    fn name_tokenizer_splits_separators_and_camel_case() {
+        assert_eq!(mcp_name_tokens("kubectl_delete"), vec!["kubectl", "delete"]);
+        assert_eq!(mcp_name_tokens("createIssue"), vec!["create", "issue"]);
+        assert_eq!(mcp_name_tokens("get_settings"), vec!["get", "settings"]);
+        assert_eq!(mcp_name_tokens("exec-in-pod"), vec!["exec", "in", "pod"]);
+        // "compute" must stay one token so it never matches "put".
+        assert_eq!(mcp_name_tokens("compute"), vec!["compute"]);
     }
 }
 
