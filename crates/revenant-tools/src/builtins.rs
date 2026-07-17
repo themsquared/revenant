@@ -625,6 +625,43 @@ fn exec_is_read_only(command: &str) -> bool {
     if prog == "sqlite3" {
         return sqlite_is_read_only(cmd);
     }
+    // Container/cluster/package/cloud CLIs: only their inspect-and-report verbs
+    // auto-allow; anything that starts, kills, applies, deletes, edits, pushes,
+    // or execs still prompts. `git`/`find`/`revenant`/`sqlite3` handled above.
+    let sub = rest.first().copied().unwrap_or("");
+    match prog {
+        // `docker exec`/`run`/`rm`/`build`/… mutate; only inspection reads.
+        "docker" | "podman" => {
+            return matches!(
+                sub,
+                "ps" | "images" | "logs" | "inspect" | "version" | "info" | "top"
+                    | "port" | "stats" | "history" | "search"
+            );
+        }
+        // kubectl: read verbs only, and never with a mutating flag. `config`
+        // and `auth` are allowed only in their read forms (view / can-i).
+        "kubectl" | "k" => {
+            let readish = matches!(
+                sub,
+                "get" | "describe" | "logs" | "explain" | "top" | "api-resources"
+                    | "api-versions" | "version" | "cluster-info" | "events"
+            );
+            let config_read = sub == "config" && matches!(rest.get(1).copied().unwrap_or(""), "view" | "get-contexts" | "current-context");
+            let auth_read = sub == "auth" && rest.get(1).copied() == Some("can-i");
+            return readish || config_read || auth_read;
+        }
+        "helm" => {
+            let repo_read = sub == "repo" && matches!(rest.get(1).copied().unwrap_or(""), "list" | "ls");
+            return matches!(sub, "list" | "ls" | "status" | "get" | "history" | "show" | "search" | "version" | "env")
+                || repo_read;
+        }
+        // `gh <noun> <verb>` — only report verbs; `gh auth` prompts regardless.
+        "gh" => {
+            return sub != "auth"
+                && matches!(rest.get(1).copied().unwrap_or(""), "list" | "view" | "status" | "checks" | "diff");
+        }
+        _ => {}
+    }
     const READ_ONLY: &[&str] = &[
         "ls", "cat", "head", "tail", "wc", "stat", "file", "grep", "rg", "fd", "tree", "du",
         "df", "pwd", "echo", "printf", "date", "whoami", "id", "uname", "hostname", "uptime",
@@ -2771,6 +2808,12 @@ mod dbquery_tests {
             // …and their read-only kin.
             "revenant net quests", "revenant net credits", "revenant doctor",
             "revenant memory search foo", "ls 2>/dev/null",
+            // Container/cluster/cloud read verbs — inspect, don't mutate.
+            "docker ps", "docker images", "docker logs web", "docker inspect web",
+            "kubectl get pods", "kubectl describe pod web", "kubectl logs web -n prod",
+            "kubectl top nodes", "kubectl config view", "kubectl auth can-i get pods",
+            "helm list", "helm status myrel", "gh pr list", "gh run view 123",
+            "gh pr checks", "podman ps",
         ] {
             assert!(exec_is_read_only(ok), "should be auto-allowed: {ok}");
         }
@@ -2784,6 +2827,12 @@ mod dbquery_tests {
             "revenant net scroll \"hi\"", "revenant net vote abc up", "revenant up",
             "sqlite3 x.db \"delete from jobs\"", "sqlite3 x.db \"update jobs set status=1\"",
             "sqlite3 x.db \"drop table jobs\"",
+            // Container/cluster/cloud MUTATIONS still prompt.
+            "docker run -d nginx", "docker exec web sh", "docker rm web", "docker build .",
+            "kubectl apply -f x.yaml", "kubectl delete pod web", "kubectl exec web -- sh",
+            "kubectl edit deploy web", "kubectl scale --replicas=3 deploy/web",
+            "kubectl config use-context prod", "helm install r ./chart",
+            "helm upgrade r ./chart", "gh pr merge 12", "gh pr create", "gh auth login",
         ] {
             assert!(!exec_is_read_only(risky), "should prompt: {risky}");
         }
