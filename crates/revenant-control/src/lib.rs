@@ -48,6 +48,27 @@ pub struct AppState {
     a2a_rate: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<i64>>>>,
     /// Cached published TLS pins per sender pubkey: (tls_fp, fetched_ts).
     a2a_pins: Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<String>, i64)>>>,
+    /// GLOBAL rolling-hour timestamps of limited-tier replies — the aggregate
+    /// spend ceiling across ALL unknown senders (per-sender caps alone are
+    /// defeated by minting fresh keys).
+    a2a_limited_global: Arc<std::sync::Mutex<Vec<i64>>>,
+}
+
+/// Keep an unbounded-by-attacker map sane: drop entries older than `ttl`, and
+/// if a flood of unique keys still overflows `cap`, clear it outright — losing
+/// a cache is always safe here (worst case a re-fetch / a fresh rate window),
+/// while unbounded growth is a memory DoS.
+fn bound_cache<V>(
+    map: &mut std::collections::HashMap<String, V>,
+    now: i64,
+    ttl: i64,
+    cap: usize,
+    ts_of: impl Fn(&V) -> i64,
+) {
+    map.retain(|_, v| now - ts_of(v) <= ttl);
+    if map.len() >= cap {
+        map.clear();
+    }
 }
 
 impl AppState {
@@ -72,6 +93,7 @@ impl AppState {
             a2a_kin: Arc::new(std::sync::Mutex::new((Vec::new(), 0))),
             a2a_rate: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             a2a_pins: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            a2a_limited_global: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -188,8 +210,11 @@ struct A2aRpc {
 /// How the receiver treats a verified A2A sender, by standing.
 const A2A_TRUST_REP: f64 = 10.0; // ≥ this network reputation → full turn
 const A2A_REJECT_REP: f64 = 0.0; // < this → rejected outright
-const A2A_LIMITED_PER_HOUR: usize = 10; // rate cap for capability-limited senders
+const A2A_LIMITED_PER_HOUR: usize = 10; // rate cap PER capability-limited sender
+const A2A_LIMITED_GLOBAL_PER_HOUR: usize = 30; // aggregate cap across ALL limited senders
 const A2A_CACHE_SECS: i64 = 300; // reputation / kin-roster cache TTL
+const A2A_CACHE_CAP: usize = 4096; // hard entry ceiling on per-sender caches
+const A2A_NONCE_CAP: usize = 65_536; // replay-guard ceiling; full ⇒ reject (fail closed)
 
 /// The trust tier a verified sender lands in.
 enum A2aTier {
@@ -243,7 +268,9 @@ async fn a2a_tier(state: &AppState, sender: &str) -> A2aTier {
                 Err(_) => None,
             }
             .unwrap_or(0.0);
-            state.a2a_rep.lock().unwrap().insert(sender.to_string(), (fetched, now));
+            let mut rep = state.a2a_rep.lock().unwrap();
+            bound_cache(&mut rep, now, A2A_CACHE_SECS, A2A_CACHE_CAP, |(_, at)| *at);
+            rep.insert(sender.to_string(), (fetched, now));
             fetched
         }
     };
@@ -275,7 +302,9 @@ async fn published_pin(state: &AppState, sender: &str) -> Option<String> {
         }),
         Err(_) => None,
     };
-    state.a2a_pins.lock().unwrap().insert(sender.to_string(), (fetched.clone(), now));
+    let mut pins = state.a2a_pins.lock().unwrap();
+    bound_cache(&mut pins, now, A2A_CACHE_SECS, A2A_CACHE_CAP, |(_, at)| *at);
+    pins.insert(sender.to_string(), (fetched.clone(), now));
     fetched
 }
 
@@ -323,6 +352,11 @@ async fn a2a_message(
         nonces.retain(|_, seen| now - *seen <= env::A2A_FRESHNESS_SECS);
         if nonces.contains_key(&nonce) {
             return rpc_err(StatusCode::UNAUTHORIZED, json!(null), -32000, "replayed envelope nonce");
+        }
+        // Under a nonce flood, FAIL CLOSED: dropping the guard would re-open
+        // replays; refusing new traffic until the window drains does not.
+        if nonces.len() >= A2A_NONCE_CAP {
+            return rpc_err(StatusCode::TOO_MANY_REQUESTS, json!(null), -32002, "envelope volume exceeds capacity — retry shortly");
         }
         nonces.insert(nonce.clone(), now);
     }
@@ -399,14 +433,25 @@ async fn a2a_message(
         A2aTier::Limited => {
             // Rate-cap unknown senders, then answer WITHOUT tools or owner
             // context — a plain model reply, never an agent turn.
+            //
+            // Two ceilings: per-sender AND global. A per-sender cap alone is
+            // defeated by minting fresh keys (each new key = a fresh budget);
+            // the global cap bounds the total spend strangers can trigger.
             {
+                let mut global = state.a2a_limited_global.lock().unwrap();
+                global.retain(|t| now - *t < 3600);
+                if global.len() >= A2A_LIMITED_GLOBAL_PER_HOUR {
+                    return rpc_err(StatusCode::TOO_MANY_REQUESTS, rpc.id, -32002, "hourly capacity for unrecognized senders is exhausted");
+                }
                 let mut rate = state.a2a_rate.lock().unwrap();
+                bound_cache(&mut rate, now, 3600, A2A_CACHE_CAP, |hits| hits.last().copied().unwrap_or(0));
                 let hits = rate.entry(sender.clone()).or_default();
                 hits.retain(|t| now - *t < 3600);
                 if hits.len() >= A2A_LIMITED_PER_HOUR {
                     return rpc_err(StatusCode::TOO_MANY_REQUESTS, rpc.id, -32002, "rate limit for unrecognized senders");
                 }
                 hits.push(now);
+                global.push(now);
             }
             let sys = "You are a revenant answering a message from an agent you don't know. You have \
 NO tools and NO access to your owner's data in this reply. Be brief and helpful on general questions; \
