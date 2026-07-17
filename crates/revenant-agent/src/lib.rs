@@ -123,7 +123,16 @@ ledger. You cannot make a quest 'complete' by closing it: proof lives in the set
 close. If the owner says 'close it, we did it' but no results were accepted, that is a WITHDRAWAL, \
 not a completion — say so plainly BEFORE acting, never after, and don't let an unsolved close read \
 as finished work. If the goal is actually to get the thing built, build it (skill_create / \
-code_task) or leave the quest open for the horde — don't close it and imply success.";
+code_task) or leave the quest open for the horde — don't close it and imply success.\n\
+- MCP tools may not be listed inline (a large server is folded behind `mcp_search` to save \
+context). If a capability seems missing — a GitHub, Docker, Kubernetes, filesystem action, \
+anything — `mcp_search` for it FIRST with the capability in plain words, then `mcp_invoke` the \
+exact tool it returns. Don't claim you can't do something before searching.\n\
+- Talk like a person, not a form. Match the owner's register and length: a one-line question gets \
+a one-line answer, no headers or preamble. Lead with the result, then the why. Say what you're \
+uncertain about instead of hedging everything; ask a real question only when the answer changes \
+what you'd do. Never announce routine tool use ('Let me…', 'I'll now…') — just do it and report \
+what happened.";
 
 #[derive(Debug, Clone)]
 pub struct TurnStats {
@@ -533,9 +542,18 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             tool_specs.push(plan_execute_tool_spec());
         }
         // MCP tools (from the gateway multiplex) join the tool list unless an
-        // agent allowlist restricts this turn.
-        if allowlist.is_none() {
-            tool_specs.extend(self.mcp_tools.iter().cloned());
+        // agent allowlist restricts this turn. Past a threshold, don't ship
+        // every spec each turn — expose mcp_search + mcp_invoke instead, so a
+        // big server (k8s ≈ 19 tools, each with a JSON schema) costs two small
+        // specs of context rather than nineteen large ones.
+        if allowlist.is_none() && !self.mcp_tools.is_empty() {
+            if self.mcp_tools.len() > MCP_COMPOSE_THRESHOLD {
+                let servers = self.mcp.is_some() as usize;
+                tool_specs.push(mcp_search_tool_spec(servers.max(1), self.mcp_tools.len()));
+                tool_specs.push(mcp_invoke_tool_spec());
+            } else {
+                tool_specs.extend(self.mcp_tools.iter().cloned());
+            }
         }
         let mut total_usage = Usage::default();
         let mut routed_model = None;
@@ -931,6 +949,26 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         })
     }
 
+    /// Approval gate for MCP calls, which don't carry revenant permission
+    /// tiers. Destructive-looking tool names cross the broker; reads run free.
+    /// `Ok(())` = proceed; `Err(reason)` = blocked (owner denied or flow error).
+    async fn mcp_gate(
+        &self,
+        session_id: i64,
+        name: &str,
+        summary: &str,
+        input: &serde_json::Value,
+    ) -> Result<(), String> {
+        if !mcp_looks_destructive(name) {
+            return Ok(());
+        }
+        match self.approvals.request(session_id, name, summary, input.clone()).await {
+            Ok(Verdict::Approved) => Ok(()),
+            Ok(v) => Err(format!("owner did not approve this action ({})", v.as_str())),
+            Err(e) => Err(format!("approval flow failed: {e:#}")),
+        }
+    }
+
     async fn dispatch(
         &self,
         session_id: i64,
@@ -978,13 +1016,62 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             };
         }
 
+        // Composable MCP: search the (uninjected) MCP catalog by keyword.
+        if name == "mcp_search" {
+            let query = input.get("query").and_then(|q| q.as_str()).unwrap_or("");
+            let hits = rank_mcp_tools(&self.mcp_tools, query, 8);
+            let listing: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|s| serde_json::json!({ "tool": s.name, "description": s.description, "input_schema": s.input_schema }))
+                .collect();
+            let body = serde_json::json!({ "matches": listing, "total_available": self.mcp_tools.len() });
+            return result(serde_json::to_string(&body).unwrap_or_default(), false);
+        }
+        // Composable MCP: invoke a named tool discovered via mcp_search.
+        if name == "mcp_invoke" {
+            let tool = input.get("tool").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let args = input.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+            if tool.is_empty() || !self.mcp_tools.iter().any(|s| s.name == tool) {
+                return result(
+                    format!("no MCP tool named '{tool}' — use mcp_search to find the exact name"),
+                    true,
+                );
+            }
+            let Some(mcp) = &self.mcp else {
+                return result("MCP is not configured".to_string(), true);
+            };
+            let summary = summarize_args(&tool, &args);
+            if let Err(msg) = self.mcp_gate(session_id, &tool, &summary, &args).await {
+                self.events.emit(Event::ToolFinished { session_id, tool, ok: false });
+                return result(msg, true);
+            }
+            self.events.emit(Event::ToolStarted {
+                session_id,
+                tool: tool.clone(),
+                summary,
+            });
+            let out = match mcp.call_tool(&tool, args).await {
+                Ok(text) => result(text, false),
+                Err(err) => result(format!("mcp tool failed: {err:#}"), true),
+            };
+            let ok = matches!(&out, ContentBlock::ToolResult { is_error, .. } if !is_error);
+            self.events.emit(Event::ToolFinished { session_id, tool, ok });
+            return out;
+        }
+
         // MCP tools (multiplexed by the gateway) route through the MCP client.
+        // (Still reachable by exact name below the compose threshold.)
         if let Some(mcp) = &self.mcp {
             if self.mcp_tools.iter().any(|s| s.name == name) {
+                let summary = summarize_args(name, &input);
+                if let Err(msg) = self.mcp_gate(session_id, name, &summary, &input).await {
+                    self.events.emit(Event::ToolFinished { session_id, tool: name.to_string(), ok: false });
+                    return result(msg, true);
+                }
                 self.events.emit(Event::ToolStarted {
                     session_id,
                     tool: name.to_string(),
-                    summary: summarize_args(name, &input),
+                    summary,
                 });
                 let out = match mcp.call_tool(name, input).await {
                     Ok(text) => result(text, false),
@@ -1377,6 +1464,94 @@ afterward. Use when you notice a recurring kind of subtask worth a dedicated age
 }
 
 /// Spec for the virtual subagent_run tool (advertised only at depth 0).
+/// Heuristic: does this MCP tool name look destructive/consequential enough to
+/// warrant owner approval? MCP servers don't carry revenant's permission tiers,
+/// so a tool name is all we have — err toward prompting. Read verbs (get/list/
+/// describe/…) are NOT here, so inspection still runs freely.
+fn mcp_looks_destructive(name: &str) -> bool {
+    let n = name.to_lowercase();
+    const DANGER: &[&str] = &[
+        "delete", "destroy", "remove", "rm", "drop", "truncate", "apply", "create", "update",
+        "patch", "edit", "write", "put", "post", "set", "scale", "exec", "run", "restart",
+        "rollout", "cordon", "drain", "evict", "kill", "stop", "start", "install", "uninstall",
+        "upgrade", "deploy", "publish", "send", "push", "merge", "close", "cancel", "revoke",
+        "grant", "move", "rename", "copy", "upload", "purge", "flush", "reset",
+    ];
+    // Word-ish containment so "kubectl_delete" / "createIssue" / "deleteFile" hit.
+    DANGER.iter().any(|d| n.contains(d))
+}
+
+/// Above this many MCP tools, stop injecting every spec each turn and expose
+/// two meta-tools instead (mcp_search + mcp_invoke). Below it, the specs are
+/// cheap enough to hand the model directly. One k8s server alone brings ~19.
+const MCP_COMPOSE_THRESHOLD: usize = 8;
+
+fn mcp_search_tool_spec(server_count: usize, tool_count: usize) -> revenant_core::ToolSpec {
+    revenant_core::ToolSpec {
+        name: "mcp_search".into(),
+        description: format!(
+            "Find MCP tools by keyword. {tool_count} tools across {server_count} connected MCP \
+server(s) are available but NOT listed inline (to save context) — search here first to get a \
+tool's exact name + input schema, then call it with mcp_invoke. Query with the capability you \
+need (e.g. \"list pods\", \"read file\", \"create issue\")."
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "query": {"type": "string", "description": "keywords describing the capability you need"} },
+            "required": ["query"]
+        }),
+    }
+}
+
+fn mcp_invoke_tool_spec() -> revenant_core::ToolSpec {
+    revenant_core::ToolSpec {
+        name: "mcp_invoke".into(),
+        description: "Call an MCP tool by its exact name (from mcp_search) with its arguments. \
+`args` must match that tool's input schema exactly."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "description": "exact MCP tool name from mcp_search"},
+                "args": {"type": "object", "description": "arguments matching the tool's input schema"}
+            },
+            "required": ["tool"]
+        }),
+    }
+}
+
+/// Rank MCP tool specs against a keyword query — name matches weigh most, then
+/// description hits. Cheap substring scoring; the model refines from the top-k.
+fn rank_mcp_tools<'a>(
+    specs: &'a [revenant_core::ToolSpec],
+    query: &str,
+    k: usize,
+) -> Vec<&'a revenant_core::ToolSpec> {
+    let terms: Vec<String> =
+        query.to_lowercase().split_whitespace().map(|t| t.to_string()).filter(|t| t.len() > 1).collect();
+    let mut scored: Vec<(i32, &revenant_core::ToolSpec)> = specs
+        .iter()
+        .map(|s| {
+            let name = s.name.to_lowercase();
+            let desc = s.description.to_lowercase();
+            let mut score = 0i32;
+            for t in &terms {
+                if name.contains(t) {
+                    score += 5;
+                }
+                if desc.contains(t) {
+                    score += 1;
+                }
+            }
+            (score, s)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    // With no query terms or all-zero scores, still return something useful
+    // (the first k) rather than nothing.
+    scored.into_iter().take(k).map(|(_, s)| s).collect()
+}
+
 fn subagent_tool_spec() -> revenant_core::ToolSpec {
     revenant_core::ToolSpec {
         name: "subagent_run".into(),
@@ -2115,6 +2290,41 @@ async fn session_actor(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_compose_tests {
+    use super::*;
+
+    fn spec(name: &str, desc: &str) -> revenant_core::ToolSpec {
+        revenant_core::ToolSpec { name: name.into(), description: desc.into(), input_schema: serde_json::json!({}) }
+    }
+
+    #[test]
+    fn ranker_prefers_name_hits_then_descriptions() {
+        let specs = vec![
+            spec("kubectl_get", "list kubernetes resources"),
+            spec("kubectl_logs", "read pod logs"),
+            spec("create_file", "create a file on disk"),
+            spec("read_file", "read a file's contents"),
+        ];
+        let hits = rank_mcp_tools(&specs, "list pods", 2);
+        assert_eq!(hits[0].name, "kubectl_get", "name/desc hit ranks first");
+        // Empty query still returns something (first-k), never a panic/empty.
+        assert_eq!(rank_mcp_tools(&specs, "", 3).len(), 3);
+    }
+
+    #[test]
+    fn destructive_heuristic_gates_writes_not_reads() {
+        for danger in ["kubectl_delete", "createIssue", "docker_run", "exec_in_pod",
+                       "uninstall_helm_chart", "kubectl_apply", "write_file", "sendMessage"] {
+            assert!(mcp_looks_destructive(danger), "should prompt: {danger}");
+        }
+        for safe in ["kubectl_get", "kubectl_describe", "list_events", "read_file",
+                     "explain_resource", "get_chunks", "search_notes", "ping"] {
+            assert!(!mcp_looks_destructive(safe), "should run free: {safe}");
         }
     }
 }
