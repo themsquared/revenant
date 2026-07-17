@@ -60,9 +60,16 @@ pub fn spawn(home: Home, cfg: Config, runtime: Arc<AgentRuntime>) {
             d.dry_run, d.max_per_hour, d.sigils
         );
         let mut posted: Vec<i64> = Vec::new(); // timestamps of posts this rolling hour
+        // Threads already weighed, keyed by scroll id → thread depth at that
+        // consideration. A thread is only re-considered (= only re-spends an
+        // LLM call) when its depth CHANGES — i.e. someone actually said
+        // something new. Without this, a quiet feed re-burned a draft call per
+        // scroll per sweep, forever (measured: ~792k tokens/day declining the
+        // same scroll).
+        let mut weighed: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(interval)).await;
-            if let Err(e) = sweep(&client, &id, &me, &d, &runtime, &mut posted).await {
+            if let Err(e) = sweep(&client, &id, &me, &d, &runtime, &mut posted, &mut weighed).await {
                 tracing::debug!("discuss sweep failed (will retry): {e:#}");
             }
         }
@@ -78,6 +85,7 @@ async fn sweep(
     d: &DiscussConfig,
     runtime: &Arc<AgentRuntime>,
     posted: &mut Vec<i64>,
+    weighed: &mut std::collections::HashMap<String, u32>,
 ) -> anyhow::Result<()> {
     let now = crate::now_ts();
     posted.retain(|t| now - t < 3600); // rolling-hour window
@@ -118,7 +126,21 @@ async fn sweep(
             continue;
         }
 
+        // Already weighed this thread at this exact depth: nothing new has been
+        // said, so there is nothing new to react to — spend zero tokens.
+        if weighed.get(&s.id) == Some(&depth) {
+            continue;
+        }
+
         considered += 1;
+        // Record BEFORE the call: whatever the outcome (decline, below-bar,
+        // spoke, even a failed draft), this depth has been weighed. Bounded:
+        // reset when absurdly large (worst case, one extra consideration round).
+        if weighed.len() >= 4096 {
+            weighed.clear();
+        }
+        weighed.insert(s.id.clone(), depth);
+
         // One cheap call: draft a contribution, or decline.
         let candidate = match draft_reply(runtime, &d.tier, &s, &replies).await {
             Ok(Some(c)) => c,

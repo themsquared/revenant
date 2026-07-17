@@ -2218,24 +2218,16 @@ async fn cmd_doctor() -> Result<()> {
     }
     // Split installs: if the SERVICE launches a different binary than the
     // updater writes, updates never reach the running daemon (seen live on the
-    // mini). Read the actual path out of the launchd plist and compare.
+    // mini). Read the actual path out of the unit file and compare — through
+    // symlinks, since a linked ~/.local/bin/revenant IS the updater's binary.
     {
         let updater_bin = home.root().join("bin/revenant");
-        let plist = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join("Library/LaunchAgents/dev.revenant.agent.plist");
-        let service_bin = std::fs::read_to_string(&plist).ok().and_then(|s| {
-            // Plists may pack <array><string>…</string>… on one line; scan
-            // every <string>…</string> fragment rather than lines.
-            s.split("<string>")
-                .skip(1)
-                .filter_map(|frag| frag.split("</string>").next())
-                .find(|v| v.ends_with("/revenant"))
-                .map(std::path::PathBuf::from)
-        });
-        match service_bin {
-            Some(sb) if sb == updater_bin => ok("install paths", "service runs the updater's binary"),
+        let canon =
+            |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        match crate::service::configured_binary() {
+            Some(sb) if canon(&sb) == canon(&updater_bin) => {
+                ok("install paths", "service runs the updater's binary")
+            }
             Some(sb) => {
                 let differs = match (std::fs::metadata(&sb), std::fs::metadata(&updater_bin)) {
                     (Ok(a), Ok(b)) => a.len() != b.len(),
@@ -2245,7 +2237,7 @@ async fn cmd_doctor() -> Result<()> {
                     bad(
                         "install paths",
                         &format!(
-                            "service runs {} but updates land in {} — the service is on a STALE binary. Copy the new one over it (or repoint the service) and restart",
+                            "service runs {} but updates land in {} — the service is on a STALE binary. `revenant update` will sync it, or `revenant service install` repoints it; then restart",
                             sb.display(),
                             updater_bin.display()
                         ),
@@ -2254,14 +2246,14 @@ async fn cmd_doctor() -> Result<()> {
                     warn(
                         "install paths",
                         &format!(
-                            "service runs {} (updates land in {}) — currently identical, but future updates won't reach it; repoint the service",
+                            "service runs {} (updates land in {}) — currently identical; `revenant service install` repoints it at the updated binary",
                             sb.display(),
                             updater_bin.display()
                         ),
                     );
                 }
             }
-            None => {} // no service plist (not installed / not macOS)
+            None => {} // no service unit installed
         }
     }
 
@@ -2432,6 +2424,15 @@ fn cmd_update(check: bool) -> Result<()> {
 
     let bak = perform_update(&home, triple, &tag)?;
     println!("✓ checksum verified");
+    // Heal split installs: if the service's unit file launches a different
+    // binary than the one just swapped, update that one too.
+    match sync_service_binary() {
+        Ok(Some(p)) => println!("✓ service binary synced ({})", p.display()),
+        Ok(None) => {}
+        Err(e) => println!(
+            "⚠️  service binary NOT synced: {e:#}\n   the service may keep running the old version — see `revenant doctor`"
+        ),
+    }
     println!("\n✅ updated to {tag}. Restart to run it: `revenant up` (or restart the service).");
     println!("   previous binary kept at {}", bak.display());
     Ok(())
@@ -2491,8 +2492,12 @@ pub(crate) fn perform_update(home: &Home, triple: &str, tag: &str) -> Result<Pat
         bail!("archive has no `revenant` binary");
     }
 
-    // Atomic-ish swap with a restorable backup.
+    // Atomic-ish swap with a restorable backup. Swap the REAL file: on a
+    // symlinked install (~/.local/bin/revenant → ~/.revenant/bin/revenant)
+    // renaming the symlink itself would replace the link with a plain file
+    // and silently split the install in two.
     let exe = std::env::current_exe()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
     let bak = exe.with_extension("bak");
     let _ = std::fs::remove_file(&bak);
     std::fs::rename(&exe, &bak).context("backing up the current binary")?;
@@ -2511,6 +2516,49 @@ pub(crate) fn perform_update(home: &Home, triple: &str, tag: &str) -> Result<Pat
     // Record the installed release so the next check can compare CalVer.
     let _ = std::fs::write(home.root().join("release"), tag);
     Ok(bak)
+}
+
+/// After an update swaps `current_exe`, make sure the always-on service isn't
+/// left launching a DIFFERENT, now-stale binary — the split-install failure
+/// seen live on the mini: `~/.revenant/release` said v2026.7.157 while the
+/// launchd service kept running an old copy at ~/.local/bin. Reads the path
+/// the service actually launches out of its unit file and, when that's a
+/// separate file, installs the freshly updated binary over it (previous one
+/// kept at `<path>.bak`, restored on failure). Returns the synced path, or
+/// None when there was nothing to do (no service, symlink to the same file,
+/// or the configured path doesn't exist).
+pub(crate) fn sync_service_binary() -> Result<Option<PathBuf>> {
+    let Some(svc) = service::configured_binary() else { return Ok(None) };
+    let exe = std::env::current_exe()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    sync_binary_into(&svc, &exe)
+}
+
+/// Core of [`sync_service_binary`]: install `updated` over `svc` unless they
+/// are already the same file (directly or through a symlink). Split out so the
+/// swap semantics are unit-testable without a real service install.
+fn sync_binary_into(svc: &std::path::Path, updated: &std::path::Path) -> Result<Option<PathBuf>> {
+    // A symlinked service path canonicalizes to the file we just swapped;
+    // a dangling path means the service is broken in a way a copy won't fix
+    // (doctor flags it) — skip both.
+    let Ok(svc) = svc.canonicalize() else { return Ok(None) };
+    if svc == *updated {
+        return Ok(None);
+    }
+    let bak = svc.with_extension("bak");
+    let _ = std::fs::remove_file(&bak);
+    std::fs::rename(&svc, &bak)
+        .with_context(|| format!("backing up service binary {}", svc.display()))?;
+    if let Err(e) = std::fs::copy(updated, &svc) {
+        let _ = std::fs::rename(&bak, &svc); // restore on failure
+        bail!("installing over service binary {} failed (restored): {e}", svc.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&svc, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(Some(svc))
 }
 
 async fn cmd_status() -> Result<()> {
@@ -2772,8 +2820,61 @@ async fn cmd_approvals(action: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_calver, select_update_target};
+    use super::{parse_calver, select_update_target, sync_binary_into};
     use revenant_core::config::UpdateChannel;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("revenant-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // The mini failure: the service launches a stale COPY at a different path
+    // than the updater just swapped. Sync must install the new bytes over the
+    // copy and keep the old one restorable at `.bak`.
+    #[test]
+    fn sync_installs_over_a_stale_service_copy() {
+        let d = scratch("sync-copy");
+        let (svc, new) = (d.join("service/revenant"), d.join("updated/revenant"));
+        std::fs::create_dir_all(svc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&svc, b"OLD").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+
+        let synced = sync_binary_into(&svc, &new.canonicalize().unwrap()).unwrap();
+        assert_eq!(synced, Some(svc.canonicalize().unwrap()));
+        assert_eq!(std::fs::read(&svc).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(svc.with_extension("bak")).unwrap(), b"OLD");
+    }
+
+    // A symlinked service path IS the updated binary — sync must be a no-op,
+    // and must never replace the symlink with a plain file.
+    #[cfg(unix)]
+    #[test]
+    fn sync_leaves_a_symlinked_service_path_alone() {
+        let d = scratch("sync-link");
+        let new = d.join("revenant");
+        std::fs::write(&new, b"NEW").unwrap();
+        let link = d.join("link-revenant");
+        std::os::unix::fs::symlink(&new, &link).unwrap();
+
+        let synced = sync_binary_into(&link, &new.canonicalize().unwrap()).unwrap();
+        assert_eq!(synced, None);
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    // A dangling service path can't be fixed by copying a binary there —
+    // sync skips it (doctor is what surfaces the broken unit).
+    #[test]
+    fn sync_skips_a_missing_service_path() {
+        let d = scratch("sync-missing");
+        let new = d.join("revenant");
+        std::fs::write(&new, b"NEW").unwrap();
+        let synced =
+            sync_binary_into(&d.join("nope/revenant"), &new.canonicalize().unwrap()).unwrap();
+        assert_eq!(synced, None);
+    }
 
     // A GitHub /releases payload shaped like what the API returns: newest first,
     // a stable release plus two rolling `-main.<sha>` prereleases and a draft.

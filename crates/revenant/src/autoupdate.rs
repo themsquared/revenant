@@ -86,10 +86,26 @@ async fn check_once(
         }
         AutoUpdate::Install => {
             let (h, tag) = (home.clone(), latest.clone());
-            let installed =
-                tokio::task::spawn_blocking(move || crate::perform_update(&h, triple, &tag))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("join: {e}"))?;
+            let installed = tokio::task::spawn_blocking(move || {
+                let installed = crate::perform_update(&h, triple, &tag)?;
+                // Heal split installs: if the service unit launches a
+                // different binary than the one just swapped, update it too —
+                // otherwise the service restart cycle keeps booting the old
+                // version forever (the failure seen live on the mini).
+                match crate::sync_service_binary() {
+                    Ok(Some(p)) => {
+                        tracing::info!("auto-update: service binary synced ({})", p.display())
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        "auto-update: service binary NOT synced — the service may keep \
+                         running the old version (see `revenant doctor`): {e:#}"
+                    ),
+                }
+                Ok::<_, anyhow::Error>(installed)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("join: {e}"))?;
             match installed {
                 Ok(_) => {
                     // Deliberately do NOT self-restart: killing this process
