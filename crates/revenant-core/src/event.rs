@@ -139,6 +139,16 @@ pub enum Event {
         lessons: u32,
         suggestions: Vec<String>,
     },
+    /// A background job (e.g. `code_task`) reached a terminal state — done, or
+    /// failed after exhausting retries. Pushed to the owner so an async task
+    /// ALWAYS closes its loop instead of vanishing after it was queued.
+    /// `ok=false` means it gave up; `detail` is a short outcome/error line.
+    JobFinished {
+        id: i64,
+        label: String,
+        ok: bool,
+        detail: String,
+    },
 }
 
 impl Event {

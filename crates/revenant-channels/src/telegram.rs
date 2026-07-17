@@ -634,6 +634,22 @@ impl OutboundMirror {
                         }
                     }
                 }
+                // A background job closed its loop → tell the owner it landed,
+                // whether it finished or gave up. This is the fix for jobs that
+                // used to be fired off and then silently forgotten.
+                Event::JobFinished { id, label, ok, detail } => {
+                    let icon = if ok { "✅" } else { "❌" };
+                    let verb = if ok { "finished" } else { "failed" };
+                    let mut msg = format!("{icon} Task #{id} {verb}: {label}");
+                    if !detail.is_empty() {
+                        msg.push_str(&format!("\n{detail}"));
+                    }
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let _ = self.client.send_message(chat_id, &msg).await;
+                        }
+                    }
+                }
                 _ => {}
             }
         }

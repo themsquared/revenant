@@ -256,6 +256,12 @@ function Chat({ onApprovalCount, setBanner }) {
         case 'self_review_completed':
           setBanner(`🔎 Self-review: ${event.summary} · ${event.lessons} operating note(s)`)
           break
+        case 'job_finished':
+          // Global (no session_id) — a background task closed its loop.
+          setBanner(
+            `${event.ok ? '✅' : '❌'} Task #${event.id} ${event.ok ? 'finished' : 'failed'}: ${event.label}`,
+          )
+          break
         default:
       }
     })

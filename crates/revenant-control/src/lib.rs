@@ -572,6 +572,7 @@ async fn events(
                 revenant_core::Event::TurnCancelled { .. } => "turn_cancelled",
                 revenant_core::Event::BudgetAlert { .. } => "budget_alert",
                 revenant_core::Event::SelfReviewCompleted { .. } => "self_review_completed",
+                revenant_core::Event::JobFinished { .. } => "job_finished",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())

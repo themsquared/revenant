@@ -111,6 +111,7 @@ export function eventStream(onEvent) {
     'turn_cancelled',
     'budget_alert',
     'self_review_completed',
+    'job_finished',
   ]) {
     source.addEventListener(name, forward)
   }

@@ -70,10 +70,23 @@ impl JobRunner {
             "reminder" => self.run_reminder_job(&job).await,
             other => Err(anyhow::anyhow!("unknown job kind '{other}'")),
         };
+        let events = &self.manager.runtime().events;
         match outcome {
             Ok(output) => {
                 let _ = store.job_complete(job.id, &output).await;
                 tracing::info!("jobs: #{} done", job.id);
+                // Close the loop: a queued async task must report back, not
+                // vanish. Reminders already emit their own event; code jobs
+                // (and any future kind) surface completion here.
+                if job.kind != "reminder" {
+                    let detail = output.lines().next().unwrap_or("").chars().take(280).collect::<String>();
+                    events.emit(revenant_core::Event::JobFinished {
+                        id: job.id,
+                        label: job.label.clone(),
+                        ok: true,
+                        detail,
+                    });
+                }
             }
             Err(err) => {
                 let backoff = (BACKOFF_BASE_SECS << job.attempts.min(6)).min(BACKOFF_MAX_SECS);
@@ -87,6 +100,16 @@ impl JobRunner {
                     job.attempts,
                     if retry { format!("retry in {backoff}s") } else { "gave up".into() },
                 );
+                // Only surface a TERMINAL failure — retryable ones stay quiet
+                // so a flaky task doesn't spam the owner between attempts.
+                if !retry {
+                    events.emit(revenant_core::Event::JobFinished {
+                        id: job.id,
+                        label: job.label.clone(),
+                        ok: false,
+                        detail: format!("{err:#}").chars().take(280).collect::<String>(),
+                    });
+                }
             }
         }
     }
