@@ -418,6 +418,40 @@ mod tests {
     }
 
     #[test]
+    fn wizard_fallback_renders_cross_provider_failover() {
+        // End-to-end: the setup wizard's primary+fallback composition
+        // (tiers_with_fallback) must render into AGW virtualModels with priority
+        // failover across BOTH providers — the whole point of the fallback step.
+        use revenant_core::providers;
+        let env: HashSet<String> =
+            ["MOONSHOT_API_KEY".to_string(), "ANTHROPIC_API_KEY".to_string()].into();
+        let kimi = providers::find("kimi").unwrap();
+        let claude = providers::find("anthropic").unwrap();
+        let mut cfg = Config::default_config();
+        cfg.tiers = kimi.tiers_with_fallback(Some(&claude));
+        let yaml = render_gateway_yaml(&cfg, &env, None).unwrap();
+        // Balanced is now 2-target → a failover virtual model, primary first.
+        assert!(yaml.contains("virtualModels"));
+        assert!(yaml.contains("name: balanced"));
+        assert!(yaml.contains("failover"));
+        assert!(yaml.contains("priority: 0"));
+        assert!(yaml.contains("priority: 1"));
+        // Both providers wired, each with its own $ENV key ref.
+        assert!(yaml.contains("kimi-k3"));
+        assert!(yaml.contains(claude.balanced));
+        assert!(yaml.contains("apiKey: $MOONSHOT_API_KEY"));
+        assert!(yaml.contains("apiKey: $ANTHROPIC_API_KEY"));
+        assert!(yaml.contains("https://api.moonshot.ai/v1"));
+
+        // If the fallback key is absent, the gateway drops that target and the
+        // tier degrades to a plain single-provider alias — never a broken tier.
+        let primary_only: HashSet<String> = ["MOONSHOT_API_KEY".to_string()].into();
+        let yaml2 = render_gateway_yaml(&cfg, &primary_only, None).unwrap();
+        assert!(yaml2.contains("kimi-k3"));
+        assert!(!yaml2.contains("apiKey: $ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
     fn spending_cap_renders_local_rate_limit() {
         use revenant_core::config::BudgetCount;
         let env: HashSet<String> = ["ANTHROPIC_API_KEY".to_string()].into();

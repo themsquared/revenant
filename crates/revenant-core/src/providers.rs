@@ -155,6 +155,29 @@ impl ProviderChoice {
         }
         t
     }
+
+    /// Same as [`tiers`], but with an optional second provider appended to every
+    /// cloud tier as a lower-priority failover target. agentgateway tries the
+    /// primary first and rolls over to the fallback on error/health eviction, so
+    /// a provider outage — or a wrong primary model id — degrades to the backup
+    /// instead of failing the turn. A `None` fallback (or one equal to `self`)
+    /// is a no-op, yielding the plain single-target tiers. The fallback's key
+    /// must be present at render time or the gateway simply drops that target
+    /// (render.rs), so an un-keyed fallback is harmless, not broken.
+    pub fn tiers_with_fallback(&self, fallback: Option<&ProviderChoice>) -> BTreeMap<String, TierConfig> {
+        let mut t = self.tiers();
+        if let Some(fb) = fallback {
+            if fb.key != self.key {
+                for (name, model) in [("fast", fb.fast), ("balanced", fb.balanced), ("deep", fb.deep)] {
+                    if let Some(tier) = t.get_mut(name) {
+                        tier.targets.push(fb.target(model));
+                        tier.strategy = RouteStrategy::Failover;
+                    }
+                }
+            }
+        }
+        t
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +206,32 @@ mod tests {
         assert_eq!(kimi.provider, Provider::OpenAI);
         assert_eq!(kimi.base_url.as_deref(), Some("https://api.moonshot.ai/v1"));
         assert_eq!(kimi.key_env, Some("MOONSHOT_API_KEY"));
+    }
+
+    #[test]
+    fn fallback_appends_a_second_failover_target() {
+        let kimi = find("kimi").unwrap();
+        let claude = find("anthropic").unwrap();
+
+        // No fallback → single-target tiers, unchanged.
+        let plain = kimi.tiers_with_fallback(None);
+        assert_eq!(plain["balanced"].targets.len(), 1);
+
+        // Fallback → each cloud tier gains the backup as a 2nd target, primary
+        // first (priority order), strategy failover.
+        let t = kimi.tiers_with_fallback(Some(&claude));
+        for name in ["fast", "balanced", "deep"] {
+            let tier = &t[name];
+            assert_eq!(tier.strategy, RouteStrategy::Failover);
+            assert_eq!(tier.targets.len(), 2, "{name} should have primary + fallback");
+            assert_eq!(tier.targets[0].provider, Provider::OpenAI); // Kimi first
+            assert_eq!(tier.targets[1].provider, Provider::Anthropic); // Claude backup
+        }
+        assert_eq!(t["balanced"].targets[1].model, claude.balanced);
+        assert_eq!(t["balanced"].targets[1].api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+
+        // A fallback equal to the primary is a no-op (no self-failover).
+        let same = kimi.tiers_with_fallback(Some(&kimi));
+        assert_eq!(same["balanced"].targets.len(), 1);
     }
 }

@@ -1587,8 +1587,8 @@ fn upsert_secret(home: &Home, key: &str, value: &str) -> Result<()> {
 /// Point the fast/balanced/deep tiers at the chosen provider, always keeping a
 /// free `local` Ollama tier for $0 testing. Cloud providers default to
 /// `balanced`; a local-only setup defaults to `local`.
-fn apply_provider(cfg: &mut Config, choice: &ProviderChoice) {
-    let mut tiers = choice.tiers();
+fn apply_provider(cfg: &mut Config, choice: &ProviderChoice, fallback: Option<&ProviderChoice>) {
+    let mut tiers = choice.tiers_with_fallback(fallback);
     tiers.entry("local".to_string()).or_insert_with(|| TierConfig {
         targets: vec![TierTarget {
             provider: Provider::Ollama,
@@ -1747,9 +1747,8 @@ fn setup_step_llm(home: &Home, cfg: &mut Config) -> Result<ProviderChoice> {
         }
     };
 
-    apply_provider(cfg, &pick);
-
     if pick.key == "ollama" {
+        apply_provider(cfg, &pick, None);
         println!(
             "  {G}✓{X} local models (free). {D}Great for chat; cloud keys work best for coding/agentic runs.{X}"
         );
@@ -1765,24 +1764,71 @@ fn setup_step_llm(home: &Home, cfg: &mut Config) -> Result<ProviderChoice> {
         return Ok(pick);
     }
 
-    // Cloud provider: capture the key.
-    let env = pick.key_env.unwrap_or("API_KEY");
+    // Cloud provider: capture the key, then offer an optional failover backup.
+    capture_provider_key(home, &pick)?;
+    let fallback = setup_pick_fallback(home, &catalog, &pick)?;
+    apply_provider(cfg, &pick, fallback.as_ref());
+    Ok(pick)
+}
+
+/// Capture (or keep) a cloud provider's API key into secrets.env. Ollama and any
+/// other keyless provider are a no-op. Shared by the primary-brain pick and the
+/// optional fallback pick so both handle "already set / replace / blank" alike.
+fn capture_provider_key(home: &Home, choice: &ProviderChoice) -> Result<()> {
+    let env = match choice.key_env {
+        Some(e) => e,
+        None => return Ok(()),
+    };
     if secret_present(home, env) {
-        let keep = prompt_default(&format!("A {} key is already set — replace it? [y/N]: ", pick.label), "n")?;
+        let keep = prompt_default(&format!("A {} key is already set — replace it? [y/N]: ", choice.label), "n")?;
         if !keep.eq_ignore_ascii_case("y") {
-            println!("  {G}✓{X} keeping existing {}", pick.label);
-            return Ok(pick);
+            println!("  {G}✓{X} keeping existing {}", choice.label);
+            return Ok(());
         }
     }
-    println!("\n  Get a key at:  {U}{}{X}", pick.key_url);
-    let key = prompt(&format!("  Paste your {} key ({env}, blank to skip): ", pick.label))?;
+    println!("\n  Get a key at:  {U}{}{X}", choice.key_url);
+    let key = prompt(&format!("  Paste your {} key ({env}, blank to skip): ", choice.label))?;
     if key.is_empty() {
         println!("  {Y}!{X} no key yet — tiers are set; add {env} to {} when ready.", home.secrets_path().display());
     } else {
         upsert_secret(home, env, &key)?;
         println!("  {G}✓{X} key saved to secrets.env (0600)");
     }
-    Ok(pick)
+    Ok(())
+}
+
+/// Optional second provider used as a lower-priority failover target on every
+/// cloud tier. agentgateway tries the primary first and rolls over to this on
+/// error or health eviction — resilience against outages/rate limits, and a
+/// safety net if the primary model id is wrong. Returns None if declined.
+fn setup_pick_fallback(
+    home: &Home,
+    catalog: &[ProviderChoice],
+    primary: &ProviderChoice,
+) -> Result<Option<ProviderChoice>> {
+    println!(
+        "\n  {D}Fallback (optional): if {} is down, overloaded, or rate-limited, revenant \
+         rolls over to a second model automatically.{X}",
+        primary.label
+    );
+    let want = prompt_default("  Add a fallback provider? [y/N]: ", "n")?;
+    if !want.eq_ignore_ascii_case("y") {
+        return Ok(None);
+    }
+    let opts: Vec<&ProviderChoice> = catalog.iter().filter(|c| c.key != primary.key).collect();
+    for (i, c) in opts.iter().enumerate() {
+        println!("  {B}{}){X} {:<26} {D}{}{X}", i + 1, c.label, c.blurb);
+    }
+    let fb = loop {
+        let raw = prompt_default(&format!("  Choose fallback [1–{}]: ", opts.len()), "1")?;
+        match raw.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= opts.len() => break opts[n - 1].clone(),
+            _ => println!("  {Y}enter a number 1–{}{X}", opts.len()),
+        }
+    };
+    capture_provider_key(home, &fb)?;
+    println!("  {G}✓{X} fallback: {B}{}{X} — every tier now fails over to it", fb.label);
+    Ok(Some(fb))
 }
 
 /// Step 2 — the voice. Choose a default personality (or none). Applies to every
@@ -2948,7 +2994,7 @@ mod tests {
         // default routed to balanced.
         let grok = providers::find("grok").unwrap();
         let mut cfg = Config::default_config();
-        super::apply_provider(&mut cfg, &grok);
+        super::apply_provider(&mut cfg, &grok, None);
         for t in ["fast", "balanced", "deep", "local"] {
             assert!(cfg.tiers.contains_key(t), "missing tier {t}");
         }
@@ -2957,14 +3003,49 @@ mod tests {
         assert_eq!(balanced.model, grok.balanced);
         assert_eq!(balanced.base_url.as_deref(), Some("https://api.x.ai/v1"));
         assert_eq!(balanced.api_key_env.as_deref(), Some("XAI_API_KEY"));
+        // No fallback → single target per cloud tier.
+        assert_eq!(cfg.tiers["balanced"].targets.len(), 1);
         // The kept local tier is keyless Ollama.
         assert!(cfg.tiers["local"].targets[0].api_key_env.is_none());
 
         // A local-only provider defaults to the local tier.
         let ollama = providers::find("ollama").unwrap();
         let mut cfg2 = Config::default_config();
-        super::apply_provider(&mut cfg2, &ollama);
+        super::apply_provider(&mut cfg2, &ollama, None);
         assert_eq!(cfg2.agent.default_tier, "local");
+    }
+
+    #[test]
+    fn apply_provider_with_fallback_wires_failover() {
+        use revenant_core::config::{Config, RouteStrategy};
+        use revenant_core::providers;
+
+        // Kimi primary, Anthropic fallback → each cloud tier is 2-target failover.
+        let kimi = providers::find("kimi").unwrap();
+        let claude = providers::find("anthropic").unwrap();
+        let mut cfg = Config::default_config();
+        super::apply_provider(&mut cfg, &kimi, Some(&claude));
+        for t in ["fast", "balanced", "deep"] {
+            let tier = &cfg.tiers[t];
+            assert_eq!(tier.strategy, RouteStrategy::Failover);
+            assert_eq!(tier.targets.len(), 2, "tier {t} should be primary + fallback");
+            assert_eq!(tier.targets[0].model, kimi_model(&kimi, t)); // primary first
+        }
+        // Backup carries its own key + model.
+        let backup = &cfg.tiers["balanced"].targets[1];
+        assert_eq!(backup.model, claude.balanced);
+        assert_eq!(backup.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        // local stays single-target (never gets a cloud fallback).
+        assert_eq!(cfg.tiers["local"].targets.len(), 1);
+    }
+
+    fn kimi_model(c: &revenant_core::providers::ProviderChoice, tier: &str) -> String {
+        match tier {
+            "fast" => c.fast,
+            "deep" => c.deep,
+            _ => c.balanced,
+        }
+        .to_string()
     }
 
     #[test]
