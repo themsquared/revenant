@@ -77,6 +77,18 @@ pub fn catalog() -> Vec<ProviderChoice> {
             deep: "grok-2-latest",
         },
         ProviderChoice {
+            key: "kimi",
+            label: "Kimi (Moonshot)",
+            blurb: "K3 flagship, 1M ctx, strong agentic/tool use · OpenAI-compatible · platform.moonshot.ai",
+            provider: Provider::OpenAI, // Moonshot speaks the OpenAI API
+            key_env: Some("MOONSHOT_API_KEY"),
+            key_url: "https://platform.moonshot.ai/console/api-keys",
+            base_url: Some("https://api.moonshot.ai/v1"),
+            fast: "kimi-k3",
+            balanced: "kimi-k3",
+            deep: "kimi-k3",
+        },
+        ProviderChoice {
             key: "gemini",
             label: "Google (Gemini)",
             blurb: "fast + long context · aistudio.google.com/apikey",
@@ -166,5 +178,10 @@ mod tests {
         let grok = find("grok").unwrap();
         assert_eq!(grok.provider, Provider::OpenAI);
         assert!(grok.base_url.is_some());
+        // Kimi (Moonshot) is likewise OpenAI-compatible, keyed + base_url'd.
+        let kimi = find("kimi").unwrap();
+        assert_eq!(kimi.provider, Provider::OpenAI);
+        assert_eq!(kimi.base_url.as_deref(), Some("https://api.moonshot.ai/v1"));
+        assert_eq!(kimi.key_env, Some("MOONSHOT_API_KEY"));
     }
 }

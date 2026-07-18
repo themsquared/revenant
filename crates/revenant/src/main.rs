@@ -2073,7 +2073,7 @@ async fn cmd_doctor() -> Result<()> {
     let secrets = std::fs::read_to_string(home.root().join("secrets.env")).unwrap_or_default();
     let present: Vec<&str> = [
         "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY",
-        "OPENROUTER_API_KEY", "GROQ_API_KEY",
+        "OPENROUTER_API_KEY", "GROQ_API_KEY", "MOONSHOT_API_KEY",
     ]
     .into_iter()
     .filter(|k| secrets.contains(k))
