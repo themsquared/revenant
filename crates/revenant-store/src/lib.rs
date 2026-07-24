@@ -328,12 +328,26 @@ impl Store {
 
     /// Compare-and-swap resolve: returns false if already resolved.
     pub async fn approval_resolve(&self, id: &str, verdict: &str, resolver: &str) -> Result<bool> {
+        self.approval_resolve_with(id, verdict, resolver, None).await
+    }
+
+    /// Same CAS resolve, but also records the owner's typed answer for an
+    /// elicitation. Kept as one statement with the verdict so a resolve can
+    /// never land without its response, or vice versa.
+    pub async fn approval_resolve_with(
+        &self,
+        id: &str,
+        verdict: &str,
+        resolver: &str,
+        response: Option<&str>,
+    ) -> Result<bool> {
         let (id, verdict, resolver) = (id.to_owned(), verdict.to_owned(), resolver.to_owned());
+        let response = response.map(str::to_owned);
         self.with(move |conn| {
             let n = conn.execute(
-                "UPDATE approvals SET resolved_at = ?2, verdict = ?3, resolver = ?4
+                "UPDATE approvals SET resolved_at = ?2, verdict = ?3, resolver = ?4, response = ?5
                  WHERE id = ?1 AND resolved_at IS NULL",
-                (&id, unix_now(), &verdict, &resolver),
+                (&id, unix_now(), &verdict, &resolver, &response),
             )?;
             Ok(n == 1)
         })
@@ -1286,6 +1300,22 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 9 {
+        // Elicitation: an approval could only ever record a yes/no verdict, so
+        // there was nowhere to put an ANSWER. MCP servers (spec 2025-06-18) can
+        // ask the client to collect a value from the user mid-tool-call, and the
+        // owner's reply has to be persisted with the request that asked for it —
+        // both for audit ("what did I hand this server?") and so a restart can
+        // see the request was already satisfied.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE approvals ADD COLUMN response TEXT;
+             PRAGMA user_version = 9;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1333,6 +1363,65 @@ mod tests {
         let recovered = s.jobs_recover_running(now + 3600).await.unwrap();
         assert_eq!(recovered, 1);
         assert_eq!(s.job_get(id3).await.unwrap().unwrap().status, "queued");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migration 9 adds `approvals.response`. A fresh DB exercises the exact
+    /// same path an existing one does: the table is CREATEd at v1 without the
+    /// column and ALTERed here, so this covers the upgrade of a live database
+    /// (the deployed one sits at user_version 8) and not just a greenfield one.
+    #[tokio::test]
+    async fn migration_9_adds_the_response_column() {
+        let dir = std::env::temp_dir().join(format!("rev-mig9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("m.db")).unwrap();
+
+        let version: i64 = store
+            .with(|conn| conn.query_row("PRAGMA user_version", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert!(version >= 9, "schema should be at least v9, got {version}");
+
+        let has_response: bool = store
+            .with(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(approvals)")?;
+                let names: Vec<String> =
+                    stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+                Ok(names.iter().any(|n| n == "response"))
+            })
+            .await
+            .unwrap();
+        assert!(has_response, "approvals.response must exist after migration 9");
+
+        // An answer round-trips, and lands atomically with its verdict.
+        store.approval_insert("e1", "elicitation", "{}", 900).await.unwrap();
+        assert!(store
+            .approval_resolve_with("e1", "accepted", "owner", Some("us-east-1"))
+            .await
+            .unwrap());
+        let (verdict, response): (Option<String>, Option<String>) = store
+            .with(|conn| {
+                conn.query_row("SELECT verdict, response FROM approvals WHERE id = 'e1'", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(verdict.as_deref(), Some("accepted"));
+        assert_eq!(response.as_deref(), Some("us-east-1"));
+
+        // A plain boolean resolve leaves response NULL — no accidental writes.
+        store.approval_insert("e2", "exec", "{}", 900).await.unwrap();
+        assert!(store.approval_resolve("e2", "approved", "owner").await.unwrap());
+        let r2: Option<String> = store
+            .with(|conn| {
+                conn.query_row("SELECT response FROM approvals WHERE id = 'e2'", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(r2, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

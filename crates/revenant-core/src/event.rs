@@ -149,6 +149,18 @@ pub enum Event {
         ok: bool,
         detail: String,
     },
+    /// An MCP server asked, mid-tool-call, for a value only the owner can supply
+    /// (spec 2025-06-18 elicitation). `source` names the server doing the asking
+    /// — surfaces MUST show it, because "something wants your API key" cannot be
+    /// judged without knowing what "something" is. Resolution reuses
+    /// `ApprovalResolved` with verdict accepted | declined | cancelled.
+    ElicitationRequested {
+        id: String,
+        session_id: i64,
+        source: String,
+        prompt: String,
+        expires_at: i64,
+    },
 }
 
 impl Event {
@@ -163,7 +175,8 @@ impl Event {
             | Event::ApprovalCreated { session_id, .. }
             | Event::PrivacyRouted { session_id, .. }
             | Event::ComplexityRouted { session_id, .. }
-            | Event::TurnCancelled { session_id } => Some(*session_id),
+            | Event::TurnCancelled { session_id }
+            | Event::ElicitationRequested { session_id, .. } => Some(*session_id),
             Event::SubagentSpawned { parent_session, .. }
             | Event::SubagentFinished { parent_session, .. } => Some(*parent_session),
             _ => None,
