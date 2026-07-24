@@ -154,7 +154,13 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     let (mcp, mcp_tools) = if cfg.mcp.is_empty() || cfg.gateway.mode != GatewayMode::Bundled {
         (None, Vec::new())
     } else {
-        let client = revenant_mcp::McpClient::new(format!("http://127.0.0.1:{}/", cfg.gateway.mcp_port));
+        // Willing to collect input from the owner when a server asks for it
+        // (MCP elicitation). The broker enforces the security semantics; this
+        // only bridges wire shape to prompt.
+        let client = revenant_mcp::McpClient::with_elicitation(
+            format!("http://127.0.0.1:{}/", cfg.gateway.mcp_port),
+            Arc::new(BrokerElicitation { approvals: approvals.clone() }),
+        );
         match client.list_tools().await {
             Ok(tools) => {
                 tracing::info!("discovered {} MCP tool(s) across {} server(s)", tools.len(), cfg.mcp.len());
@@ -492,4 +498,115 @@ pub async fn cmd_up() -> Result<()> {
         handle.shutdown().await;
     }
     Ok(())
+}
+
+/// Bridges the MCP wire layer to the approval broker: a server asking for a
+/// value becomes a prompt only the owner can answer.
+///
+/// `source` is deliberately vague. Tools reach us through the gateway's MCP
+/// MULTIPLEX — one endpoint fronting every configured server — and an
+/// `elicitation/create` carries no upstream identifier, so we cannot honestly
+/// name which server is asking. Saying "an MCP server" is the truthful version;
+/// claiming a specific name would be worse than vague. Narrowing this needs the
+/// gateway to forward a server id, and until it does the owner should treat any
+/// such prompt with the suspicion the vagueness deserves.
+struct BrokerElicitation {
+    approvals: revenant_security::ApprovalBroker,
+}
+
+/// Turn the owner's typed answer into the `content` object the server's schema
+/// asked for. Returns None when we cannot do it faithfully — the caller then
+/// DECLINES rather than sending a value of the wrong shape or type.
+///
+/// MCP restricts `requestedSchema` to a flat object of primitives. We serve the
+/// single-property case, which is what a one-line prompt can actually collect;
+/// a multi-field form is refused rather than guessed at from one string.
+fn answer_to_content(schema: &serde_json::Value, answer: &str) -> Option<serde_json::Value> {
+    let props = schema.get("properties")?.as_object()?;
+    if props.len() != 1 {
+        return None; // multi-field forms need a real surface, not one text line
+    }
+    let (name, spec) = props.iter().next()?;
+    let value = match spec.get("type").and_then(|t| t.as_str()).unwrap_or("string") {
+        // A wrong-typed value is worse than no value: refuse on parse failure.
+        "number" => serde_json::Value::from(answer.parse::<f64>().ok()?),
+        "integer" => serde_json::Value::from(answer.parse::<i64>().ok()?),
+        "boolean" => match answer.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "y" | "1" => serde_json::Value::Bool(true),
+            "false" | "no" | "n" | "0" => serde_json::Value::Bool(false),
+            _ => return None,
+        },
+        _ => serde_json::Value::String(answer.to_string()),
+    };
+    Some(serde_json::json!({ name.as_str(): value }))
+}
+
+#[async_trait::async_trait]
+impl revenant_mcp::ElicitationHandler for BrokerElicitation {
+    async fn elicit(
+        &self,
+        message: &str,
+        schema: &serde_json::Value,
+    ) -> revenant_mcp::ElicitReply {
+        use revenant_mcp::ElicitReply;
+        use revenant_security::ElicitOutcome;
+
+        // session_id 0: the MCP client is shared across sessions and the
+        // multiplex does not tell us which turn triggered the call, so this is
+        // owner-level rather than falsely attributed to one session.
+        match self.approvals.elicit(0, "an MCP server", message, schema.clone()).await {
+            Ok(ElicitOutcome::Accepted(answer)) => match answer_to_content(schema, &answer) {
+                Some(content) => ElicitReply::Accept(content),
+                None => {
+                    tracing::warn!("mcp elicitation: cannot map answer to the requested schema");
+                    ElicitReply::Decline
+                }
+            },
+            Ok(ElicitOutcome::Declined) => ElicitReply::Decline,
+            // Timeout, dismissal, or a broker error all mean "no answer".
+            Ok(ElicitOutcome::Cancelled) => ElicitReply::Cancel,
+            Err(err) => {
+                tracing::warn!("mcp elicitation failed: {err:#}");
+                ElicitReply::Cancel
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod elicit_mapping_tests {
+    use super::answer_to_content;
+    use serde_json::json;
+
+    #[test]
+    fn maps_a_single_primitive_field() {
+        let schema = json!({ "properties": { "region": { "type": "string" } } });
+        assert_eq!(
+            answer_to_content(&schema, "us-east-1").unwrap(),
+            json!({ "region": "us-east-1" })
+        );
+
+        let n = json!({ "properties": { "count": { "type": "integer" } } });
+        assert_eq!(answer_to_content(&n, "42").unwrap(), json!({ "count": 42 }));
+
+        let b = json!({ "properties": { "confirm": { "type": "boolean" } } });
+        assert_eq!(answer_to_content(&b, "yes").unwrap(), json!({ "confirm": true }));
+    }
+
+    #[test]
+    fn refuses_rather_than_sending_a_wrong_shape_or_type() {
+        // A wrong-typed answer must not be coerced into something plausible.
+        let n = json!({ "properties": { "count": { "type": "integer" } } });
+        assert!(answer_to_content(&n, "not a number").is_none());
+        let b = json!({ "properties": { "confirm": { "type": "boolean" } } });
+        assert!(answer_to_content(&b, "maybe").is_none());
+
+        // Multi-field forms need a real surface, not one text line.
+        let multi = json!({ "properties": { "a": {"type":"string"}, "b": {"type":"string"} } });
+        assert!(answer_to_content(&multi, "x").is_none());
+
+        // Malformed schemas are refused, never unwrapped.
+        assert!(answer_to_content(&json!({}), "x").is_none());
+        assert!(answer_to_content(&json!({ "properties": {} }), "x").is_none());
+    }
 }
