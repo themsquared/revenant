@@ -19,6 +19,10 @@ use std::time::Duration;
 /// one never blocks the rest), but this bounds the burst so a pile-up of due
 /// loops can't thrash the box — the excess queues on the semaphore.
 const MAX_CONCURRENT_FIRES: usize = 4;
+/// How many times an idle loop's gap may double (4 ⇒ at most 16x its cadence).
+const MAX_IDLE_DOUBLINGS: i64 = 4;
+/// A backed-off loop still runs at least this often, so it can always find news.
+const BACKOFF_CEILING_SECS: i64 = 86_400;
 
 pub struct LoopScheduler {
     manager: SessionManager,
@@ -147,6 +151,14 @@ impl LoopScheduler {
                     .store
                     .loop_run_finish(run_id, status, tin, tout, &clip(&text, 2000))
                     .await;
+                // Cadence follows information, not the clock: a loop that keeps
+                // saying the same thing gets asked less often, and snaps back to
+                // full cadence the moment it says something new. Only successful
+                // runs count — an error is not "no news", it is a failure, and
+                // backing off would hide it.
+                if status == "ok" {
+                    self.tune_cadence(lp, &text).await;
+                }
                 // Push results to a channel if configured (channels listen
                 // for LoopCompleted on the bus).
                 if status == "ok" {
@@ -169,6 +181,61 @@ impl LoopScheduler {
             }
         }
     }
+}
+
+impl LoopScheduler {
+    /// Back a loop off when it has nothing new to report.
+    ///
+    /// The signal is deliberately LLM-free — a loop must not cost a model call
+    /// just to decide whether it was worth running: fingerprint the output and
+    /// count consecutive identical results.
+    ///
+    /// Two properties keep this from muting a useful loop:
+    ///   - Backoff is bounded (MAX_IDLE_DOUBLINGS, plus an absolute
+    ///     BACKOFF_CEILING_SECS), so a quiet loop still runs periodically and can
+    ///     always discover news.
+    ///   - Novelty resets to full cadence IMMEDIATELY, not gradually.
+    ///
+    /// Note what counts as "no news": byte-identical normalized output. A loop
+    /// whose text always differs (an embedded timestamp, a changing count) will
+    /// never back off. That is the safe direction to fail — it wastes some runs
+    /// rather than silencing something that matters.
+    async fn tune_cadence(&self, lp: &revenant_store::LoopRow, text: &str) {
+        let store = &self.manager.runtime().store;
+        let idle = match store.loop_note_output(&lp.id, &fingerprint(text)).await {
+            Ok(n) => n,
+            Err(err) => {
+                tracing::warn!("loop {}: novelty check failed: {err:#}", lp.name);
+                return;
+            }
+        };
+        if idle == 0 {
+            return; // novel: the base cadence already stands
+        }
+        let now = unix_now();
+        let base_gap = match Schedule::parse(&lp.schedule).and_then(|s| s.next_after(now)) {
+            Ok(next) => (next - now).max(1),
+            Err(_) => return,
+        };
+        let doublings = idle.min(MAX_IDLE_DOUBLINGS) as u32;
+        let extra = base_gap.saturating_mul((1i64 << doublings) - 1);
+        if let Err(err) = store.loop_defer(&lp.id, extra, BACKOFF_CEILING_SECS).await {
+            tracing::warn!("loop {}: defer failed: {err:#}", lp.name);
+            return;
+        }
+        tracing::info!(
+            "loop '{}' repeated itself {idle}x — next run pushed out {extra}s (capped)",
+            lp.name
+        );
+    }
+}
+
+/// Stable fingerprint of a run's output, normalized so cosmetic differences
+/// (case, wrapping, whitespace) do not read as news.
+fn fingerprint(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    Sha256::digest(normalized.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 fn unix_now() -> i64 {
@@ -211,5 +278,33 @@ mod tests {
         let s = Schedule::parse("cron:0 * * * *").unwrap(); // top of every hour
         let next = s.next_after(0).unwrap();
         assert!(next > 0 && next <= 3600);
+    }
+}
+
+#[cfg(test)]
+mod novelty_tests {
+    use super::fingerprint;
+
+    #[test]
+    fn cosmetic_differences_are_not_news() {
+        // Wrapping, indentation and case must not read as new information —
+        // otherwise a loop never backs off and the signal is useless.
+        assert_eq!(fingerprint("All systems healthy"), fingerprint("all   systems\nhealthy"));
+        assert_eq!(fingerprint("  A B  "), fingerprint("a\tb"));
+    }
+
+    #[test]
+    fn real_differences_are_news() {
+        assert_ne!(fingerprint("2 alerts open"), fingerprint("3 alerts open"));
+        assert_ne!(fingerprint("healthy"), fingerprint("degraded"));
+        // Empty vs non-empty is a change.
+        assert_ne!(fingerprint(""), fingerprint("something"));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_bounded() {
+        let a = fingerprint("the horde rises");
+        assert_eq!(a, fingerprint("the horde rises"), "must be deterministic across calls");
+        assert_eq!(a.len(), 32, "16 bytes hex — short enough to store per loop");
     }
 }
