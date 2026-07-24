@@ -205,7 +205,20 @@ async fn retrieval_accuracy_and_latency() {
     eprintln!("eval: hit@5 = {hits_at_5}/20, MRR = {mrr:.3}, p50 = {p50:.2?}");
 
     assert!(hits_at_5 >= 18, "hit@5 {hits_at_5}/20 below gate (18)");
-    assert!(mrr >= 0.7, "MRR {mrr:.3} below gate (0.7)");
+    // MRR gate is 0.85, not 0.7 — and the graph leg is the reason. Measured by
+    // ablation (graph_leg() forced to return no candidates, everything else
+    // untouched): MRR falls 0.885 -> 0.704 and hit@5 20/20 -> 19/20. The old
+    // 0.7 gate therefore passed with the graph leg ENTIRELY DEAD, by a margin of
+    // 0.004 — it could not detect losing a whole retrieval leg. This eval, not
+    // the multi-hop one, is where the graph leg demonstrably earns its cost
+    // (it improves ranking quality, rather than extending multi-hop reach), so
+    // this is the assertion that has to protect it.
+    //
+    // Retrieval here is fully deterministic (static embeddings, BM25, fixed-
+    // iteration PPR over a fixed fixture): MRR is 0.885 on every run, so 0.85
+    // leaves 0.035 of headroom while sitting far above the 0.704 ablated floor.
+    // Raise it only after re-measuring; lower it only with a documented reason.
+    assert!(mrr >= 0.85, "MRR {mrr:.3} below gate (0.85) — retrieval quality regressed");
     assert!(
         p50 < std::time::Duration::from_millis(25),
         "p50 {p50:?} over 25ms budget"
@@ -344,6 +357,22 @@ async fn multi_hop_retrieval() {
         hits >= MULTI_HOP_HIT_BAR,
         "multi-hop hit@{K} {hits}/{} below gate ({MULTI_HOP_HIT_BAR}) — graph leg may not be pulling its weight",
         questions.len()
+    );
+    // Gate `graph_credited` too, not just `hits`. Without this the test proves
+    // nothing about the graph leg: measured by ablation (graph_leg() forced to
+    // return no candidates), multi-hop hit@10 stays at 8/9 while graph_credited
+    // drops 8/8 -> 0/8, because BM25+cosine independently reach these same
+    // facts — note the `legs=7` (FTS|VEC|GRAPH) values in the MISS dump above.
+    // So `hits` alone passes with the graph leg deleted; only this assertion
+    // fails. Read it precisely: it proves the graph leg RETRIEVES these
+    // multi-hop answers, NOT that it is the only leg that can — the honest
+    // measure of necessity is the differential above (see the MRR gate in
+    // `retrieval_accuracy_and_latency`), which is where the leg's real value
+    // shows up.
+    assert!(
+        graph_credited >= MULTI_HOP_HIT_BAR,
+        "graph leg credited on only {graph_credited}/{hits} multi-hop hits (gate {MULTI_HOP_HIT_BAR}) \
+         — the graph leg has stopped reaching these answers even if other legs still do"
     );
 
     std::env::remove_var("REVENANT_HOME");
