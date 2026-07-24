@@ -1299,6 +1299,7 @@ mod tests {
     #[tokio::test]
     async fn jobs_state_machine_is_reliable() {
         let dir = std::env::temp_dir().join(format!("rev-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let s = Store::open(&dir.join("j.db")).unwrap();
         let now = 1_000_000i64;
@@ -1332,11 +1333,14 @@ mod tests {
         let recovered = s.jobs_recover_running(now + 3600).await.unwrap();
         assert_eq!(recovered, 1);
         assert_eq!(s.job_get(id3).await.unwrap().unwrap().status, "queued");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn round_trip() {
         let dir = std::env::temp_dir().join(format!("revenant-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
         let sid = store.ensure_session("cli", "local", "chat").await.unwrap();
@@ -1374,6 +1378,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_flow() {
         let dir = std::env::temp_dir().join(format!("revenant-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
 
