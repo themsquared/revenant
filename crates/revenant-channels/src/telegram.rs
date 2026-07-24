@@ -21,6 +21,15 @@ const CHANNEL: &str = "telegram";
 const TYPING_REFRESH: Duration = Duration::from_secs(4);
 /// Telegram's hard per-message limit; longer replies are split.
 const TG_MAX: usize = 4000;
+/// Most outstanding elicitation prompts we track at once. Each is answerable
+/// only until the broker's TTL, so this is spray protection, not correctness.
+const ELICIT_WAITING_CAP: usize = 64;
+
+/// Outstanding elicitation prompts: `(chat_id, prompt message_id) -> elicitation
+/// id`. A Vec rather than a map because it is tiny, capped, and needs
+/// oldest-first eviction. Shared between the inbound handler (which consumes an
+/// entry when the owner replies) and the outbound mirror (which records them).
+type ElicitWaiting = Arc<AsyncMutex<Vec<((i64, i64), String)>>>;
 
 // ---- thin Bot API client ----
 
@@ -56,6 +65,11 @@ pub struct Message {
     pub chat: Chat,
     pub text: Option<String>,
     pub from: Option<User>,
+    /// Present when the owner used Telegram's reply affordance. This is how an
+    /// elicitation answer is bound to the prompt that asked for it, rather than
+    /// being guessed from whatever arrived next.
+    #[serde(default)]
+    pub reply_to_message: Option<Box<Message>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,6 +192,47 @@ impl TelegramClient {
         Ok(msg.message_id)
     }
 
+    /// Ask the owner for a VALUE. `force_reply` makes Telegram open the reply
+    /// composer pre-targeted at this message, so the answer comes back bound to
+    /// the request — and a Decline button means refusing is one tap rather than
+    /// requiring the owner to type something they don't want to send.
+    pub async fn send_elicitation(
+        &self,
+        chat_id: i64,
+        text: &str,
+        elicit_id: &str,
+    ) -> Result<i64> {
+        let msg: Message = self
+            .call(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_markup": {
+                        "force_reply": true,
+                        "input_field_placeholder": "type your answer, or tap Decline",
+                        "selective": true,
+                    },
+                }),
+            )
+            .await?;
+        // The decline affordance goes on a follow-up message: Telegram does not
+        // allow force_reply and an inline keyboard on the SAME message.
+        let _ = self
+            .call::<serde_json::Value>(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": "…or decline to answer:",
+                    "reply_markup": { "inline_keyboard": [[
+                        { "text": "🚫 Decline", "callback_data": format!("eli:{elicit_id}:n") },
+                    ]]},
+                }),
+            )
+            .await;
+        Ok(msg.message_id)
+    }
+
     pub async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
         // "message is not modified" errors are harmless — swallow them.
         let result: Result<serde_json::Value> = self
@@ -219,6 +274,11 @@ pub struct TelegramChannel {
     pub client: TelegramClient,
     pub manager: SessionManager,
     pub default_tier: Tier,
+    /// Prompt message -> elicitation id, so a reply resolves the request that
+    /// asked for it. Bounded: an unanswered prompt expires in the broker, and we
+    /// evict the oldest here past a cap so a server spraying prompts cannot grow
+    /// this without limit.
+    pub elicit_waiting: ElicitWaiting,
 }
 
 impl TelegramChannel {
@@ -234,6 +294,7 @@ impl TelegramChannel {
         let outbound = OutboundMirror {
             client: self.client.clone(),
             manager: self.manager.clone(),
+            elicit_waiting: Arc::clone(&self.elicit_waiting),
         };
         tokio::spawn(outbound.run());
 
@@ -273,6 +334,7 @@ impl TelegramChannel {
     async fn handle_message(&self, runtime: &revenant_agent::AgentRuntime, message: Message) {
         let chat_id = message.chat.id;
         let peer = chat_id.to_string();
+        let replying_to = message.reply_to_message.as_ref().map(|m| m.message_id);
         let Some(text) = message.text else { return };
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -284,6 +346,36 @@ impl TelegramChannel {
             .peer_allowed(CHANNEL, &peer)
             .await
             .unwrap_or(false);
+
+        // A reply to an elicitation prompt is an ANSWER, not chat. Intercept it
+        // before the turn loop sees it, so a value meant for a server is never
+        // also fed to the model as conversation. Requires pairing: an unpaired
+        // chat must not be able to answer on the owner's behalf.
+        if allowed {
+            if let Some(prompt_id) = replying_to {
+                let hit = {
+                    let mut waiting = self.elicit_waiting.lock().await;
+                    waiting
+                        .iter()
+                        .position(|((c, m), _)| *c == chat_id && *m == prompt_id)
+                        .map(|i| waiting.remove(i).1)
+                };
+                if let Some(elicit_id) = hit {
+                    let acked = runtime
+                        .approvals
+                        .resolve_elicitation(&elicit_id, Some(&text), "telegram")
+                        .await
+                        .unwrap_or(false);
+                    let note = if acked {
+                        "✅ Sent your answer."
+                    } else {
+                        "That request already expired — nothing was sent."
+                    };
+                    let _ = self.client.send_message(chat_id, note).await;
+                    return;
+                }
+            }
+        }
 
         // /help and /start work in any state so commands are discoverable.
         if text == "/help" || text == "/start" {
@@ -381,6 +473,29 @@ impl TelegramChannel {
 
     async fn handle_callback(&self, runtime: &revenant_agent::AgentRuntime, cb: CallbackQuery) {
         let Some(data) = cb.data.as_deref() else { return };
+        let cb_peer = cb
+            .message
+            .as_ref()
+            .map(|m| m.chat.id.to_string())
+            .unwrap_or_default();
+
+        // eli:<elicitation_id>:n — decline without typing anything.
+        if let Some(rest) = data.strip_prefix("eli:") {
+            let elicit_id = rest.trim_end_matches(":n");
+            if !runtime.store.peer_allowed(CHANNEL, &cb_peer).await.unwrap_or(false) {
+                self.client.answer_callback(&cb.id, "not paired").await;
+                return;
+            }
+            match runtime.approvals.resolve_elicitation(elicit_id, None, "telegram").await {
+                Ok(true) => {
+                    self.client.answer_callback(&cb.id, "declined — nothing sent").await;
+                    self.elicit_waiting.lock().await.retain(|(_, id)| id != elicit_id);
+                }
+                _ => self.client.answer_callback(&cb.id, "already resolved").await,
+            }
+            return;
+        }
+
         // apr:<approval_id>:<y|n>
         let mut parts = data.splitn(3, ':');
         if parts.next() != Some("apr") {
@@ -435,6 +550,10 @@ impl TelegramChannel {
 struct OutboundMirror {
     client: TelegramClient,
     manager: SessionManager,
+    /// SHARED with the inbound side (same Arc) — the mirror records which prompt
+    /// message maps to which elicitation, and the inbound handler consumes it
+    /// when the owner replies.
+    elicit_waiting: ElicitWaiting,
 }
 
 impl OutboundMirror {
@@ -631,6 +750,30 @@ impl OutboundMirror {
                     for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
                         if let Ok(chat_id) = peer.parse::<i64>() {
                             let _ = self.client.send_message(chat_id, &msg).await;
+                        }
+                    }
+                }
+                // A server asked for a value → prompt the owner with force_reply,
+                // naming who is asking. Never auto-answered from context.
+                Event::ElicitationRequested { id, source, prompt, .. } => {
+                    let text = format!(
+                        "🔐 {source} is asking for something:\n\n{prompt}\n\n                         Reply to this message with your answer — or decline.                          I will not answer it for you.",
+                    );
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            if let Ok(msg_id) =
+                                self.client.send_elicitation(chat_id, &text, &id).await
+                            {
+                                let mut waiting = self.elicit_waiting.lock().await;
+                                waiting.push(((chat_id, msg_id), id.clone()));
+                                // Bound the map — stale entries are harmless
+                                // (the broker already expired them) but must not
+                                // accumulate.
+                                if waiting.len() > ELICIT_WAITING_CAP {
+                                    let drop_to = waiting.len() - ELICIT_WAITING_CAP;
+                                    waiting.drain(..drop_to);
+                                }
+                            }
                         }
                     }
                 }

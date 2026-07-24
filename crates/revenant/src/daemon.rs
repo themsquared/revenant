@@ -258,6 +258,7 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
                     client: revenant_channels::telegram::TelegramClient::new(&token),
                     manager: manager.clone(),
                     default_tier,
+                    elicit_waiting: Default::default(),
                 };
                 tokio::spawn(async move {
                     if let Err(err) = channel.run().await {
