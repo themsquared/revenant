@@ -36,9 +36,21 @@ pub struct HordeTask {
     pub sig: String,
 }
 
+/// Domain tag: binds a signature to this record type and no other.
+const DOMAIN_TASK: &[u8] = b"rev-horde-task-v1";
+const DOMAIN_CLAIM: &[u8] = b"rev-horde-claim-v1";
+const DOMAIN_RESULT: &[u8] = b"rev-horde-result-v1";
+
 impl HordeTask {
-    fn preimage(run: &str, title: &str, spec: &str, sigils: &[String], created_ts: i64) -> Vec<u8> {
-        let mut h = Sha256::new();
+    fn preimage(
+        domain: Option<&[u8]>,
+        run: &str,
+        title: &str,
+        spec: &str,
+        sigils: &[String],
+        created_ts: i64,
+    ) -> Vec<u8> {
+        let mut h = crate::identity::preimage_hasher(domain);
         h.update(run.as_bytes());
         h.update([0]);
         h.update(title.as_bytes());
@@ -63,7 +75,7 @@ impl HordeTask {
         created_ts: i64,
     ) -> Self {
         let (run, title, spec) = (run.into(), title.into(), spec.into());
-        let preimage = Self::preimage(&run, &title, &spec, &sigils, created_ts);
+        let preimage = Self::preimage(Some(DOMAIN_TASK), &run, &title, &spec, &sigils, created_ts);
         HordeTask {
             id: hex::encode(Sha256::digest(&preimage)),
             author: id_key.id(),
@@ -77,11 +89,14 @@ impl HordeTask {
     }
 
     pub fn verify(&self) -> bool {
-        let preimage = Self::preimage(&self.run, &self.title, &self.spec, &self.sigils, self.created_ts);
-        if hex::encode(Sha256::digest(&preimage)) != self.id {
-            return false;
-        }
-        verify_hex(&self.author, &preimage, &self.sig)
+        // Domain-tagged first; untagged accepted only for records signed before
+        // domain separation existed (see identity::preimage_hasher).
+        [Some(DOMAIN_TASK), None].into_iter().any(|domain| {
+            let preimage =
+                Self::preimage(domain, &self.run, &self.title, &self.spec, &self.sigils, self.created_ts);
+            hex::encode(Sha256::digest(&preimage)) == self.id
+                && verify_hex(&self.author, &preimage, &self.sig)
+        })
     }
 }
 
@@ -97,8 +112,8 @@ pub struct HordeClaim {
 }
 
 impl HordeClaim {
-    fn preimage(task: &str, created_ts: i64) -> Vec<u8> {
-        let mut h = Sha256::new();
+    fn preimage(domain: Option<&[u8]>, task: &str, created_ts: i64) -> Vec<u8> {
+        let mut h = crate::identity::preimage_hasher(domain);
         h.update(task.as_bytes());
         h.update([0]);
         h.update(created_ts.to_le_bytes());
@@ -107,7 +122,7 @@ impl HordeClaim {
 
     pub fn create(id_key: &Identity, task: impl Into<String>, created_ts: i64) -> Self {
         let task = task.into();
-        let preimage = Self::preimage(&task, created_ts);
+        let preimage = Self::preimage(Some(DOMAIN_CLAIM), &task, created_ts);
         HordeClaim {
             id: hex::encode(Sha256::digest(&preimage)),
             worker: id_key.id(),
@@ -118,11 +133,11 @@ impl HordeClaim {
     }
 
     pub fn verify(&self) -> bool {
-        let preimage = Self::preimage(&self.task, self.created_ts);
-        if hex::encode(Sha256::digest(&preimage)) != self.id {
-            return false;
-        }
-        verify_hex(&self.worker, &preimage, &self.sig)
+        [Some(DOMAIN_CLAIM), None].into_iter().any(|domain| {
+            let preimage = Self::preimage(domain, &self.task, self.created_ts);
+            hex::encode(Sha256::digest(&preimage)) == self.id
+                && verify_hex(&self.worker, &preimage, &self.sig)
+        })
     }
 }
 
@@ -139,8 +154,8 @@ pub struct HordeResult {
 }
 
 impl HordeResult {
-    fn preimage(task: &str, output: &str, created_ts: i64) -> Vec<u8> {
-        let mut h = Sha256::new();
+    fn preimage(domain: Option<&[u8]>, task: &str, output: &str, created_ts: i64) -> Vec<u8> {
+        let mut h = crate::identity::preimage_hasher(domain);
         h.update(task.as_bytes());
         h.update([0]);
         h.update(output.as_bytes());
@@ -156,7 +171,7 @@ impl HordeResult {
         created_ts: i64,
     ) -> Self {
         let (task, output) = (task.into(), output.into());
-        let preimage = Self::preimage(&task, &output, created_ts);
+        let preimage = Self::preimage(Some(DOMAIN_RESULT), &task, &output, created_ts);
         HordeResult {
             id: hex::encode(Sha256::digest(&preimage)),
             worker: id_key.id(),
@@ -168,11 +183,11 @@ impl HordeResult {
     }
 
     pub fn verify(&self) -> bool {
-        let preimage = Self::preimage(&self.task, &self.output, self.created_ts);
-        if hex::encode(Sha256::digest(&preimage)) != self.id {
-            return false;
-        }
-        verify_hex(&self.worker, &preimage, &self.sig)
+        [Some(DOMAIN_RESULT), None].into_iter().any(|domain| {
+            let preimage = Self::preimage(domain, &self.task, &self.output, self.created_ts);
+            hex::encode(Sha256::digest(&preimage)) == self.id
+                && verify_hex(&self.worker, &preimage, &self.sig)
+        })
     }
 }
 
@@ -213,5 +228,105 @@ mod tests {
         let mut replayed = r.clone();
         replayed.task = "task-xyz".into();
         assert!(!replayed.verify());
+    }
+}
+
+#[cfg(test)]
+mod domain_confusion_tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    /// RED-TEAM: one signature, two record types.
+    ///
+    /// `HordeClaim` hashes `task \0 ts` and `HordeResult` hashes
+    /// `task \0 output \0 ts`. Neither preimage names its own type, so a
+    /// Result for task `T` with an empty output produces the SAME bytes as a
+    /// Claim for task `T\0` — and a signature over one therefore verifies as
+    /// the other. This test documents the weakness domain separation fixes.
+    #[test]
+    fn a_result_signature_verifies_as_a_claim() {
+        let key = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let ts = 1_784_000_000i64;
+
+        // A legitimately signed result with an empty output.
+        let result = HordeResult::create(&key, "abc123", "", ts);
+        assert!(result.verify(), "baseline: the result is authentic");
+
+        // Re-present that exact signature as a CLAIM, task id + one NUL.
+        let forged = HordeClaim {
+            id: result.id.clone(),
+            worker: result.worker.clone(),
+            task: "abc123\0".to_string(),
+            created_ts: ts,
+            sig: result.sig.clone(),
+        };
+        assert!(
+            !forged.verify(),
+            "a result's signature must NOT verify as a claim — preimages are not domain-separated"
+        );
+    }
+
+    /// The compatibility guarantee that makes this change safe to deploy: every
+    /// record signed BEFORE domain separation must still verify, because the
+    /// Necropolis ledger re-verifies its whole history on replay (`Dir::apply`)
+    /// and a rejected historical entry would break the chain.
+    #[test]
+    fn legacy_untagged_records_still_verify() {
+        let key = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let ts = 1_780_000_000i64;
+
+        // Hand-build a record exactly as a pre-domain-separation agent would:
+        // untagged preimage, id and sig derived from it.
+        let legacy_preimage = HordeClaim::preimage(None, "task-legacy", ts);
+        let legacy = HordeClaim {
+            id: hex::encode(Sha256::digest(&legacy_preimage)),
+            worker: key.id(),
+            task: "task-legacy".to_string(),
+            created_ts: ts,
+            sig: key.sign_hex(&legacy_preimage),
+        };
+        assert!(legacy.verify(), "pre-domain-tag records must keep verifying");
+
+        // And tampering with a legacy record is still caught.
+        let mut tampered = legacy.clone();
+        tampered.task = "task-other".to_string();
+        assert!(!tampered.verify(), "legacy path must not become a forgery oracle");
+    }
+
+    /// PHASE 2 REMINDER, enforced as a test so it cannot be quietly forgotten.
+    ///
+    /// Accepting untagged preimages keeps the confusion window OPEN for records
+    /// whose signatures predate the tag: an attacker holding a legacy
+    /// `HordeResult` signature can still present it as a legacy `HordeClaim`.
+    /// That is a deliberate transitional cost — the alternative rejects both the
+    /// existing ledger and any peer that has not upgraded yet.
+    ///
+    /// Once every agent on the network signs tagged records, drop the `None`
+    /// arm from all three `verify()` methods. This test documents the residual
+    /// exposure precisely so the decision stays visible.
+    #[test]
+    fn legacy_path_is_still_confusable_until_phase_2() {
+        let key = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let ts = 1_780_000_000i64;
+
+        // A legacy-signed result with empty output...
+        let p = HordeResult::preimage(None, "abc123", "", ts);
+        let sig = key.sign_hex(&p);
+
+        // ...still verifies as a legacy claim on "abc123\0". This asserts the
+        // KNOWN residual hole, so if a future change closes it this test fails
+        // loudly and gets deleted along with the `None` arms.
+        let forged = HordeClaim {
+            id: hex::encode(Sha256::digest(&p)),
+            worker: key.id(),
+            task: "abc123\0".to_string(),
+            created_ts: ts,
+            sig,
+        };
+        assert!(
+            forged.verify(),
+            "if this now FAILS, phase 2 has effectively landed — remove the legacy \
+             `None` arms in verify() and delete this test"
+        );
     }
 }

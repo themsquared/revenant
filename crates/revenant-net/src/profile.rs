@@ -11,7 +11,7 @@
 
 use crate::identity::{verify_hex, Identity};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 
 /// Coarse machine specs an agent advertises. Optional-ish: unknown fields are
 /// empty/zero rather than absent, so the signed preimage is stable.
@@ -48,15 +48,19 @@ pub struct AgentProfile {
     pub sig: String,
 }
 
+/// Domain tag: binds a signature to this record type and no other.
+const DOMAIN_PROFILE: &[u8] = b"rev-agent-profile-v1";
+
 impl AgentProfile {
     fn preimage(
+        domain: Option<&[u8]>,
         name: &str,
         specs: &MachineSpecs,
         capabilities: &[String],
         created_ts: i64,
         tls_fp: Option<&str>,
     ) -> Vec<u8> {
-        let mut h = Sha256::new();
+        let mut h = crate::identity::preimage_hasher(domain);
         h.update(name.as_bytes());
         h.update([0]);
         h.update(specs.os.as_bytes());
@@ -95,7 +99,14 @@ impl AgentProfile {
         tls_fp: Option<String>,
     ) -> Self {
         let name = name.into();
-        let preimage = Self::preimage(&name, &specs, &capabilities, created_ts, tls_fp.as_deref());
+        let preimage = Self::preimage(
+            Some(DOMAIN_PROFILE),
+            &name,
+            &specs,
+            &capabilities,
+            created_ts,
+            tls_fp.as_deref(),
+        );
         AgentProfile {
             sig: id_key.sign_hex(&preimage),
             agent: id_key.id(),
@@ -109,14 +120,19 @@ impl AgentProfile {
 
     /// Verify the signature is authentic for the stated agent + content.
     pub fn verify(&self) -> bool {
-        let preimage = Self::preimage(
-            &self.name,
-            &self.specs,
-            &self.capabilities,
-            self.created_ts,
-            self.tls_fp.as_deref(),
-        );
-        verify_hex(&self.agent, &preimage, &self.sig)
+        // Domain-tagged first; untagged accepted only for signatures predating
+        // domain separation (see the phase-2 note in horde.rs).
+        [Some(DOMAIN_PROFILE), None].into_iter().any(|domain| {
+            let preimage = Self::preimage(
+                domain,
+                &self.name,
+                &self.specs,
+                &self.capabilities,
+                self.created_ts,
+                self.tls_fp.as_deref(),
+            );
+            verify_hex(&self.agent, &preimage, &self.sig)
+        })
     }
 }
 
