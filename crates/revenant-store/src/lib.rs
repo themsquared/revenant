@@ -602,6 +602,60 @@ impl Store {
         .await
     }
 
+    /// Record whether this run said anything NEW, returning the resulting count
+    /// of consecutive same-output runs (0 = this run was novel).
+    ///
+    /// Compare-and-update in one closure so the count cannot race the
+    /// single-writer actor. A novel run resets to 0 immediately — a loop that
+    /// goes quiet for a while and then has news must return to full cadence at
+    /// once, not creep back.
+    pub async fn loop_note_output(&self, loop_id: &str, fingerprint: &str) -> Result<i64> {
+        let (loop_id, fingerprint) = (loop_id.to_owned(), fingerprint.to_owned());
+        self.with(move |conn| {
+            // `.ok().flatten()` covers both "no such loop" and a NULL column —
+            // either way there is no previous output to compare against.
+            let previous: Option<String> = conn
+                .query_row("SELECT last_output FROM loops WHERE id = ?1", [&loop_id], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .ok()
+                .flatten();
+            let idle = if previous.as_deref() == Some(fingerprint.as_str()) {
+                conn.execute(
+                    "UPDATE loops SET idle_runs = idle_runs + 1 WHERE id = ?1",
+                    [&loop_id],
+                )?;
+                conn.query_row("SELECT idle_runs FROM loops WHERE id = ?1", [&loop_id], |r| {
+                    r.get(0)
+                })?
+            } else {
+                conn.execute(
+                    "UPDATE loops SET idle_runs = 0, last_output = ?2 WHERE id = ?1",
+                    rusqlite::params![&loop_id, &fingerprint],
+                )?;
+                0i64
+            };
+            Ok(idle)
+        })
+        .await
+    }
+
+    /// Push a loop's next run later by `extra_secs`, never past `now + cap_secs`.
+    /// The cap is what stops a quiet loop from effectively disabling itself.
+    pub async fn loop_defer(&self, loop_id: &str, extra_secs: i64, cap_secs: i64) -> Result<()> {
+        let loop_id = loop_id.to_owned();
+        self.with(move |conn| {
+            let ceiling = unix_now() + cap_secs;
+            conn.execute(
+                "UPDATE loops SET next_run = MIN(COALESCE(next_run, ?3) + ?2, ?3)
+                 WHERE id = ?1",
+                rusqlite::params![&loop_id, extra_secs, ceiling],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn loop_run_finish(
         &self,
         run_id: i64,
@@ -1316,6 +1370,22 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 10 {
+        // Loop novelty: a loop fired on a fixed cadence forever, whether or not
+        // it had anything new to say. `last_output` is a fingerprint of the
+        // previous run's text and `idle_runs` counts consecutive runs that said
+        // the same thing — enough for the scheduler to back off a loop that has
+        // gone quiet and snap back the moment it doesn't.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE loops ADD COLUMN idle_runs INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE loops ADD COLUMN last_output TEXT;
+             PRAGMA user_version = 10;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1484,6 +1554,57 @@ mod tests {
         store.pairing_code_create("EXPIRED1", -10).await.unwrap();
         assert!(!store.pairing_claim("EXPIRED1", "telegram", "444").await.unwrap());
         assert_eq!(store.peers_list("telegram").await.unwrap(), vec!["111"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod loop_novelty_tests {
+    use super::*;
+
+    /// The counter behind cadence backoff: consecutive identical outputs
+    /// accumulate, and ANY change resets to zero immediately (a loop that goes
+    /// quiet then has news must return to full cadence at once).
+    #[tokio::test]
+    async fn idle_runs_accumulate_and_reset_on_novelty() {
+        let dir = std::env::temp_dir().join(format!("rev-loopnov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("l.db")).unwrap();
+
+        let now = unix_now();
+        store
+            .with(move |conn| {
+                conn.execute(
+                    "INSERT INTO loops (id, name, schedule, prompt, created_at, updated_at)
+                     VALUES ('lp1', 'watch', 'every:600s', 'check', ?1, ?1)",
+                    [now],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // First run is always novel — there is nothing to compare against.
+        assert_eq!(store.loop_note_output("lp1", "aaa").await.unwrap(), 0);
+        // Repeats accumulate.
+        assert_eq!(store.loop_note_output("lp1", "aaa").await.unwrap(), 1);
+        assert_eq!(store.loop_note_output("lp1", "aaa").await.unwrap(), 2);
+        // News resets to zero at once, not gradually.
+        assert_eq!(store.loop_note_output("lp1", "bbb").await.unwrap(), 0);
+        // ...and starts counting again from the NEW output.
+        assert_eq!(store.loop_note_output("lp1", "bbb").await.unwrap(), 1);
+
+        // Deferral respects its ceiling: a huge push is clamped, so a quiet loop
+        // can never defer itself into never running again.
+        store.loop_defer("lp1", 10_000_000, 3_600).await.unwrap();
+        let next: Option<i64> = store
+            .with(|conn| conn.query_row("SELECT next_run FROM loops WHERE id='lp1'", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        let next = next.expect("next_run set");
+        assert!(next <= unix_now() + 3_600, "deferral must be capped, got {next}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
