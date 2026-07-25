@@ -328,12 +328,26 @@ impl Store {
 
     /// Compare-and-swap resolve: returns false if already resolved.
     pub async fn approval_resolve(&self, id: &str, verdict: &str, resolver: &str) -> Result<bool> {
+        self.approval_resolve_with(id, verdict, resolver, None).await
+    }
+
+    /// Same CAS resolve, but also records the owner's typed answer for an
+    /// elicitation. Kept as one statement with the verdict so a resolve can
+    /// never land without its response, or vice versa.
+    pub async fn approval_resolve_with(
+        &self,
+        id: &str,
+        verdict: &str,
+        resolver: &str,
+        response: Option<&str>,
+    ) -> Result<bool> {
         let (id, verdict, resolver) = (id.to_owned(), verdict.to_owned(), resolver.to_owned());
+        let response = response.map(str::to_owned);
         self.with(move |conn| {
             let n = conn.execute(
-                "UPDATE approvals SET resolved_at = ?2, verdict = ?3, resolver = ?4
+                "UPDATE approvals SET resolved_at = ?2, verdict = ?3, resolver = ?4, response = ?5
                  WHERE id = ?1 AND resolved_at IS NULL",
-                (&id, unix_now(), &verdict, &resolver),
+                (&id, unix_now(), &verdict, &resolver, &response),
             )?;
             Ok(n == 1)
         })
@@ -584,6 +598,60 @@ impl Store {
                 rusqlite::params![loop_id, unix_now()],
             )?;
             Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    /// Record whether this run said anything NEW, returning the resulting count
+    /// of consecutive same-output runs (0 = this run was novel).
+    ///
+    /// Compare-and-update in one closure so the count cannot race the
+    /// single-writer actor. A novel run resets to 0 immediately — a loop that
+    /// goes quiet for a while and then has news must return to full cadence at
+    /// once, not creep back.
+    pub async fn loop_note_output(&self, loop_id: &str, fingerprint: &str) -> Result<i64> {
+        let (loop_id, fingerprint) = (loop_id.to_owned(), fingerprint.to_owned());
+        self.with(move |conn| {
+            // `.ok().flatten()` covers both "no such loop" and a NULL column —
+            // either way there is no previous output to compare against.
+            let previous: Option<String> = conn
+                .query_row("SELECT last_output FROM loops WHERE id = ?1", [&loop_id], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .ok()
+                .flatten();
+            let idle = if previous.as_deref() == Some(fingerprint.as_str()) {
+                conn.execute(
+                    "UPDATE loops SET idle_runs = idle_runs + 1 WHERE id = ?1",
+                    [&loop_id],
+                )?;
+                conn.query_row("SELECT idle_runs FROM loops WHERE id = ?1", [&loop_id], |r| {
+                    r.get(0)
+                })?
+            } else {
+                conn.execute(
+                    "UPDATE loops SET idle_runs = 0, last_output = ?2 WHERE id = ?1",
+                    rusqlite::params![&loop_id, &fingerprint],
+                )?;
+                0i64
+            };
+            Ok(idle)
+        })
+        .await
+    }
+
+    /// Push a loop's next run later by `extra_secs`, never past `now + cap_secs`.
+    /// The cap is what stops a quiet loop from effectively disabling itself.
+    pub async fn loop_defer(&self, loop_id: &str, extra_secs: i64, cap_secs: i64) -> Result<()> {
+        let loop_id = loop_id.to_owned();
+        self.with(move |conn| {
+            let ceiling = unix_now() + cap_secs;
+            conn.execute(
+                "UPDATE loops SET next_run = MIN(COALESCE(next_run, ?3) + ?2, ?3)
+                 WHERE id = ?1",
+                rusqlite::params![&loop_id, extra_secs, ceiling],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1286,6 +1354,38 @@ fn migrate(conn: &mut Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 9 {
+        // Elicitation: an approval could only ever record a yes/no verdict, so
+        // there was nowhere to put an ANSWER. MCP servers (spec 2025-06-18) can
+        // ask the client to collect a value from the user mid-tool-call, and the
+        // owner's reply has to be persisted with the request that asked for it —
+        // both for audit ("what did I hand this server?") and so a restart can
+        // see the request was already satisfied.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE approvals ADD COLUMN response TEXT;
+             PRAGMA user_version = 9;
+             COMMIT;",
+        )?;
+    }
+
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 10 {
+        // Loop novelty: a loop fired on a fixed cadence forever, whether or not
+        // it had anything new to say. `last_output` is a fingerprint of the
+        // previous run's text and `idle_runs` counts consecutive runs that said
+        // the same thing — enough for the scheduler to back off a loop that has
+        // gone quiet and snap back the moment it doesn't.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE loops ADD COLUMN idle_runs INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE loops ADD COLUMN last_output TEXT;
+             PRAGMA user_version = 10;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1299,6 +1399,7 @@ mod tests {
     #[tokio::test]
     async fn jobs_state_machine_is_reliable() {
         let dir = std::env::temp_dir().join(format!("rev-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let s = Store::open(&dir.join("j.db")).unwrap();
         let now = 1_000_000i64;
@@ -1332,11 +1433,73 @@ mod tests {
         let recovered = s.jobs_recover_running(now + 3600).await.unwrap();
         assert_eq!(recovered, 1);
         assert_eq!(s.job_get(id3).await.unwrap().unwrap().status, "queued");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migration 9 adds `approvals.response`. A fresh DB exercises the exact
+    /// same path an existing one does: the table is CREATEd at v1 without the
+    /// column and ALTERed here, so this covers the upgrade of a live database
+    /// (the deployed one sits at user_version 8) and not just a greenfield one.
+    #[tokio::test]
+    async fn migration_9_adds_the_response_column() {
+        let dir = std::env::temp_dir().join(format!("rev-mig9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("m.db")).unwrap();
+
+        let version: i64 = store
+            .with(|conn| conn.query_row("PRAGMA user_version", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        assert!(version >= 9, "schema should be at least v9, got {version}");
+
+        let has_response: bool = store
+            .with(|conn| {
+                let mut stmt = conn.prepare("PRAGMA table_info(approvals)")?;
+                let names: Vec<String> =
+                    stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+                Ok(names.iter().any(|n| n == "response"))
+            })
+            .await
+            .unwrap();
+        assert!(has_response, "approvals.response must exist after migration 9");
+
+        // An answer round-trips, and lands atomically with its verdict.
+        store.approval_insert("e1", "elicitation", "{}", 900).await.unwrap();
+        assert!(store
+            .approval_resolve_with("e1", "accepted", "owner", Some("us-east-1"))
+            .await
+            .unwrap());
+        let (verdict, response): (Option<String>, Option<String>) = store
+            .with(|conn| {
+                conn.query_row("SELECT verdict, response FROM approvals WHERE id = 'e1'", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(verdict.as_deref(), Some("accepted"));
+        assert_eq!(response.as_deref(), Some("us-east-1"));
+
+        // A plain boolean resolve leaves response NULL — no accidental writes.
+        store.approval_insert("e2", "exec", "{}", 900).await.unwrap();
+        assert!(store.approval_resolve("e2", "approved", "owner").await.unwrap());
+        let r2: Option<String> = store
+            .with(|conn| {
+                conn.query_row("SELECT response FROM approvals WHERE id = 'e2'", [], |r| r.get(0))
+            })
+            .await
+            .unwrap();
+        assert_eq!(r2, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn round_trip() {
         let dir = std::env::temp_dir().join(format!("revenant-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
         let sid = store.ensure_session("cli", "local", "chat").await.unwrap();
@@ -1374,6 +1537,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_flow() {
         let dir = std::env::temp_dir().join(format!("revenant-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir.join("t.db")).unwrap();
 
@@ -1390,6 +1554,57 @@ mod tests {
         store.pairing_code_create("EXPIRED1", -10).await.unwrap();
         assert!(!store.pairing_claim("EXPIRED1", "telegram", "444").await.unwrap());
         assert_eq!(store.peers_list("telegram").await.unwrap(), vec!["111"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod loop_novelty_tests {
+    use super::*;
+
+    /// The counter behind cadence backoff: consecutive identical outputs
+    /// accumulate, and ANY change resets to zero immediately (a loop that goes
+    /// quiet then has news must return to full cadence at once).
+    #[tokio::test]
+    async fn idle_runs_accumulate_and_reset_on_novelty() {
+        let dir = std::env::temp_dir().join(format!("rev-loopnov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("l.db")).unwrap();
+
+        let now = unix_now();
+        store
+            .with(move |conn| {
+                conn.execute(
+                    "INSERT INTO loops (id, name, schedule, prompt, created_at, updated_at)
+                     VALUES ('lp1', 'watch', 'every:600s', 'check', ?1, ?1)",
+                    [now],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // First run is always novel — there is nothing to compare against.
+        assert_eq!(store.loop_note_output("lp1", "aaa").await.unwrap(), 0);
+        // Repeats accumulate.
+        assert_eq!(store.loop_note_output("lp1", "aaa").await.unwrap(), 1);
+        assert_eq!(store.loop_note_output("lp1", "aaa").await.unwrap(), 2);
+        // News resets to zero at once, not gradually.
+        assert_eq!(store.loop_note_output("lp1", "bbb").await.unwrap(), 0);
+        // ...and starts counting again from the NEW output.
+        assert_eq!(store.loop_note_output("lp1", "bbb").await.unwrap(), 1);
+
+        // Deferral respects its ceiling: a huge push is clamped, so a quiet loop
+        // can never defer itself into never running again.
+        store.loop_defer("lp1", 10_000_000, 3_600).await.unwrap();
+        let next: Option<i64> = store
+            .with(|conn| conn.query_row("SELECT next_run FROM loops WHERE id='lp1'", [], |r| r.get(0)))
+            .await
+            .unwrap();
+        let next = next.expect("next_run set");
+        assert!(next <= unix_now() + 3_600, "deferral must be capped, got {next}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

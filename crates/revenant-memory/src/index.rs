@@ -56,11 +56,17 @@ pub struct FactRow {
     pub source: Option<(i64, i64)>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EdgeRow {
     pub src: i64,
     pub dst: i64,
     pub weight: f32,
+    /// The relation predicate ("works_at", "manages", "mentions"). Written at
+    /// consolidation/reindex time and, since typed traversal, read back here so
+    /// the graph leg can tell a real relation from incidental co-mention and
+    /// match the query's intent against the edge label. Not `Copy` because of
+    /// this String — edges are handled by reference or cloned per query.
+    pub rel: String,
 }
 
 fn now() -> i64 {
@@ -264,7 +270,7 @@ pub async fn neighborhood(
                    FROM mem_edges e JOIN hood h ON (e.src = h.id OR e.dst = h.id)
                    WHERE h.depth < {depth} AND e.expired_at IS NULL
                  )
-                 SELECT e.src, e.dst, e.weight FROM mem_edges e
+                 SELECT e.src, e.dst, e.weight, e.rel FROM mem_edges e
                  WHERE e.expired_at IS NULL
                    AND e.src IN (SELECT id FROM hood)
                    AND e.dst IN (SELECT id FROM hood)
@@ -272,7 +278,12 @@ pub async fn neighborhood(
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([], |r| {
-                Ok(EdgeRow { src: r.get(0)?, dst: r.get(1)?, weight: r.get::<_, f64>(2)? as f32 })
+                Ok(EdgeRow {
+                    src: r.get(0)?,
+                    dst: r.get(1)?,
+                    weight: r.get::<_, f64>(2)? as f32,
+                    rel: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                })
             })?;
             rows.collect()
         })

@@ -2869,11 +2869,28 @@ mod tests {
     use super::{parse_calver, select_update_target, sync_binary_into};
     use revenant_core::config::UpdateChannel;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    /// A temp dir that removes itself when the test ends — on the panic path too,
+    /// so a failing assertion doesn't leave litter under $TMPDIR.
+    struct Scratch(std::path::PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
         let d = std::env::temp_dir().join(format!("revenant-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Scratch(d)
     }
 
     // The mini failure: the service launches a stale COPY at a different path

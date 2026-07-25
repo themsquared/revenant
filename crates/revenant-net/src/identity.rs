@@ -6,7 +6,36 @@
 
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 use std::path::Path;
+
+/// Separator between a preimage's domain tag and its first field. 0xFF is never
+/// a valid UTF-8 byte and is distinct from the 0x00/0x01/0x02 field separators
+/// the record preimages already use, so a domain tag can never be confused with
+/// or spliced into field content.
+const DOMAIN_SEP: u8 = 0xFF;
+
+/// Begin a signing preimage bound to ONE record type.
+///
+/// Every signed record must start its hash with its own domain tag, so a
+/// signature over one record type can never verify as another. Without this,
+/// two types whose field layouts happen to line up produce identical bytes and
+/// their signatures become interchangeable — demonstrated for real between
+/// `HordeResult` (`task \0 output \0 ts`) and `HordeClaim` (`task \0 ts`),
+/// where a result with an empty output collides with a claim on `task\0`.
+///
+/// Pass `None` to reproduce a legacy (pre-domain-tag) preimage. That exists
+/// ONLY so `verify()` can still accept records signed before this change —
+/// notably every entry already in the Necropolis ledger, which is re-verified
+/// on replay. Never sign with `None`.
+pub fn preimage_hasher(domain: Option<&[u8]>) -> Sha256 {
+    let mut h = Sha256::new();
+    if let Some(tag) = domain {
+        h.update(tag);
+        h.update([DOMAIN_SEP]);
+    }
+    h
+}
 
 pub struct Identity {
     signing: SigningKey,

@@ -2456,6 +2456,7 @@ name = "revenant"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "dirs 5.0.1",
@@ -2667,6 +2668,7 @@ dependencies = [
  "revenant-store",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "uuid",
@@ -2677,6 +2679,7 @@ name = "revenant-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "reqwest",
  "revenant-core",
  "serde",

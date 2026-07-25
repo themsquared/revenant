@@ -21,6 +21,15 @@ const CHANNEL: &str = "telegram";
 const TYPING_REFRESH: Duration = Duration::from_secs(4);
 /// Telegram's hard per-message limit; longer replies are split.
 const TG_MAX: usize = 4000;
+/// Most outstanding elicitation prompts we track at once. Each is answerable
+/// only until the broker's TTL, so this is spray protection, not correctness.
+const ELICIT_WAITING_CAP: usize = 64;
+
+/// Outstanding elicitation prompts: `(chat_id, prompt message_id) -> elicitation
+/// id`. A Vec rather than a map because it is tiny, capped, and needs
+/// oldest-first eviction. Shared between the inbound handler (which consumes an
+/// entry when the owner replies) and the outbound mirror (which records them).
+type ElicitWaiting = Arc<AsyncMutex<Vec<((i64, i64), String)>>>;
 
 // ---- thin Bot API client ----
 
@@ -56,6 +65,11 @@ pub struct Message {
     pub chat: Chat,
     pub text: Option<String>,
     pub from: Option<User>,
+    /// Present when the owner used Telegram's reply affordance. This is how an
+    /// elicitation answer is bound to the prompt that asked for it, rather than
+    /// being guessed from whatever arrived next.
+    #[serde(default)]
+    pub reply_to_message: Option<Box<Message>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -246,6 +260,64 @@ impl TelegramClient {
         )
     }
 
+    /// Report an available update with a single explicit Install control.
+    pub async fn send_update_offer(&self, chat_id: i64, text: &str) -> Result<i64> {
+        let msg: Message = self
+            .call(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_markup": { "inline_keyboard": [[
+                        { "text": "⬆️ Install now", "callback_data": "upd:install" },
+                    ]]},
+                }),
+            )
+            .await?;
+        Ok(msg.message_id)
+    }
+
+    /// Ask the owner for a VALUE. `force_reply` makes Telegram open the reply
+    /// composer pre-targeted at this message, so the answer comes back bound to
+    /// the request — and a Decline button means refusing is one tap rather than
+    /// requiring the owner to type something they don't want to send.
+    pub async fn send_elicitation(
+        &self,
+        chat_id: i64,
+        text: &str,
+        elicit_id: &str,
+    ) -> Result<i64> {
+        let msg: Message = self
+            .call(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_markup": {
+                        "force_reply": true,
+                        "input_field_placeholder": "type your answer, or tap Decline",
+                        "selective": true,
+                    },
+                }),
+            )
+            .await?;
+        // The decline affordance goes on a follow-up message: Telegram does not
+        // allow force_reply and an inline keyboard on the SAME message.
+        let _ = self
+            .call::<serde_json::Value>(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": "…or decline to answer:",
+                    "reply_markup": { "inline_keyboard": [[
+                        { "text": "🚫 Decline", "callback_data": format!("eli:{elicit_id}:n") },
+                    ]]},
+                }),
+            )
+            .await;
+        Ok(msg.message_id)
+    }
+
     pub async fn edit_message(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
         // "message is not modified" errors are harmless — swallow them.
         let result: Result<serde_json::Value> = self
@@ -287,6 +359,11 @@ pub struct TelegramChannel {
     pub client: TelegramClient,
     pub manager: SessionManager,
     pub default_tier: Tier,
+    /// Prompt message -> elicitation id, so a reply resolves the request that
+    /// asked for it. Bounded: an unanswered prompt expires in the broker, and we
+    /// evict the oldest here past a cap so a server spraying prompts cannot grow
+    /// this without limit.
+    pub elicit_waiting: ElicitWaiting,
 }
 
 impl TelegramChannel {
@@ -302,6 +379,7 @@ impl TelegramChannel {
         let outbound = OutboundMirror {
             client: self.client.clone(),
             manager: self.manager.clone(),
+            elicit_waiting: Arc::clone(&self.elicit_waiting),
         };
         tokio::spawn(outbound.run());
 
@@ -341,6 +419,7 @@ impl TelegramChannel {
     async fn handle_message(&self, runtime: &revenant_agent::AgentRuntime, message: Message) {
         let chat_id = message.chat.id;
         let peer = chat_id.to_string();
+        let replying_to = message.reply_to_message.as_ref().map(|m| m.message_id);
         let Some(text) = message.text else { return };
         let text = text.trim().to_string();
         if text.is_empty() {
@@ -353,11 +432,77 @@ impl TelegramChannel {
             .await
             .unwrap_or(false);
 
+        // A reply to an elicitation prompt is an ANSWER, not chat. Intercept it
+        // before the turn loop sees it, so a value meant for a server is never
+        // also fed to the model as conversation. Requires pairing: an unpaired
+        // chat must not be able to answer on the owner's behalf.
+        if allowed {
+            if let Some(prompt_id) = replying_to {
+                let hit = {
+                    let mut waiting = self.elicit_waiting.lock().await;
+                    waiting
+                        .iter()
+                        .position(|((c, m), _)| *c == chat_id && *m == prompt_id)
+                        .map(|i| waiting.remove(i).1)
+                };
+                if let Some(elicit_id) = hit {
+                    let acked = runtime
+                        .approvals
+                        .resolve_elicitation(&elicit_id, Some(&text), "telegram")
+                        .await
+                        .unwrap_or(false);
+                    let note = if acked {
+                        "✅ Sent your answer."
+                    } else {
+                        "That request already expired — nothing was sent."
+                    };
+                    let _ = self.client.send_message(chat_id, note).await;
+                    return;
+                }
+            }
+        }
+
+        // /update — report what a new release would be, and offer to take it.
+        // Check is read-only; INSTALLING replaces the binary on the host, so it
+        // needs a deliberate tap rather than happening on a typed command.
+        if text == "/update" {
+            if !allowed {
+                let _ = self
+                    .client
+                    .send_message(chat_id, "Pair first: /pair <code>")
+                    .await;
+                return;
+            }
+            let _ = self.client.send_message(chat_id, "Checking for a new release…").await;
+            match run_self("--check").await {
+                Ok(report) => {
+                    let available = report.contains("update available");
+                    let body = format!("🔎 Update check\n\n{}", clip_tg(&report));
+                    if available {
+                        let _ = self
+                            .client
+                            .send_update_offer(chat_id, &body)
+                            .await;
+                    } else {
+                        let _ = self.client.send_message(chat_id, &body).await;
+                    }
+                }
+                Err(err) => {
+                    let _ = self
+                        .client
+                        .send_message(chat_id, &format!("Couldn't check: {err:#}"))
+                        .await;
+                }
+            }
+            return;
+        }
+
         // /help and /start work in any state so commands are discoverable.
         if text == "/help" || text == "/start" {
             let msg = if allowed {
                 "Commands:\n\
                  /stop — stop the turn I'm running\n\
+                 /update — check for a new release, and install it if you want\n\
                  /persona <name|off> — switch my voice (no name lists them)\n\
                  /help — this list\n\n\
                  Otherwise just talk to me — I stream replies as I go, and you can send more mid-turn to steer or queue it."
@@ -449,6 +594,61 @@ impl TelegramChannel {
 
     async fn handle_callback(&self, runtime: &revenant_agent::AgentRuntime, cb: CallbackQuery) {
         let Some(data) = cb.data.as_deref() else { return };
+        let cb_peer = cb
+            .message
+            .as_ref()
+            .map(|m| m.chat.id.to_string())
+            .unwrap_or_default();
+
+        // upd:install — take the release we just reported. Paired only: this
+        // replaces the binary running on the host.
+        if data == "upd:install" {
+            if !runtime.store.peer_allowed(CHANNEL, &cb_peer).await.unwrap_or(false) {
+                self.client.answer_callback(&cb.id, "not paired").await;
+                return;
+            }
+            self.client.answer_callback(&cb.id, "installing…").await;
+            let chat = cb.message.as_ref().map(|m| m.chat.id).unwrap_or_default();
+            match run_self("").await {
+                Ok(report) => {
+                    let _ = self
+                        .client
+                        .send_message(
+                            chat,
+                            &format!(
+                                "⬆️ Update run\n\n{}\n\nUnder a service manager I restart                                  into it automatically; otherwise restart to apply.",
+                                clip_tg(&report)
+                            ),
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    let _ = self
+                        .client
+                        .send_message(chat, &format!("Update failed: {err:#}"))
+                        .await;
+                }
+            }
+            return;
+        }
+
+        // eli:<elicitation_id>:n — decline without typing anything.
+        if let Some(rest) = data.strip_prefix("eli:") {
+            let elicit_id = rest.trim_end_matches(":n");
+            if !runtime.store.peer_allowed(CHANNEL, &cb_peer).await.unwrap_or(false) {
+                self.client.answer_callback(&cb.id, "not paired").await;
+                return;
+            }
+            match runtime.approvals.resolve_elicitation(elicit_id, None, "telegram").await {
+                Ok(true) => {
+                    self.client.answer_callback(&cb.id, "declined — nothing sent").await;
+                    self.elicit_waiting.lock().await.retain(|(_, id)| id != elicit_id);
+                }
+                _ => self.client.answer_callback(&cb.id, "already resolved").await,
+            }
+            return;
+        }
+
         // apr:<approval_id>:<y|n>
         let mut parts = data.splitn(3, ':');
         if parts.next() != Some("apr") {
@@ -503,6 +703,10 @@ impl TelegramChannel {
 struct OutboundMirror {
     client: TelegramClient,
     manager: SessionManager,
+    /// SHARED with the inbound side (same Arc) — the mirror records which prompt
+    /// message maps to which elicitation, and the inbound handler consumes it
+    /// when the owner replies.
+    elicit_waiting: ElicitWaiting,
 }
 
 impl OutboundMirror {
@@ -699,6 +903,30 @@ impl OutboundMirror {
                     for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
                         if let Ok(chat_id) = peer.parse::<i64>() {
                             let _ = self.client.send_message(chat_id, &msg).await;
+                        }
+                    }
+                }
+                // A server asked for a value → prompt the owner with force_reply,
+                // naming who is asking. Never auto-answered from context.
+                Event::ElicitationRequested { id, source, prompt, .. } => {
+                    let text = format!(
+                        "🔐 {source} is asking for something:\n\n{prompt}\n\n                         Reply to this message with your answer — or decline.                          I will not answer it for you.",
+                    );
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            if let Ok(msg_id) =
+                                self.client.send_elicitation(chat_id, &text, &id).await
+                            {
+                                let mut waiting = self.elicit_waiting.lock().await;
+                                waiting.push(((chat_id, msg_id), id.clone()));
+                                // Bound the map — stale entries are harmless
+                                // (the broker already expired them) but must not
+                                // accumulate.
+                                if waiting.len() > ELICIT_WAITING_CAP {
+                                    let drop_to = waiting.len() - ELICIT_WAITING_CAP;
+                                    waiting.drain(..drop_to);
+                                }
+                            }
                         }
                     }
                 }
@@ -910,6 +1138,51 @@ fn split_message(text: &str, max: usize) -> Vec<String> {
     flush(&mut cur, &mut parts);
     parts
 }
+
+/// Run THIS binary's own `update` subcommand and return its output.
+///
+/// Deliberately shells out to the real updater rather than reimplementing it
+/// here: the update path knows about install locations, channel selection and
+/// the service's binary, and duplicating that logic in the chat adapter would
+/// mean two versions of the trickiest code in the tree drifting apart. `arg` is
+/// "--check" for a read-only probe or "" to actually install.
+///
+/// `current_exe` is the binary the daemon is running, so /update always probes
+/// the same install the owner is talking to.
+async fn run_self(arg: &str) -> Result<String> {
+    let exe = std::env::current_exe().context("locating my own binary")?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("update");
+    if !arg.is_empty() {
+        cmd.arg(arg);
+    }
+    let out = tokio::time::timeout(Duration::from_secs(300), cmd.output())
+        .await
+        .context("update timed out after 5 minutes")?
+        .context("running my own update")?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        // Surface stderr: an updater failure the owner cannot see is worse than
+        // no /update at all.
+        bail!(
+            "{}",
+            if stderr.is_empty() { stdout } else { stderr }
+        );
+    }
+    Ok(if stdout.is_empty() { "(no output)".to_string() } else { stdout })
+}
+
+/// Clip to something Telegram will accept, leaving room for our own framing.
+fn clip_tg(s: &str) -> String {
+    const ROOM: usize = 3_000;
+    if s.chars().count() <= ROOM {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(ROOM).collect();
+    format!("{kept}\n…(clipped)")
+}
+
 
 #[cfg(test)]
 mod tests {

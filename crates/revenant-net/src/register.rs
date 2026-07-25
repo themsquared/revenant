@@ -10,7 +10,7 @@
 
 use crate::identity::{verify_hex, Identity};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 
 /// A signed claim: "this key is reachable at `endpoint` with `capabilities`."
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,9 +30,18 @@ pub struct Registration {
     pub sig: String,
 }
 
+/// Domain tag: binds a signature to this record type and no other.
+const DOMAIN_REGISTRATION: &[u8] = b"rev-registration-v1";
+
 impl Registration {
-    fn preimage(endpoint: &str, capabilities: &[String], ts: i64, tls_fp: Option<&str>) -> Vec<u8> {
-        let mut h = Sha256::new();
+    fn preimage(
+        domain: Option<&[u8]>,
+        endpoint: &str,
+        capabilities: &[String],
+        ts: i64,
+        tls_fp: Option<&str>,
+    ) -> Vec<u8> {
+        let mut h = crate::identity::preimage_hasher(domain);
         h.update(endpoint.as_bytes());
         h.update([0]);
         for c in capabilities {
@@ -57,7 +66,8 @@ impl Registration {
         tls_fp: Option<String>,
     ) -> Self {
         let endpoint = endpoint.into();
-        let preimage = Self::preimage(&endpoint, &capabilities, ts, tls_fp.as_deref());
+        let preimage =
+            Self::preimage(Some(DOMAIN_REGISTRATION), &endpoint, &capabilities, ts, tls_fp.as_deref());
         Registration {
             id: id_key.id(),
             sig: id_key.sign_hex(&preimage),
@@ -71,9 +81,19 @@ impl Registration {
     /// Authentic for the stated id + content. Callers separately enforce the
     /// timestamp freshness window.
     pub fn verify(&self) -> bool {
-        let preimage =
-            Self::preimage(&self.endpoint, &self.capabilities, self.ts, self.tls_fp.as_deref());
-        verify_hex(&self.id, &preimage, &self.sig)
+        // Domain-tagged first; untagged accepted only for signatures predating
+        // domain separation (see identity::preimage_hasher and the phase-2 note
+        // in horde.rs).
+        [Some(DOMAIN_REGISTRATION), None].into_iter().any(|domain| {
+            let preimage = Self::preimage(
+                domain,
+                &self.endpoint,
+                &self.capabilities,
+                self.ts,
+                self.tls_fp.as_deref(),
+            );
+            verify_hex(&self.id, &preimage, &self.sig)
+        })
     }
 }
 

@@ -2,7 +2,9 @@
 //!
 //! Builds a fixture vault (25 entities, ~120 facts), reindexes, then asks 20
 //! questions asserting the expected fact lands in the top-5 (hit@5 >= 18/20,
-//! MRR >= 0.7) and that recall latency stays under budget.
+//! MRR >= 0.82) and that recall latency stays under budget. `multi_hop_retrieval`
+//! additionally gates the graph leg on questions whose answers are 2-3 relation
+//! hops from the entity named in the question.
 //!
 //! Requires the builtin embedding model; if it isn't downloaded (CI without
 //! `revenant init`), the test SKIPS with a notice rather than failing.
@@ -205,7 +207,29 @@ async fn retrieval_accuracy_and_latency() {
     eprintln!("eval: hit@5 = {hits_at_5}/20, MRR = {mrr:.3}, p50 = {p50:.2?}");
 
     assert!(hits_at_5 >= 18, "hit@5 {hits_at_5}/20 below gate (18)");
-    assert!(mrr >= 0.7, "MRR {mrr:.3} below gate (0.7)");
+    // MRR gate is 0.82, not the original 0.7 — and the graph leg is the reason.
+    // Measured by ablation (graph_leg() forced to return no candidates,
+    // everything else untouched): MRR falls 0.860 -> 0.704 and hit@5 20/20 ->
+    // 19/20. The original 0.7 gate therefore passed with the graph leg ENTIRELY
+    // DEAD, by a margin of 0.004 — it could not detect losing a whole retrieval
+    // leg. This eval, not the multi-hop one, is where the graph leg's ranking
+    // contribution shows up, so this is the assertion that has to protect it.
+    //
+    // The scoring inputs are deterministic (static embeddings, BM25, and
+    // fixed-iteration PPR over a fixed fixture) and MRR measures 0.860 on every
+    // run observed. It is NOT deterministic by construction, though: RRF fuses
+    // into a HashMap and equal-scoring items are ordered by hash iteration, so
+    // ties can reorder between runs — observed while ablating, where MRR moved
+    // between 0.704 and 0.729. Hence a gate with real headroom (0.04) rather
+    // than one pinned to the observed value.
+    //
+    // 0.860 (not 0.885) is the current figure because the per-entity fact cap
+    // that made multi-hop 9/9 costs a little single-hop ranking precision —
+    // hit@5 is unchanged at 20/20, so the right fact is still always in the
+    // top-5, just sometimes a slot lower. That trade is deliberate and
+    // documented in `multi_hop_retrieval`. Raise this gate only after
+    // re-measuring; lower it only with a documented reason.
+    assert!(mrr >= 0.82, "MRR {mrr:.3} below gate (0.82) — retrieval quality regressed");
     assert!(
         p50 < std::time::Duration::from_millis(25),
         "p50 {p50:?} over 25ms budget"
@@ -317,33 +341,55 @@ async fn multi_hop_retrieval() {
 
     // OBSERVED (run locally, `cargo test -p revenant-memory --test eval --
     // --nocapture` with REVENANT_TEST_MODEL_DIR set to a real
-    // potion-retrieval-32M download): hit@10 = 8/9, graph-leg credited on
-    // 8/8 of those hits — i.e. every successful multi-hop answer carried
-    // the LEG_GRAPH bit. This is a real positive result: the graph leg
-    // (Personalized PageRank over the entity neighborhood) is not dead
-    // weight here, it is doing the actual work that a pure BM25+cosine
-    // retriever structurally cannot (no lexical/semantic overlap exists
-    // between e.g. "What database does the project Jane manages depend
-    // on?" and the fact "Depends on ClickHouse for metrics storage" on a
-    // different entity's note).
+    // potion-retrieval-32M download): hit@10 = 9/9, graph-leg credited on
+    // 9/9. Every multi-hop answer carries the LEG_GRAPH bit, and the graph
+    // leg is doing work a pure BM25+cosine retriever structurally cannot
+    // (there is no lexical/semantic overlap between e.g. "What database does
+    // the project Jane manages depend on?" and the fact "Depends on
+    // ClickHouse for metrics storage" living on a different entity's note).
     //
-    // The one miss ("What breed is the pet belonging to the person who
-    // works at Nimbus Labs?" -> Nimbus Labs -> Alex Chen -> Spot -> "golden
-    // retriever", a 3-hop chain) fell just outside K=10 — PPR mass decays
-    // with hop distance (see graph.rs ALPHA=0.5 docs), so 3-hop chains
-    // competing against many 1-hop facts for the same seed are the
-    // expected edge of this system's reach, not a broken graph leg.
+    // This was 8/9 when the test was written. The last miss was the one
+    // 3-hop chain ("What breed is the pet belonging to the person who works
+    // at Nimbus Labs?" -> Nimbus Labs -> Alex Chen -> Spot -> "golden
+    // retriever"), and it turned out NOT to be an α-decay limit as originally
+    // supposed: the graph leg was emitting facts in strict entity-rank order,
+    // so the ~14 facts belonging to the three nearest entities consumed the
+    // whole window before Spot could appear at all. A per-entity fact cap
+    // (MAX_FACTS_PER_ENTITY in retrieve.rs) fixed it. Measured cost of that
+    // cap: single-hop MRR 0.885 -> 0.860 with hit@5 unchanged at 20/20, i.e.
+    // the correct fact is still always in the top-5, occasionally one slot
+    // lower. See also the negative result recorded in graph.rs — steering the
+    // traversal by reweighting typed edges was tried here and did nothing.
     //
-    // Bar set at 8/9 (the observed number) rather than padding it —
+    // Bar set at 9/9 (the observed number) rather than padding it —
     // tighten further only once more multi-hop cases are added and
     // re-measured; loosen it only with a documented reason (e.g. an
     // intentional PPR parameter change), never to silently hide a
     // regression.
-    const MULTI_HOP_HIT_BAR: usize = 8;
+    const MULTI_HOP_HIT_BAR: usize = 9;
     assert!(
         hits >= MULTI_HOP_HIT_BAR,
         "multi-hop hit@{K} {hits}/{} below gate ({MULTI_HOP_HIT_BAR}) — graph leg may not be pulling its weight",
         questions.len()
+    );
+    // Gate `graph_credited` too, not just `hits`. Ablation (graph_leg() forced
+    // to return no candidates) now gives hit@10 8/9 with graph_credited 0/8, so
+    // both assertions fire — but they fail for different reasons and both are
+    // worth keeping. `hits` catches "the answers stopped being reachable";
+    // `graph_credited` catches "another leg is carrying them instead", which is
+    // the failure mode that hid here originally: BM25+cosine independently reach
+    // several of these facts (note the `legs=7` = FTS|VEC|GRAPH values in the
+    // MISS dump above), so before the per-entity cap `hits` was 8/9 with OR
+    // without the graph leg and only this assertion could tell the difference.
+    //
+    // Read it precisely: it proves the graph leg RETRIEVES these multi-hop
+    // answers, NOT that it is the only leg that can. The honest measure of
+    // necessity is the differential — see the MRR gate in
+    // `retrieval_accuracy_and_latency`.
+    assert!(
+        graph_credited >= MULTI_HOP_HIT_BAR,
+        "graph leg credited on only {graph_credited}/{hits} multi-hop hits (gate {MULTI_HOP_HIT_BAR}) \
+         — the graph leg has stopped reaching these answers even if other legs still do"
     );
 
     std::env::remove_var("REVENANT_HOME");

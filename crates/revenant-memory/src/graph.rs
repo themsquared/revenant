@@ -16,6 +16,34 @@ const EPSILON: f32 = 1e-6;
 /// Reverse-direction edges count, slightly discounted.
 const REVERSE_DISCOUNT: f32 = 0.7;
 
+// NEGATIVE RESULT — do not re-attempt typed traversal by reweighting edges.
+//
+// `EdgeRow.rel` is now read back from the index (it used to be dropped), and the
+// obvious use of it is: when the query names a relation ("the pet *belonging to*
+// the person who *works at* Nimbus"), multiply that relation's edges so PPR
+// follows the intended chain. That was implemented, unit-tested, and measured on
+// the retrieval evals. It moved NOTHING: multi-hop stayed 8/9 and MRR stayed
+// 0.885, byte-identical to not doing it.
+//
+// The reason is structural, in the iteration below: mass is distributed as
+// `ALPHA * rank[i] / out_weight[i] * w`, i.e. each edge's share is normalized by
+// the node's TOTAL out-weight. Scaling a node's edges by a constant cancels in
+// that ratio, so a boost only shifts anything when a node has a mix of boosted
+// and unboosted out-edges — and even then it competes against α-decay, which
+// dominates at the hop distances multi-hop questions care about. Reweighting
+// cannot express "follow THIS predicate"; it only re-scores an undirected
+// diffusion.
+//
+// Real typed traversal therefore needs a different shape: walk the named
+// predicate chain to identify the ANSWER entity, then retrieve that entity's
+// facts directly — path-aware retrieval, not a reweighted random walk. `rel` is
+// plumbed through and available for exactly that.
+//
+// What did fix the multi-hop miss was unrelated to edge weights: a per-entity
+// fact cap in the graph leg (see MAX_FACTS_PER_ENTITY in retrieve.rs) — the leg
+// was emitting strict entity-rank order, so a distant entity's fact could never
+// reach the top-K behind a near entity's many facts.
+
 /// Personalized PageRank seeded at `seeds` (entity id -> teleport weight).
 pub fn personalized_pagerank(
     edges: &[EdgeRow],
@@ -95,7 +123,31 @@ mod tests {
     use super::*;
 
     fn edge(src: i64, dst: i64, weight: f32) -> EdgeRow {
-        EdgeRow { src, dst, weight }
+        EdgeRow { src, dst, weight, rel: "mentions".into() }
+    }
+
+    /// Guards the negative result documented above: a uniform reweighting of a
+    /// node's out-edges cannot steer PPR, because each edge's share is
+    /// normalized by the node's total out-weight. Anyone tempted to implement
+    /// typed traversal by scaling `EdgeRow.weight` should see this fail-safe
+    /// first — scaling every edge 3x leaves the ranking identical.
+    #[test]
+    fn uniform_edge_reweighting_cannot_steer_ppr() {
+        let edges = vec![edge(1, 2, 1.0), edge(2, 3, 1.0), edge(1, 4, 1.0)];
+        let scaled: Vec<EdgeRow> =
+            edges.iter().map(|e| EdgeRow { weight: e.weight * 3.0, ..e.clone() }).collect();
+        let seeds = HashMap::from([(1i64, 1.0f32)]);
+
+        let base = personalized_pagerank(&edges, &seeds);
+        let boosted = personalized_pagerank(&scaled, &seeds);
+        for node in [1i64, 2, 3, 4] {
+            assert!(
+                (base[&node] - boosted[&node]).abs() < 1e-6,
+                "node {node}: out-weight normalization must cancel a uniform boost ({} vs {})",
+                base[&node],
+                boosted[&node]
+            );
+        }
     }
 
     #[test]
