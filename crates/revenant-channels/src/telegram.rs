@@ -945,6 +945,23 @@ impl OutboundMirror {
                         }
                     }
                 }
+                // "Still working." Deliberately terse and unemojied-by-repetition:
+                // the point is a pulse, not a report. Cadence backs off upstream,
+                // so this arm does not rate-limit again.
+                Event::JobProgress { id, label, note, elapsed_secs } => {
+                    let mins = elapsed_secs / 60;
+                    let when = if mins >= 1 {
+                        format!("{mins}m in")
+                    } else {
+                        format!("{elapsed_secs}s in")
+                    };
+                    let msg = format!("⏳ Task #{id} {note} ({when}) · {label}");
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let _ = self.client.send_message(chat_id, &msg).await;
+                        }
+                    }
+                }
                 // A background job closed its loop → tell the owner it landed,
                 // whether it finished or gave up. This is the fix for jobs that
                 // used to be fired off and then silently forgotten.

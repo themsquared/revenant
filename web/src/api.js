@@ -112,6 +112,7 @@ export function eventStream(onEvent) {
     'budget_alert',
     'self_review_completed',
     'job_finished',
+    'job_progress',
   ]) {
     source.addEventListener(name, forward)
   }
