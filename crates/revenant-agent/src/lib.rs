@@ -206,6 +206,9 @@ pub struct AgentRuntime {
     pub default_persona: Option<String>,
     /// Timestamps of recent auto-distilled skills (rolling 1h) — anti-spam.
     pub learn_budget: Arc<Mutex<Vec<i64>>>,
+    /// Spend + spawn rails for this agent's whole task tree (shared token pool
+    /// and live-descendant count). Cloned into every session: one tree, one budget.
+    pub task_budget: revenant_core::budget::TaskBudget,
     /// Sessions with a top-level turn in flight — so a new message can be
     /// treated as a mid-turn interjection instead of waiting in line.
     pub active_turns: Arc<Mutex<HashSet<i64>>>,
@@ -359,6 +362,7 @@ impl AgentRuntime {
             learn_min_tools: self.learn_min_tools,
             default_persona: self.default_persona.clone(),
             learn_budget: self.learn_budget.clone(),
+            task_budget: self.task_budget.clone(),
             active_turns: self.active_turns.clone(),
             interjections: self.interjections.clone(),
             deferred: self.deferred.clone(),
@@ -690,6 +694,19 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
             self.store
                 .record_spend(session_id, tier.as_str(), outcome.routed_model.as_deref(), outcome.usage)
                 .await?;
+            // Charge the tree's shared pool. The tokens are already spent at the
+            // provider, so this records reality. Exhaustion refuses further SPAWNS and
+            // is surfaced to the owner; it does not kill this turn mid-flight, which
+            // would waste what it has already paid for.
+            if let revenant_core::budget::Spend::Exhausted { asked, remaining } = self
+                .task_budget
+                .charge(outcome.usage.input_tokens as i64 + outcome.usage.output_tokens as i64)
+            {
+                tracing::warn!(
+                    "task budget exhausted: asked {asked}, had {remaining} ({})",
+                    self.task_budget.summary()
+                );
+            }
 
             if outcome.stop_reason.as_deref() != Some("tool_use") {
                 // Hand the finished exchange to the memory consolidator —
@@ -915,6 +932,19 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         self.store
             .record_spend(session_id, tier.as_str(), outcome.routed_model.as_deref(), outcome.usage)
             .await?;
+        // Charge the tree's shared pool. The tokens are already spent at the
+        // provider, so this records reality. Exhaustion refuses further SPAWNS and
+        // is surfaced to the owner; it does not kill this turn mid-flight, which
+        // would waste what it has already paid for.
+        if let revenant_core::budget::Spend::Exhausted { asked, remaining } = self
+            .task_budget
+            .charge(outcome.usage.input_tokens as i64 + outcome.usage.output_tokens as i64)
+        {
+            tracing::warn!(
+                "task budget exhausted: asked {asked}, had {remaining} ({})",
+                self.task_budget.summary()
+            );
+        }
         if let Some(memory) = &self.memory {
             memory.observe(revenant_memory::Episode {
                 session_id,
@@ -1146,9 +1176,34 @@ When finished, state briefly which files you changed and why.\n\nTask: {task}"
         input: serde_json::Value,
         depth: u8,
     ) -> Result<String> {
-        if depth >= 1 {
-            bail!("subagents cannot spawn their own subagents");
+        // Three independent rails, all checked before any work starts. Each
+        // catches a spiral the others cannot: depth stops towers, the live
+        // descendant cap stops a concurrent fan-out committing money faster than
+        // the pool can notice, and an exhausted pool stops a serial grind (whose
+        // live count never leaves 1). Refusal returns a STRUCTURED PARTIAL result
+        // rather than an error — the parent should report what it has.
+        use revenant_core::budget::MAX_TASK_DEPTH;
+        if depth >= MAX_TASK_DEPTH {
+            return Ok(format!(
+                "[partial] not spawning: nesting limit reached (depth {depth} of                  {MAX_TASK_DEPTH}). Continue with what you already have, or                  restructure into fewer levels."
+            ));
         }
+        // Held for the whole child run; released on Drop, so an error or a
+        // cancellation returns the slot just as a clean finish does.
+        let _slot = match self.task_budget.try_spawn_at(depth) {
+            Some(slot) => slot,
+            None => {
+                let b = &self.task_budget;
+                let why = if !b.is_unlimited() && b.remaining() <= 0 {
+                    format!("task budget exhausted — {}", b.summary())
+                } else {
+                    format!("{} tasks already running (the concurrent limit)", b.live_descendants())
+                };
+                return Ok(format!(
+                    "[partial] not spawning: {why}. Continue with what you already have."
+                ));
+            }
+        };
         let task = input
             .get("task")
             .and_then(|t| t.as_str())

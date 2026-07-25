@@ -28,6 +28,16 @@ use std::sync::Arc;
 /// Hard nesting limit for spawned work (root = depth 0).
 pub const MAX_TASK_DEPTH: u8 = 4;
 
+/// Most spawned tasks alive at once across the WHOLE tree.
+///
+/// This is the rail the token pool cannot provide. A spiral that fans out wide
+/// and fast can queue hundreds of children before any of them has spent enough
+/// for the pool to notice — the money is committed before the accounting catches
+/// up. Conversely a serial grind keeps the live count at 1 forever, which only
+/// the pool catches. Depth catches neither: a two-level tree can still be
+/// enormous. All three rails are needed; none subsumes another.
+pub const MAX_LIVE_DESCENDANTS: i64 = 16;
+
 /// What happened when work asked to spend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spend {
@@ -42,9 +52,30 @@ pub enum Spend {
 /// A budget shared by one task and everything it spawns.
 ///
 /// Cloning shares the pool; [`TaskBudget::child`] shares it AND increments depth.
+/// Proof that a spawn slot was claimed. Releasing it is [`Drop`], deliberately:
+/// a slot must come back on the error and cancellation paths too, not only on a
+/// clean return. Tying release to scope exit rather than to an explicit call is
+/// what stops a panicking or aborted child from leaking the tree's capacity.
+#[derive(Debug)]
+pub struct DescendantSlot {
+    live: Arc<AtomicI64>,
+}
+
+impl Drop for DescendantSlot {
+    fn drop(&mut self) {
+        // Floor at zero: a double-release bug must not manufacture capacity.
+        let _ = self.live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            Some((n - 1).max(0))
+        });
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskBudget {
     remaining: Arc<AtomicI64>,
+    /// Spawned tasks currently alive anywhere in this tree. Shared like the token
+    /// pool, so the cap bounds the whole fan-out rather than each parent.
+    live: Arc<AtomicI64>,
     /// Total the root started with — kept for reporting a meaningful "spent X of
     /// Y" rather than only a remainder.
     total: i64,
@@ -59,14 +90,24 @@ impl TaskBudget {
         if tokens <= 0 {
             return Self::unlimited();
         }
-        TaskBudget { remaining: Arc::new(AtomicI64::new(tokens)), total: tokens, depth: 0 }
+        TaskBudget {
+            remaining: Arc::new(AtomicI64::new(tokens)),
+            live: Arc::new(AtomicI64::new(0)),
+            total: tokens,
+            depth: 0,
+        }
     }
 
     /// No accounting. Used when the owner has configured no budget — the gateway
     /// spend cap is still the outer moat, so this is "untracked here", not
     /// "unbounded everywhere".
     pub fn unlimited() -> Self {
-        TaskBudget { remaining: Arc::new(AtomicI64::new(i64::MAX)), total: i64::MAX, depth: 0 }
+        TaskBudget {
+            remaining: Arc::new(AtomicI64::new(i64::MAX)),
+            live: Arc::new(AtomicI64::new(0)),
+            total: i64::MAX,
+            depth: 0,
+        }
     }
 
     pub fn is_unlimited(&self) -> bool {
@@ -97,15 +138,60 @@ impl TaskBudget {
     /// `None` means the depth cap is reached and the caller must NOT spawn. It is
     /// deliberately not an error type — refusing to nest further is a normal
     /// outcome the caller reports as a partial result, the same as exhaustion.
-    pub fn child(&self) -> Option<Self> {
+    fn child(&self) -> Option<Self> {
         if self.depth >= MAX_TASK_DEPTH {
             return None;
         }
         Some(TaskBudget {
             remaining: Arc::clone(&self.remaining),
+            live: Arc::clone(&self.live),
             total: self.total,
             depth: self.depth + 1,
         })
+    }
+
+    /// Spawned tasks currently alive in this tree.
+    pub fn live_descendants(&self) -> i64 {
+        self.live.load(Ordering::Relaxed).max(0)
+    }
+
+    /// Claim capacity for a child: a budget one level deeper plus the slot that
+    /// holds its place in the live count.
+    ///
+    /// `None` means refused — depth cap, live cap, or an exhausted pool. Refusal
+    /// is IMMEDIATE and never waits for a slot to free. A blocking semaphore here
+    /// would deadlock under nesting: a parent holds its own slot while awaiting
+    /// its children, so waiting for capacity that only a descendant can release
+    /// is a cycle. Refusing lets the caller return a partial result instead of
+    /// hanging.
+    pub fn spawn_child(&self) -> Option<(TaskBudget, DescendantSlot)> {
+        let slot = self.try_spawn_at(self.depth)?;
+        // depth was already validated by try_spawn_at, so child() cannot fail.
+        let child = self.child()?;
+        Some((child, slot))
+    }
+
+    /// Claim a spawn slot when the caller tracks depth itself (the agent threads
+    /// `depth` through its turn loop). Same three refusals as [`spawn_child`].
+    pub fn try_spawn_at(&self, depth: u8) -> Option<DescendantSlot> {
+        if depth >= MAX_TASK_DEPTH {
+            return None;
+        }
+        // A spawn with nothing left to spend would only produce a child that
+        // immediately fails — refuse at the parent, where a partial result can
+        // still be assembled.
+        if !self.is_unlimited() && self.remaining() <= 0 {
+            return None;
+        }
+        // Lock-free claim: only succeed if we are strictly under the cap. CAS
+        // rather than fetch_add so a burst of concurrent spawns cannot briefly
+        // overshoot and then correct.
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_LIVE_DESCENDANTS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| DescendantSlot { live: Arc::clone(&self.live) })
     }
 
     /// Charge `tokens` against the shared pool.
@@ -225,6 +311,110 @@ mod tests {
         // 1000 tokens at 10 each = exactly 100 successful charges, no more.
         assert_eq!(granted, 100, "shared counter must not over-grant under contention");
         assert_eq!(root.remaining(), 0);
+    }
+
+    #[test]
+    fn the_seventeenth_concurrent_descendant_is_refused() {
+        let root = TaskBudget::root(1_000_000);
+        // Hold the slots: capacity is about what is ALIVE, not what has ever run.
+        let mut slots: Vec<_> = (0..MAX_LIVE_DESCENDANTS)
+            .map(|i| root.spawn_child().unwrap_or_else(|| panic!("child {i} within cap")))
+            .collect();
+        assert_eq!(root.live_descendants(), MAX_LIVE_DESCENDANTS);
+        assert!(root.spawn_child().is_none(), "17th concurrent descendant must be refused");
+
+        // Free exactly ONE → one more may spawn, and no more. (`pop` rather than
+        // `into_iter().next()`, which would drop the whole Vec and release all 16.)
+        drop(slots.pop().expect("a slot to free"));
+        assert_eq!(root.live_descendants(), MAX_LIVE_DESCENDANTS - 1);
+        let reused = root.spawn_child();
+        assert!(reused.is_some(), "a freed slot must be reusable");
+        assert!(root.spawn_child().is_none(), "still capped after reuse");
+    }
+
+    #[test]
+    fn a_slot_frees_on_the_error_path_not_just_a_clean_return() {
+        // Drop-based release is the point: a child that panics or is cancelled
+        // must still give its capacity back.
+        let root = TaskBudget::root(1_000);
+        let before = root.live_descendants();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = root.spawn_child().expect("slot").1;
+            assert_eq!(root.live_descendants(), before + 1);
+            panic!("child blew up");
+        }));
+        assert!(result.is_err(), "the child did panic");
+        assert_eq!(root.live_descendants(), before, "slot released by unwinding");
+
+        // Early return (the ordinary error path) releases too.
+        fn bail_early(b: &TaskBudget) -> Result<(), &'static str> {
+            let _slot = b.spawn_child().ok_or("refused")?.1;
+            Err("failed after spawning")
+        }
+        assert!(bail_early(&root).is_err());
+        assert_eq!(root.live_descendants(), before, "slot released on early return");
+    }
+
+    #[test]
+    fn depth_and_descendant_caps_refuse_independently() {
+        // Depth exhausted, live count empty ⇒ still refused.
+        let mut deep = TaskBudget::root(1_000);
+        let mut keep = Vec::new();
+        for _ in 0..MAX_TASK_DEPTH {
+            let (child, slot) = deep.spawn_child().expect("within depth");
+            keep.push(slot);
+            deep = child;
+        }
+        assert!(deep.spawn_child().is_none(), "depth cap refuses on its own");
+
+        // Live count exhausted at depth 0 ⇒ refused even though depth is fine.
+        let shallow = TaskBudget::root(1_000);
+        let _held: Vec<_> =
+            (0..MAX_LIVE_DESCENDANTS).map(|_| shallow.spawn_child().unwrap()).collect();
+        assert_eq!(shallow.depth(), 0);
+        assert!(shallow.spawn_child().is_none(), "live cap refuses on its own");
+    }
+
+    #[test]
+    fn an_exhausted_pool_refuses_a_spawn() {
+        // A child with nothing to spend would only fail immediately; refuse at the
+        // parent, where a partial result can still be assembled.
+        let root = TaskBudget::root(100);
+        assert_eq!(root.charge(100), Spend::Ok);
+        assert_eq!(root.remaining(), 0);
+        assert!(root.spawn_child().is_none(), "no budget left ⇒ no spawn");
+        // ...and refusing to spawn does not poison the level already running.
+        assert!(root.would_fit(0));
+    }
+
+    #[test]
+    fn slot_claiming_does_not_over_grant_under_contention() {
+        // The CAS is the only thing bounding a concurrent spiral.
+        let root = TaskBudget::root(i64::MAX - 1);
+        let granted = Arc::new(AtomicI64::new(0));
+        let hold = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (b, g, h) = (root.clone(), Arc::clone(&granted), Arc::clone(&hold));
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        if let Some((_, slot)) = b.spawn_child() {
+                            g.fetch_add(1, Ordering::Relaxed);
+                            h.lock().unwrap().push(slot); // hold, never release
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            granted.load(Ordering::Relaxed),
+            MAX_LIVE_DESCENDANTS,
+            "concurrent spawns must not exceed the live cap"
+        );
     }
 
     #[test]

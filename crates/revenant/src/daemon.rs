@@ -199,6 +199,18 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     };
 
     let runtime = Arc::new(AgentRuntime {
+        // Spawn/spend rails for a whole task tree. Seeded from the owner's
+        // configured daily token budget when there is one: a SINGLE task tree
+        // should never be able to consume the entire day's allowance, so that is
+        // a conservative ceiling rather than an invented knob nobody sets. With
+        // no budget configured this is untracked here and the gateway's rolling
+        // cap remains the outer moat — the depth and live-descendant rails still
+        // apply either way, since neither depends on tokens.
+        task_budget: cfg
+            .spending
+            .daily_budget_tokens
+            .map(|t| revenant_core::budget::TaskBudget::root(t as i64))
+            .unwrap_or_else(revenant_core::budget::TaskBudget::unlimited),
         store,
         llm,
         tools,
