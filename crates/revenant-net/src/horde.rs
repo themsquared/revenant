@@ -293,19 +293,31 @@ mod domain_confusion_tests {
         assert!(!tampered.verify(), "legacy path must not become a forgery oracle");
     }
 
-    /// PHASE 2 REMINDER, enforced as a test so it cannot be quietly forgotten.
+    /// RESIDUAL EXPOSURE — and, unlike A2A, it is PERMANENT rather than
+    /// transitional. This was originally filed as "drop the `None` arm once every
+    /// agent has upgraded". Every agent HAS upgraded, and it still cannot be
+    /// dropped here.
     ///
-    /// Accepting untagged preimages keeps the confusion window OPEN for records
-    /// whose signatures predate the tag: an attacker holding a legacy
-    /// `HordeResult` signature can still present it as a legacy `HordeClaim`.
-    /// That is a deliberate transitional cost — the alternative rejects both the
-    /// existing ledger and any peer that has not upgraded yet.
+    /// Why: horde records are persisted in the Necropolis ledger and re-verified
+    /// on every replay (`Dir::apply` — `if t.verify()` for horde_task/claim/
+    /// result). Removing the untagged arm would make ~2400 historical records
+    /// fail verification, and `apply` SKIPS what fails — so history would not
+    /// break loudly, it would silently disappear from rebuilt state. That is
+    /// worse than the exposure it closes.
     ///
-    /// Once every agent on the network signs tagged records, drop the `None`
-    /// arm from all three `verify()` methods. This test documents the residual
-    /// exposure precisely so the decision stays visible.
+    /// So the window stays open for pre-tag signatures on ledger-backed types.
+    /// Practical bound on the exposure: forging this way needs a legacy
+    /// signature, whose `created_ts` is inside the preimage and therefore cannot
+    /// be moved forward, and claims/results are lease- and account-gated
+    /// downstream.
+    ///
+    /// Closing it properly needs an ERA MARKER on ledger entries so replay can
+    /// select the verifier that entry was written with — a protocol change, and
+    /// the honest next step rather than deleting the arm. A2A envelopes had no
+    /// such constraint (never persisted, never replayed) and phase 2 IS closed
+    /// there; see a2a.rs.
     #[test]
-    fn legacy_path_is_still_confusable_until_phase_2() {
+    fn ledger_backed_types_keep_the_legacy_window_by_necessity() {
         let key = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
         let ts = 1_780_000_000i64;
 
@@ -325,8 +337,8 @@ mod domain_confusion_tests {
         };
         assert!(
             forged.verify(),
-            "if this now FAILS, phase 2 has effectively landed — remove the legacy \
-             `None` arms in verify() and delete this test"
+            "if this now FAILS the legacy arm was removed — check that ledger \
+             replay still accepts pre-tag records before keeping that change"
         );
     }
 }
