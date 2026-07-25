@@ -7,6 +7,7 @@ pub mod home;
 pub mod loops;
 pub mod privacy;
 pub mod providers;
+pub mod subscription;
 pub mod tool;
 
 pub use event::{Event, EventBus};
