@@ -573,6 +573,7 @@ async fn events(
                 revenant_core::Event::BudgetAlert { .. } => "budget_alert",
                 revenant_core::Event::SelfReviewCompleted { .. } => "self_review_completed",
                 revenant_core::Event::JobFinished { .. } => "job_finished",
+                revenant_core::Event::SendMedia { .. } => "send_media",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())

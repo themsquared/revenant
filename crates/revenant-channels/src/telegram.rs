@@ -655,6 +655,21 @@ impl OutboundMirror {
                         }
                     }
                 }
+                // A file/image is ready to push (e.g. a rendered chart) → every paired chat.
+                Event::SendMedia { kind, file_path, caption } => {
+                    for peer in runtime.store.peers_list(CHANNEL).await.unwrap_or_default() {
+                        if let Ok(chat_id) = peer.parse::<i64>() {
+                            let result = if kind == "photo" {
+                                self.client.send_photo(chat_id, &file_path, caption.as_deref()).await
+                            } else {
+                                self.client.send_file(chat_id, &file_path, caption.as_deref()).await
+                            };
+                            if let Err(err) = result {
+                                tracing::warn!("telegram send_media failed for chat {chat_id}: {err:#}");
+                            }
+                        }
+                    }
+                }
                 // Auto-update news → every paired chat (the owner's pocket).
                 Event::UpdateAvailable { current, latest, channel } => {
                     let from = current.unwrap_or_else(|| "source".into());

@@ -43,6 +43,8 @@ pub fn all(home: &Home, skills: Arc<SkillIndex>) -> Vec<Arc<dyn Tool>> {
         Arc::new(Exec { workspace: home.workspace_dir() }),
         Arc::new(DbQuery),
         Arc::new(Reminder),
+        Arc::new(SendPhoto),
+        Arc::new(SendFile),
         Arc::new(Recall),
         Arc::new(MemorySave),
         Arc::new(MemoryRead { home: home.clone() }),
@@ -804,6 +806,76 @@ fn human_delay(secs: i64) -> String {
         out.push_str("0s");
     }
     out
+}
+
+// ---- send media (photo/file to paired chats) ----
+
+struct SendPhoto;
+
+#[async_trait::async_trait]
+impl Tool for SendPhoto {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "send_photo",
+            "Send an image file to the owner's paired chat(s) (e.g. Telegram) as an inline photo with an optional caption. Use for charts, screenshots, rendered diagrams — anything meant to display inline. `file_path` must be an absolute path to an existing image file on disk.",
+            json!({"type":"object","properties":{
+                "file_path":{"type":"string","description":"absolute path to an existing image file on disk"},
+                "caption":{"type":"string","description":"optional caption to display with the photo"}
+            },"required":["file_path"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::WriteWorkspace
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        send_media_invoke(cx, args, "photo").await
+    }
+}
+
+struct SendFile;
+
+#[async_trait::async_trait]
+impl Tool for SendFile {
+    fn spec(&self) -> ToolSpec {
+        spec!(
+            "send_file",
+            "Send any file to the owner's paired chat(s) (e.g. Telegram) as a downloadable document with an optional caption. Use for PDFs, CSVs, logs, or any file not meant to render inline as an image. `file_path` must be an absolute path to an existing file on disk.",
+            json!({"type":"object","properties":{
+                "file_path":{"type":"string","description":"absolute path to an existing file on disk"},
+                "caption":{"type":"string","description":"optional caption to display with the file"}
+            },"required":["file_path"]})
+        )
+    }
+    fn permission(&self) -> PermissionTier {
+        PermissionTier::WriteWorkspace
+    }
+    async fn invoke(&self, cx: &ToolCx, args: Value) -> ToolOutput {
+        send_media_invoke(cx, args, "document").await
+    }
+}
+
+/// Shared invoke body for `SendPhoto`/`SendFile`: validate the file exists,
+/// enqueue a `send_media` job (run immediately, no delay) so the actual
+/// upload/delivery happens off the hot path via the channel adapter, same
+/// pattern as `Reminder`.
+async fn send_media_invoke(cx: &ToolCx, args: Value, kind: &str) -> ToolOutput {
+    let file_path = match arg_str(&args, "file_path") {
+        Ok(p) => p.to_string(),
+        Err(e) => return e,
+    };
+    if !std::path::Path::new(&file_path).exists() {
+        return ToolOutput::err(format!("file not found: {file_path}"));
+    }
+    let caption = args.get("caption").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let payload = json!({ "kind": kind, "file_path": file_path, "caption": caption }).to_string();
+    if let Err(e) = cx.store.job_enqueue("send_media", &payload, "send_media", 3, now).await {
+        return ToolOutput::err(format!("couldn't queue the {kind} for delivery: {e:#}"));
+    }
+    ToolOutput::ok(format!("📤 queued {file_path} for delivery to your paired chat(s)"))
 }
 
 // ---- the codex: learn from the horde ----

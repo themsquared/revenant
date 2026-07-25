@@ -68,6 +68,7 @@ impl JobRunner {
         let outcome = match job.kind.as_str() {
             "code" => self.run_code_job(&job).await,
             "reminder" => self.run_reminder_job(&job).await,
+            "send_media" => self.run_send_media_job(&job).await,
             other => Err(anyhow::anyhow!("unknown job kind '{other}'")),
         };
         let events = &self.manager.runtime().events;
@@ -78,7 +79,7 @@ impl JobRunner {
                 // Close the loop: a queued async task must report back, not
                 // vanish. Reminders already emit their own event; code jobs
                 // (and any future kind) surface completion here.
-                if job.kind != "reminder" {
+                if job.kind != "reminder" && job.kind != "send_media" {
                     let detail = output.lines().next().unwrap_or("").chars().take(280).collect::<String>();
                     events.emit(revenant_core::Event::JobFinished {
                         id: job.id,
@@ -130,6 +131,27 @@ impl JobRunner {
             .events
             .emit(revenant_core::Event::ReminderFired { message: p.message.clone() });
         Ok(format!("reminder delivered: {}", p.message.chars().take(80).collect::<String>()))
+    }
+
+    /// A file/image ready to push (e.g. a rendered chart): emit a SendMedia
+    /// event — the Telegram channel (and any future channel) reads the file
+    /// off disk and delivers it to every paired peer. Fire-once by
+    /// construction, same as a reminder.
+    async fn run_send_media_job(&self, job: &JobRow) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct SendMediaPayload {
+            kind: String,
+            file_path: String,
+            caption: Option<String>,
+        }
+        let p: SendMediaPayload = serde_json::from_str(&job.payload)
+            .context("bad `send_media` job payload (need kind + file_path)")?;
+        self.manager.runtime().events.emit(revenant_core::Event::SendMedia {
+            kind: p.kind.clone(),
+            file_path: p.file_path.clone(),
+            caption: p.caption.clone(),
+        });
+        Ok(format!("media queued for delivery: {}", p.file_path))
     }
 
     /// A coding subtask: run a jailed coder in an EPHEMERAL git worktree of the
