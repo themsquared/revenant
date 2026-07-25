@@ -192,6 +192,74 @@ impl TelegramClient {
         Ok(msg.message_id)
     }
 
+    /// Send a photo from a local file via multipart/form-data. Returns the
+    /// resulting message_id. Distinct from `call()` because the Bot API needs
+    /// a file upload here, not a JSON body.
+    pub async fn send_photo(&self, chat_id: i64, file_path: &str, caption: Option<&str>) -> Result<i64> {
+        self.send_media("sendPhoto", "photo", chat_id, file_path, caption).await
+    }
+
+    /// Send an arbitrary file as a document via multipart/form-data. Same as
+    /// `send_photo` but hits `sendDocument` with a `document` field.
+    pub async fn send_file(&self, chat_id: i64, file_path: &str, caption: Option<&str>) -> Result<i64> {
+        self.send_media("sendDocument", "document", chat_id, file_path, caption).await
+    }
+
+    /// Shared multipart upload for `send_photo`/`send_file`: read the file off
+    /// disk, build the form (file field + chat_id + optional caption), POST it,
+    /// and parse the `Message` response for its id.
+    async fn send_media(
+        &self,
+        method: &str,
+        field: &str,
+        chat_id: i64,
+        file_path: &str,
+        caption: Option<&str>,
+    ) -> Result<i64> {
+        if !tokio::fs::try_exists(file_path).await.unwrap_or(false) {
+            bail!("file not found: {file_path}");
+        }
+        let bytes = tokio::fs::read(file_path)
+            .await
+            .with_context(|| format!("failed to read {file_path}"))?;
+
+        let file_name = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let mime = mime_for(file_path);
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name)
+            .mime_str(mime)
+            .with_context(|| format!("bad mime for {file_path}"))?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part(field.to_string(), part);
+        if let Some(cap) = caption {
+            form = form.text("caption", cap.to_string());
+        }
+
+        let resp = self
+            .http
+            .post(format!("{}/{method}", self.base))
+            .multipart(form)
+            .timeout(Duration::from_secs(70))
+            .send()
+            .await
+            .with_context(|| format!("telegram {method}"))?;
+        let parsed: ApiResponse<Message> = resp.json().await?;
+        if parsed.ok {
+            let msg = parsed.result.context("telegram: ok but no result")?;
+            return Ok(msg.message_id);
+        }
+        bail!(
+            "telegram {method} failed: {}",
+            parsed.description.unwrap_or_else(|| "unknown error".into())
+        )
+    }
+
     /// Report an available update with a single explicit Install control.
     pub async fn send_update_offer(&self, chat_id: i64, text: &str) -> Result<i64> {
         let msg: Message = self
@@ -935,6 +1003,35 @@ impl OutboundMirror {
         } else {
             Some(chat_id)
         }
+    }
+}
+
+/// Guess a MIME type from a file extension. Covers the common image/document
+/// types; anything unrecognized falls back to a safe binary default. Kept as a
+/// tiny hardcoded map to avoid pulling in a new dependency.
+fn mime_for(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        _ => "application/octet-stream",
     }
 }
 
