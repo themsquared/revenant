@@ -109,6 +109,15 @@ pub enum Event {
     ReminderFired {
         message: String,
     },
+    /// A file/image is ready to push to the owner's paired chat(s) (e.g. a
+    /// rendered chart, a report). `kind` is "photo" (inline image preview) or
+    /// "document" (any file, downloadable). `file_path` must be an absolute,
+    /// already-materialized path on disk — the channel adapter reads it directly.
+    SendMedia {
+        kind: String,
+        file_path: String,
+        caption: Option<String>,
+    },
     /// The complexity router downgraded a trivial turn to a cheaper tier. Bus /
     /// observability only — deliberately NOT pushed to chat surfaces (that would
     /// be noise on every "hi").
