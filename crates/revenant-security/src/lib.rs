@@ -325,6 +325,22 @@ fn now() -> i64 {
 mod elicit_tests {
     use super::*;
 
+    /// Wait until a request has actually been persisted, instead of sleeping a
+    /// fixed interval and hoping. The original version slept 50ms, which passed
+    /// in isolation and failed under a loaded full-workspace run — the spawned
+    /// task had not inserted yet, so `approvals_pending()[0]` panicked on an
+    /// empty vec. Polling makes the test wait for the CONDITION it depends on.
+    async fn await_pending(store: &Store) -> String {
+        for _ in 0..200 {
+            if let Some(row) = store.approvals_pending().await.unwrap_or_default().into_iter().next()
+            {
+                return row.id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no approval was persisted within 2s");
+    }
+
     fn new_broker(name: &str, ttl: Duration) -> (ApprovalBroker, Store) {
         let dir = std::env::temp_dir().join(format!("rev-elicit-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -341,13 +357,11 @@ mod elicit_tests {
         let task = tokio::spawn(async move {
             b.elicit(1, "acme-mcp", "Which region?", serde_json::json!({"type":"string"})).await
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
+        let id = await_pending(&store).await;
+        // Reserved kind: can never collide with a tool kind.
         let pending = store.approvals_pending().await.unwrap();
         assert_eq!(pending.len(), 1);
-        // Reserved kind: can never collide with a tool kind.
         assert_eq!(pending[0].kind, "elicitation");
-        let id = pending[0].id.clone();
 
         assert!(broker.resolve_elicitation(&id, Some("us-east-1"), "owner").await.unwrap());
         assert_eq!(
@@ -375,8 +389,7 @@ mod elicit_tests {
         let task = tokio::spawn(async move {
             b.elicit(1, "acme-mcp", "Token?", serde_json::json!({"type":"string"})).await
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let id = store.approvals_pending().await.unwrap()[0].id.clone();
+        let id = await_pending(&store).await;
         assert!(broker.resolve_elicitation(&id, Some("   "), "owner").await.unwrap());
         assert_eq!(task.await.unwrap().unwrap(), ElicitOutcome::Declined);
     }
@@ -395,8 +408,7 @@ mod elicit_tests {
         let b = broker.clone();
         let approval =
             tokio::spawn(async move { b.request(1, "elicitation", "x", serde_json::json!({})).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let id = store.approvals_pending().await.unwrap()[0].id.clone();
+        let id = await_pending(&store).await;
         broker.resolve_scoped(&id, true, true, "owner").await.unwrap();
         assert_eq!(approval.await.unwrap().unwrap(), Verdict::Approved);
         // The grant is live: a second capability request auto-approves.
@@ -426,8 +438,7 @@ mod elicit_tests {
         let elicit = tokio::spawn(async move {
             b.elicit(2, "acme-mcp", "Region?", serde_json::json!({"type":"string"})).await
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let id = store.approvals_pending().await.unwrap()[0].id.clone();
+        let id = await_pending(&store).await;
         // The row CAS succeeds (it is the same table), but no value is produced:
         // the waiter is in the elicitation map and never receives an Accepted.
         broker.resolve_scoped(&id, true, false, "owner").await.unwrap();
@@ -441,8 +452,7 @@ mod elicit_tests {
         let (broker, store) = new_broker("cross2", Duration::from_millis(400));
         let b = broker.clone();
         let req = tokio::spawn(async move { b.request(3, "exec", "rm -rf /", serde_json::json!({})).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let id = store.approvals_pending().await.unwrap()[0].id.clone();
+        let id = await_pending(&store).await;
         broker.resolve_elicitation(&id, Some("yes do it"), "owner").await.unwrap();
         assert_eq!(
             req.await.unwrap().unwrap(),
