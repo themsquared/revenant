@@ -49,11 +49,13 @@ pub fn sign(id_key: &Identity, body: &[u8], ts: i64, nonce: &str) -> String {
 /// Verify an envelope: is `sig` a valid signature by `agent` over exactly this
 /// body + ts + nonce? Freshness and nonce reuse are the receiver's checks.
 pub fn verify(agent: &str, body: &[u8], ts: i64, nonce: &str, sig: &str) -> bool {
-    // Domain-tagged first; untagged accepted only for peers that have not yet
-    // upgraded (see the phase-2 note in horde.rs).
-    [Some(DOMAIN_A2A), None]
-        .into_iter()
-        .any(|domain| verify_hex(agent, &preimage(domain, body, ts, nonce), sig))
+    // PHASE 2 (SEC-5a): domain-tagged ONLY. The untagged fallback is gone.
+    //
+    // Safe to close here and nowhere else: an A2A envelope is live traffic. It is
+    // never persisted and never replayed, so once every peer signs tagged
+    // envelopes there is no historical signature that needs the old preimage.
+    // Ledger-backed record types cannot do this — see horde.rs.
+    verify_hex(agent, &preimage(Some(DOMAIN_A2A), body, ts, nonce), sig)
 }
 
 #[cfg(test)]
@@ -76,5 +78,33 @@ mod tests {
         assert!(!verify(&k.id(), body, 1000, "abc124", &sig));
         let other = id();
         assert!(!verify(&other.id(), body, 1000, "abc123", &sig));
+    }
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    /// Phase 2 closed the confusion window for A2A: an untagged signature — the
+    /// shape a pre-SEC-5a peer produced — must now be REFUSED, not accepted.
+    #[test]
+    fn an_untagged_envelope_is_now_refused() {
+        let key = Identity::load_or_create(tempfile::tempdir().unwrap().path()).unwrap();
+        let (body, ts, nonce) = (b"{\"m\":\"hi\"}".as_slice(), 1_784_000_000i64, "abc123");
+
+        // Legacy signer: no domain tag.
+        let legacy_sig = key.sign_hex(&preimage(None, body, ts, nonce));
+        assert!(
+            !verify(&key.id(), body, ts, nonce, &legacy_sig),
+            "an untagged envelope must no longer verify"
+        );
+
+        // The tagged form still round-trips.
+        let good = sign(&key, body, ts, nonce);
+        assert!(verify(&key.id(), body, ts, nonce, &good));
+
+        // And tampering is still caught.
+        assert!(!verify(&key.id(), b"{\"m\":\"bye\"}", ts, nonce, &good));
     }
 }
