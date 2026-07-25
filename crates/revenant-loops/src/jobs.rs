@@ -94,18 +94,11 @@ impl JobRunner {
                 // vanish. Reminders already emit their own event; code jobs
                 // (and any future kind) surface completion here.
                 if job.kind != "reminder" && job.kind != "send_media" {
-                    let detail = output
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(280)
-                        .collect::<String>();
                     events.emit(revenant_core::Event::JobFinished {
                         id: job.id,
                         label: job.label.clone(),
                         ok: true,
-                        detail,
+                        detail: summarize(&job.kind, &output).render(),
                     });
                 }
             }
@@ -504,5 +497,141 @@ mod status_tests {
         assert!(msg.starts_with("transient — "), "class and action come first: {msg}");
         assert!(msg.contains("429"), "the raw error is still available");
         assert!(!msg.contains("another::frame"), "only the first raw line is kept");
+    }
+}
+
+/// What a finished job actually accomplished, and what it did NOT.
+///
+/// "Done" is rarely the whole truth. A code job that succeeds has produced a
+/// *proposal* — a diff in an ephemeral worktree that was torn down — and the
+/// change is not in the tree. Reporting only "finished" invites the owner to
+/// believe work landed that hasn't, which is a worse failure than reporting an
+/// error.
+#[derive(Debug, PartialEq, Eq)]
+pub struct JobReport {
+    /// One or two lines on what happened.
+    pub did: String,
+    /// Anything left undone that the owner has to decide about. `None` means
+    /// genuinely nothing outstanding — not "unknown".
+    pub remaining: Option<String>,
+}
+
+impl JobReport {
+    pub fn render(&self) -> String {
+        match &self.remaining {
+            Some(r) => format!("{}\n⏭ Remaining: {r}", self.did),
+            None => self.did.clone(),
+        }
+    }
+}
+
+/// Derive a report from a job's raw output.
+///
+/// Pure and per-kind, rather than a generic first-line clip: only the kind knows
+/// what "remaining" means. Kept as a function over the output string so the job
+/// runners keep their existing signatures.
+pub fn summarize(kind: &str, output: &str) -> JobReport {
+    const DIFF_MARKER: &str = "--- proposed diff ---";
+    match kind {
+        "code" => {
+            let (summary, diff) = match output.split_once(DIFF_MARKER) {
+                Some((s, d)) => (s.trim(), Some(d.trim())),
+                None => (output.trim(), None),
+            };
+            let did = clip(first_lines(summary, 2), 400);
+            match diff {
+                // The whole point: a code job PROPOSES. The worktree is gone and
+                // the live tree is untouched, so "applied" is never implied.
+                Some(d) if !d.is_empty() => JobReport {
+                    did,
+                    remaining: Some(format!(
+                        "the diff is a proposal — nothing was applied to your tree ({} changed line(s) to review)",
+                        d.lines()
+                            .filter(|l| {
+                                // `+++ b/file` and `--- a/file` are HEADERS, not
+                                // changes — counting them inflated every report
+                                // by two per touched file.
+                                !l.starts_with("+++")
+                                    && !l.starts_with("---")
+                                    && (l.starts_with('+') || l.starts_with('-'))
+                            })
+                            .count()
+                    )),
+                },
+                // Success with no diff shouldn't happen (the job fails on an empty
+                // diff), but if it does, say so rather than implying a change.
+                _ => JobReport {
+                    did,
+                    remaining: Some("no diff was produced — nothing to apply".into()),
+                },
+            }
+        }
+        _ => JobReport { did: clip(first_lines(output.trim(), 2), 400), remaining: None },
+    }
+}
+
+/// Char-safe truncation (this module has no `clip` of its own).
+fn clip(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s;
+    }
+    s.chars().take(max).collect::<String>() + "…"
+}
+
+fn first_lines(s: &str, n: usize) -> String {
+    s.lines().filter(|l| !l.trim().is_empty()).take(n).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// A successful code job must never read as "the change landed". It produced a
+    /// diff in a worktree that was then destroyed; the owner still has to apply it.
+    #[test]
+    fn a_code_job_reports_the_diff_as_unapplied() {
+        let out = "Added retry to the fetch path.\nCovered by a new unit test.\n\n\
+                   --- proposed diff ---\n\
+                   --- a/src/lib.rs\n+++ b/src/lib.rs\n+    retry(3);\n-    once();\n";
+        let r = summarize("code", out);
+        assert!(r.did.contains("Added retry"));
+        let remaining = r.remaining.clone().expect("a proposal is always outstanding");
+        assert!(remaining.contains("nothing was applied"), "{remaining}");
+        // Counts changed lines, not the +++/--- file headers.
+        assert!(remaining.contains("2 changed line"), "{remaining}");
+
+        let rendered = r.render();
+        assert!(rendered.contains("⏭ Remaining:"), "the split must be visible");
+    }
+
+    #[test]
+    fn success_without_a_diff_says_so_instead_of_implying_a_change() {
+        let r = summarize("code", "Investigated; no edit was necessary.");
+        assert_eq!(
+            r.remaining.as_deref(),
+            Some("no diff was produced — nothing to apply")
+        );
+    }
+
+    #[test]
+    fn other_kinds_have_nothing_outstanding_and_say_None_not_unknown() {
+        let r = summarize("something-else", "delivered the thing\nand tidied up");
+        assert_eq!(r.remaining, None, "None means nothing outstanding, not unknown");
+        assert_eq!(r.did, "delivered the thing and tidied up");
+        assert_eq!(r.render(), r.did, "no Remaining line when there is nothing to say");
+    }
+
+    #[test]
+    fn a_long_summary_is_clipped_but_the_remaining_line_survives() {
+        let long = "x".repeat(5_000);
+        let out = format!("{long}\n\n--- proposed diff ---\n+one\n");
+        let r = summarize("code", &out);
+        // clip() bounds CHARS and appends an ellipsis; assert in the same unit it
+        // works in rather than in bytes.
+        assert!(r.did.chars().count() <= 401, "did is clipped to something sendable");
+        assert!(
+            r.render().contains("⏭ Remaining:"),
+            "clipping must never eat the outstanding-work line"
+        );
     }
 }

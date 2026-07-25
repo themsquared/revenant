@@ -88,7 +88,9 @@ async fn check_once(
                 .sum()
         }
         Unit::Tokens => {
-            let (tin, tout) = store.spend_today().await?;
+            // Metered rows only — see spend_today_metered. A subscription run must
+            // not inflate a budget denominated in money-proxy tokens.
+            let (tin, tout) = store.spend_today_metered().await?;
             (tin + tout) as f64
         }
     };
