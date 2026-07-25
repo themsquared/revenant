@@ -919,6 +919,27 @@ impl Store {
     }
 
     /// Total tokens spent today (UTC), for the chat footer.
+    /// Today's tokens EXCLUDING subscription-metered rows.
+    ///
+    /// The token-denominated daily budget is a proxy for money. Subscription rows
+    /// carry no marginal money (flat fee, already paid), so counting them would
+    /// fire budget alerts for spend that never happened — the exact bug that would
+    /// have appeared on the first metered `claude -p` run. `sub:` is the label
+    /// prefix from revenant_core::subscription; the LIKE keeps this a pure SQL
+    /// concern rather than pulling that crate into the store.
+    pub async fn spend_today_metered(&self) -> Result<(i64, i64)> {
+        self.with(|conn| {
+            let day_start = unix_now() - (unix_now() % 86_400);
+            conn.query_row(
+                "SELECT COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0)
+                 FROM spend_ledger WHERE at >= ?1 AND model NOT LIKE 'sub:%'",
+                [day_start],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .await
+    }
+
     pub async fn spend_today(&self) -> Result<(i64, i64)> {
         self.with(|conn| {
             let day_start = unix_now() - (unix_now() % 86_400);
