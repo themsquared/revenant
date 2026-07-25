@@ -73,7 +73,11 @@ impl LoopScheduler {
             let day_ago = now - 86_400;
             let today = store.loop_runs_since(&lp.id, day_ago).await.unwrap_or(0);
             if today >= lp.max_per_day {
-                tracing::warn!("loop {} hit its {}/day cap; skipping", lp.name, lp.max_per_day);
+                tracing::warn!(
+                    "loop {} hit its {}/day cap; skipping",
+                    lp.name,
+                    lp.max_per_day
+                );
                 continue;
             }
 
@@ -108,7 +112,10 @@ impl LoopScheduler {
             Ok(id) => id,
             Err(err) => {
                 tracing::error!("loop {} session failed: {err:#}", lp.name);
-                let _ = runtime.store.loop_run_finish(run_id, "error", 0, 0, &format!("{err:#}")).await;
+                let _ = runtime
+                    .store
+                    .loop_run_finish(run_id, "error", 0, 0, &format!("{err:#}"))
+                    .await;
                 return;
             }
         };
@@ -117,10 +124,19 @@ impl LoopScheduler {
         let mut rx = runtime.events.subscribe();
         if let Err(err) = self
             .manager
-            .submit(session_id, SessionMsg::UserInput { content: lp.prompt.clone(), tier })
+            .submit(
+                session_id,
+                SessionMsg::UserInput {
+                    content: lp.prompt.clone(),
+                    tier,
+                },
+            )
             .await
         {
-            let _ = runtime.store.loop_run_finish(run_id, "error", 0, 0, &format!("{err:#}")).await;
+            let _ = runtime
+                .store
+                .loop_run_finish(run_id, "error", 0, 0, &format!("{err:#}"))
+                .await;
             return;
         }
 
@@ -128,12 +144,19 @@ impl LoopScheduler {
         let outcome = tokio::time::timeout(Duration::from_secs(300), async {
             loop {
                 match rx.recv().await {
-                    Ok(Event::TurnCompleted { session_id: s, text, input_tokens, output_tokens, .. })
-                        if s == session_id =>
-                    {
+                    Ok(Event::TurnCompleted {
+                        session_id: s,
+                        text,
+                        input_tokens,
+                        output_tokens,
+                        ..
+                    }) if s == session_id => {
                         return Some(("ok", text, input_tokens as i64, output_tokens as i64));
                     }
-                    Ok(Event::TurnFailed { session_id: s, error }) if s == session_id => {
+                    Ok(Event::TurnFailed {
+                        session_id: s,
+                        error,
+                    }) if s == session_id => {
                         return Some(("error", error, 0, 0));
                     }
                     Ok(_) => continue,
@@ -234,8 +257,16 @@ impl LoopScheduler {
 /// (case, wrapping, whitespace) do not read as news.
 fn fingerprint(text: &str) -> String {
     use sha2::{Digest, Sha256};
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    Sha256::digest(normalized.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
+    let normalized = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    Sha256::digest(normalized.as_bytes())
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn unix_now() -> i64 {
@@ -289,7 +320,10 @@ mod novelty_tests {
     fn cosmetic_differences_are_not_news() {
         // Wrapping, indentation and case must not read as new information —
         // otherwise a loop never backs off and the signal is useless.
-        assert_eq!(fingerprint("All systems healthy"), fingerprint("all   systems\nhealthy"));
+        assert_eq!(
+            fingerprint("All systems healthy"),
+            fingerprint("all   systems\nhealthy")
+        );
         assert_eq!(fingerprint("  A B  "), fingerprint("a\tb"));
     }
 
@@ -304,7 +338,11 @@ mod novelty_tests {
     #[test]
     fn fingerprint_is_stable_and_bounded() {
         let a = fingerprint("the horde rises");
-        assert_eq!(a, fingerprint("the horde rises"), "must be deterministic across calls");
+        assert_eq!(
+            a,
+            fingerprint("the horde rises"),
+            "must be deterministic across calls"
+        );
         assert_eq!(a.len(), 32, "16 bytes hex — short enough to store per loop");
     }
 }

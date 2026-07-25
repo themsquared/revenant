@@ -429,9 +429,16 @@ mod elicit_tests {
     /// The two paths must not be able to resolve each other: a boolean approve
     /// cannot satisfy a waiting elicitation, and an answer cannot approve a
     /// waiting capability request.
+    /// TTLs here are seconds, not milliseconds, and that is load-bearing. The
+    /// first version used 400ms — SHORTER than `await_pending`'s poll window — so
+    /// on a loaded box the request timed out and left the pending set before the
+    /// test could read its id, and `await_pending` panicked. My first fix
+    /// addressed the wrong race (insert visibility) and CI caught the real one
+    /// (expiry beating the poll). Both halves end by TTL on purpose, so this test
+    /// takes a few seconds; determinism is worth more than the seconds.
     #[tokio::test]
     async fn the_two_paths_cannot_cross_resolve() {
-        let (broker, store) = new_broker("cross", Duration::from_millis(400));
+        let (broker, store) = new_broker("cross", Duration::from_secs(3));
 
         // A waiting elicitation, resolved via the boolean approval path.
         let b = broker.clone();
@@ -449,7 +456,7 @@ mod elicit_tests {
         );
 
         // A waiting capability approval, resolved via the answer path.
-        let (broker, store) = new_broker("cross2", Duration::from_millis(400));
+        let (broker, store) = new_broker("cross2", Duration::from_secs(3));
         let b = broker.clone();
         let req = tokio::spawn(async move { b.request(3, "exec", "rm -rf /", serde_json::json!({})).await });
         let id = await_pending(&store).await;

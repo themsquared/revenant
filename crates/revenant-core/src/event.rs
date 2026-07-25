@@ -158,6 +158,17 @@ pub enum Event {
         ok: bool,
         detail: String,
     },
+    /// A long-running job is STILL WORKING. Emitted on a backing-off cadence
+    /// (not per-step), because the failure mode being fixed is silence: a job that
+    /// runs for forty minutes with no word is indistinguishable from one that hung
+    /// or died. `elapsed_secs` is what makes it useful at a glance — "still going,
+    /// 12m in" answers the actual question.
+    JobProgress {
+        id: i64,
+        label: String,
+        note: String,
+        elapsed_secs: i64,
+    },
     /// An MCP server asked, mid-tool-call, for a value only the owner can supply
     /// (spec 2025-06-18 elicitation). `source` names the server doing the asking
     /// — surfaces MUST show it, because "something wants your API key" cannot be
