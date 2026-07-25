@@ -192,6 +192,23 @@ impl TelegramClient {
         Ok(msg.message_id)
     }
 
+    /// Report an available update with a single explicit Install control.
+    pub async fn send_update_offer(&self, chat_id: i64, text: &str) -> Result<i64> {
+        let msg: Message = self
+            .call(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_markup": { "inline_keyboard": [[
+                        { "text": "⬆️ Install now", "callback_data": "upd:install" },
+                    ]]},
+                }),
+            )
+            .await?;
+        Ok(msg.message_id)
+    }
+
     /// Ask the owner for a VALUE. `force_reply` makes Telegram open the reply
     /// composer pre-targeted at this message, so the answer comes back bound to
     /// the request — and a Decline button means refusing is one tap rather than
@@ -377,11 +394,47 @@ impl TelegramChannel {
             }
         }
 
+        // /update — report what a new release would be, and offer to take it.
+        // Check is read-only; INSTALLING replaces the binary on the host, so it
+        // needs a deliberate tap rather than happening on a typed command.
+        if text == "/update" {
+            if !allowed {
+                let _ = self
+                    .client
+                    .send_message(chat_id, "Pair first: /pair <code>")
+                    .await;
+                return;
+            }
+            let _ = self.client.send_message(chat_id, "Checking for a new release…").await;
+            match run_self("--check").await {
+                Ok(report) => {
+                    let available = report.contains("update available");
+                    let body = format!("🔎 Update check\n\n{}", clip_tg(&report));
+                    if available {
+                        let _ = self
+                            .client
+                            .send_update_offer(chat_id, &body)
+                            .await;
+                    } else {
+                        let _ = self.client.send_message(chat_id, &body).await;
+                    }
+                }
+                Err(err) => {
+                    let _ = self
+                        .client
+                        .send_message(chat_id, &format!("Couldn't check: {err:#}"))
+                        .await;
+                }
+            }
+            return;
+        }
+
         // /help and /start work in any state so commands are discoverable.
         if text == "/help" || text == "/start" {
             let msg = if allowed {
                 "Commands:\n\
                  /stop — stop the turn I'm running\n\
+                 /update — check for a new release, and install it if you want\n\
                  /persona <name|off> — switch my voice (no name lists them)\n\
                  /help — this list\n\n\
                  Otherwise just talk to me — I stream replies as I go, and you can send more mid-turn to steer or queue it."
@@ -478,6 +531,38 @@ impl TelegramChannel {
             .as_ref()
             .map(|m| m.chat.id.to_string())
             .unwrap_or_default();
+
+        // upd:install — take the release we just reported. Paired only: this
+        // replaces the binary running on the host.
+        if data == "upd:install" {
+            if !runtime.store.peer_allowed(CHANNEL, &cb_peer).await.unwrap_or(false) {
+                self.client.answer_callback(&cb.id, "not paired").await;
+                return;
+            }
+            self.client.answer_callback(&cb.id, "installing…").await;
+            let chat = cb.message.as_ref().map(|m| m.chat.id).unwrap_or_default();
+            match run_self("").await {
+                Ok(report) => {
+                    let _ = self
+                        .client
+                        .send_message(
+                            chat,
+                            &format!(
+                                "⬆️ Update run\n\n{}\n\nUnder a service manager I restart                                  into it automatically; otherwise restart to apply.",
+                                clip_tg(&report)
+                            ),
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    let _ = self
+                        .client
+                        .send_message(chat, &format!("Update failed: {err:#}"))
+                        .await;
+                }
+            }
+            return;
+        }
 
         // eli:<elicitation_id>:n — decline without typing anything.
         if let Some(rest) = data.strip_prefix("eli:") {
@@ -956,6 +1041,51 @@ fn split_message(text: &str, max: usize) -> Vec<String> {
     flush(&mut cur, &mut parts);
     parts
 }
+
+/// Run THIS binary's own `update` subcommand and return its output.
+///
+/// Deliberately shells out to the real updater rather than reimplementing it
+/// here: the update path knows about install locations, channel selection and
+/// the service's binary, and duplicating that logic in the chat adapter would
+/// mean two versions of the trickiest code in the tree drifting apart. `arg` is
+/// "--check" for a read-only probe or "" to actually install.
+///
+/// `current_exe` is the binary the daemon is running, so /update always probes
+/// the same install the owner is talking to.
+async fn run_self(arg: &str) -> Result<String> {
+    let exe = std::env::current_exe().context("locating my own binary")?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("update");
+    if !arg.is_empty() {
+        cmd.arg(arg);
+    }
+    let out = tokio::time::timeout(Duration::from_secs(300), cmd.output())
+        .await
+        .context("update timed out after 5 minutes")?
+        .context("running my own update")?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        // Surface stderr: an updater failure the owner cannot see is worse than
+        // no /update at all.
+        bail!(
+            "{}",
+            if stderr.is_empty() { stdout } else { stderr }
+        );
+    }
+    Ok(if stdout.is_empty() { "(no output)".to_string() } else { stdout })
+}
+
+/// Clip to something Telegram will accept, leaving room for our own framing.
+fn clip_tg(s: &str) -> String {
+    const ROOM: usize = 3_000;
+    if s.chars().count() <= ROOM {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(ROOM).collect();
+    format!("{kept}\n…(clipped)")
+}
+
 
 #[cfg(test)]
 mod tests {
