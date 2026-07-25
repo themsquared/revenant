@@ -574,6 +574,7 @@ async fn events(
                 revenant_core::Event::SelfReviewCompleted { .. } => "self_review_completed",
                 revenant_core::Event::JobFinished { .. } => "job_finished",
                 revenant_core::Event::SendMedia { .. } => "send_media",
+                revenant_core::Event::ElicitationRequested { .. } => "elicitation_requested",
             };
             Some(Ok(SseEvent::default()
                 .id(id.to_string())
@@ -719,12 +720,24 @@ async fn approvals_pending(
 
 #[derive(Deserialize)]
 struct DecisionBody {
-    approve: bool,
+    /// Permission answer. Optional ONLY so an elicitation can be answered with
+    /// `answer` alone; a request carrying neither field resolves nothing.
+    #[serde(default)]
+    approve: Option<bool>,
     #[serde(default)]
     resolver: Option<String>,
     /// Approve every request of this kind for the session (task-level grant).
     #[serde(default)]
     grant: bool,
+    /// The owner's typed reply to an ELICITATION (a server asked for a value).
+    /// Present = accept with this content; `""`/whitespace or explicit
+    /// `answer: null` with `declined: true` = decline. Never combined with
+    /// `approve` — see below.
+    #[serde(default)]
+    answer: Option<String>,
+    /// Explicitly decline an elicitation without supplying any value.
+    #[serde(default)]
+    declined: bool,
 }
 
 async fn approval_decide(
@@ -733,12 +746,29 @@ async fn approval_decide(
     Json(body): Json<DecisionBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let resolver = body.resolver.unwrap_or_else(|| "api".to_string());
-    let applied = state
-        .manager
-        .runtime()
-        .approvals
-        .resolve_scoped(&id, body.approve, body.grant, &resolver)
-        .await?;
+    let approvals = &state.manager.runtime().approvals;
+
+    // Elicitation and permission are separate paths on purpose (see
+    // revenant-security): a typed answer must never be readable as consent, so
+    // a body may drive one or the other, never both.
+    if body.answer.is_some() || body.declined {
+        if body.approve.is_some() {
+            return Err(ApiError::bad_request(
+                "send either `approve` (permission) or `answer`/`declined` (elicitation), not both",
+            ));
+        }
+        let applied = approvals
+            .resolve_elicitation(&id, body.answer.as_deref(), &resolver)
+            .await?;
+        return Ok(Json(json!({ "applied": applied })));
+    }
+
+    let Some(approve) = body.approve else {
+        return Err(ApiError::bad_request(
+            "missing `approve` (permission) or `answer`/`declined` (elicitation)",
+        ));
+    };
+    let applied = approvals.resolve_scoped(&id, approve, body.grant, &resolver).await?;
     Ok(Json(json!({ "applied": applied })))
 }
 

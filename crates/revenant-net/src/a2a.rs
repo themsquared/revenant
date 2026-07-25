@@ -18,7 +18,7 @@
 //! preimage byte-identical on both ends — no canonicalization to disagree on.
 
 use crate::identity::{verify_hex, Identity};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 
 pub const HDR_AGENT: &str = "x-rev-agent";
 pub const HDR_TS: &str = "x-rev-ts";
@@ -28,8 +28,11 @@ pub const HDR_SIG: &str = "x-rev-sig";
 /// How far an envelope timestamp may drift from the receiver's clock.
 pub const A2A_FRESHNESS_SECS: i64 = 300;
 
-fn preimage(body: &[u8], ts: i64, nonce: &str) -> Vec<u8> {
-    let mut h = Sha256::new();
+/// Domain tag: binds a signature to the A2A envelope and no other record.
+const DOMAIN_A2A: &[u8] = b"rev-a2a-envelope-v1";
+
+fn preimage(domain: Option<&[u8]>, body: &[u8], ts: i64, nonce: &str) -> Vec<u8> {
+    let mut h = crate::identity::preimage_hasher(domain);
     h.update(body);
     h.update([0]);
     h.update(ts.to_le_bytes());
@@ -40,13 +43,17 @@ fn preimage(body: &[u8], ts: i64, nonce: &str) -> Vec<u8> {
 
 /// Sign a request body for A2A. Returns the signature hex for `x-rev-sig`.
 pub fn sign(id_key: &Identity, body: &[u8], ts: i64, nonce: &str) -> String {
-    id_key.sign_hex(&preimage(body, ts, nonce))
+    id_key.sign_hex(&preimage(Some(DOMAIN_A2A), body, ts, nonce))
 }
 
 /// Verify an envelope: is `sig` a valid signature by `agent` over exactly this
 /// body + ts + nonce? Freshness and nonce reuse are the receiver's checks.
 pub fn verify(agent: &str, body: &[u8], ts: i64, nonce: &str, sig: &str) -> bool {
-    verify_hex(agent, &preimage(body, ts, nonce), sig)
+    // Domain-tagged first; untagged accepted only for peers that have not yet
+    // upgraded (see the phase-2 note in horde.rs).
+    [Some(DOMAIN_A2A), None]
+        .into_iter()
+        .any(|domain| verify_hex(agent, &preimage(domain, body, ts, nonce), sig))
 }
 
 #[cfg(test)]

@@ -1,0 +1,119 @@
+name: ci
+
+# Build + test gate for pull requests and main. Deliberately hermetic: no
+# secrets, no network-dependent tests, no model downloads. The release
+# pipeline (release.yml / main-prerelease.yml) handles cross-compilation and
+# packaging; this workflow only answers "does the workspace build and pass".
+#
+# Toolchain/cache setup mirrors build-release.yml so both pipelines resolve the
+# same stable toolchain (pinned by rust-toolchain.toml) and share cache shape.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight run on the same ref. main is excluded
+# from cancellation so every landed commit keeps a durable green/red signal.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # web/dist is committed on purpose (see .gitignore) so rust-embed in
+      # revenant-control bakes in a working UI without a Node/Vite toolchain.
+      # Fail loudly here rather than inside a confusing rust-embed error.
+      - name: Check embedded web assets are present
+        run: test -f web/dist/index.html
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-build-test
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # The workspace run above compiles and executes the asset-gated tests,
+      # but they self-skip when the potion-retrieval-32M embedding model is
+      # absent — and CI never downloads it. A silent skip is indistinguishable
+      # from a clean pass, so re-run just those tests with output visible and
+      # account for every skip: all three must skip, or none (model present).
+      # Anything in between means the gate drifted and needs a human look.
+      - name: Audit asset-gated tests
+        run: |
+          set -euo pipefail
+          EXPECTED_GATED=3
+          GATED_TESTS="retrieval_accuracy_and_latency multi_hop_retrieval apply_extraction_end_to_end"
+
+          cargo test --locked -p revenant-memory \
+            --test eval --test consolidate -- --nocapture 2>&1 | tee gated.log
+
+          # Each gated test must have actually run and passed. This is what
+          # catches a test that stopped asserting or failed to compile in.
+          for t in $GATED_TESTS; do
+            if ! grep -q "test ${t} \.\.\. ok" gated.log; then
+              echo "::error::asset-gated test '${t}' did not run and pass — expected it in the revenant-memory suite"
+              exit 1
+            fi
+          done
+
+          skips=$(grep -c 'SKIP: builtin embedding model not downloaded' gated.log || true)
+
+          if [ "$skips" -eq 0 ]; then
+            echo "### Asset-gated tests: executed for real" >> "$GITHUB_STEP_SUMMARY"
+            echo "Embedding model was available; all $EXPECTED_GATED tests ran their assertions." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$skips" -eq "$EXPECTED_GATED" ]; then
+            echo "::warning::$EXPECTED_GATED asset-gated tests skipped — potion-retrieval-32M not present (expected in CI; retrieval accuracy is NOT covered by this run)"
+            {
+              echo "### Asset-gated tests: skipped (expected)"
+              echo "All \`$EXPECTED_GATED\` embedding-model tests skipped because potion-retrieval-32M is not downloaded in CI."
+              echo "They compiled and ran to their skip guard. Retrieval accuracy/latency is **not** verified by this run —"
+              echo "run locally with the model present, or set \`REVENANT_TEST_MODEL_DIR\`, to exercise them."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::expected 0 or $EXPECTED_GATED asset-gated skips, saw $skips — the model gate drifted. Reconcile GATED_TESTS/EXPECTED_GATED in .github/workflows/ci.yml with crates/revenant-memory/tests/."
+            exit 1
+          fi
+
+  # Separate job so it runs in parallel with build-test (clippy rebuilds with
+  # its own driver metadata anyway, so sharing a job would not save work).
+  #
+  # No `-D warnings`: the tree currently carries a small backlog of clippy
+  # warnings, and failing on them would make this gate red on arrival. This
+  # still fails the build on deny-by-default clippy lints and hard errors.
+  # Tighten to `-D warnings` once the existing warnings are cleared.
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check embedded web assets are present
+        run: test -f web/dist/index.html
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-clippy
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked

@@ -1,5 +1,6 @@
 //! revenant-core: domain types and configuration. Zero I/O beyond path resolution.
 
+pub mod budget;
 pub mod config;
 pub mod event;
 pub mod home;

@@ -10,6 +10,9 @@ use std::collections::HashMap;
 
 const RRF_K: f32 = 60.0;
 const LEG_TAKE: usize = 32;
+/// Max facts the graph leg will emit for any single entity, so its 32 slots
+/// cover ~16 entities instead of being exhausted by the 2-3 nearest ones.
+const MAX_FACTS_PER_ENTITY: usize = 3;
 /// A result must rank in the top-N of at least one leg to be injectable.
 const FLOOR_RANK: usize = 24;
 pub const LEG_FTS: u8 = 1;
@@ -144,25 +147,41 @@ impl MemoryEngine {
         // ties WITHIN an entity so "where does Alex work" prefers the work
         // fact among all Alex facts.
         let facts = self.fact_subjects.read().unwrap();
-        let mut scored: Vec<(&String, f32, f32)> = facts
+        let mut scored: Vec<(&String, i64, f32, f32)> = facts
             .iter()
             .filter_map(|(uid, subject)| {
-                subject.and_then(|s| ranks.get(&s)).map(|score| {
-                    (uid, *score, fact_sims.get(uid).copied().unwrap_or(0.0))
-                })
+                subject.and_then(|s| ranks.get(&s).map(|score| {
+                    (uid, s, *score, fact_sims.get(uid).copied().unwrap_or(0.0))
+                }))
             })
-            .filter(|(_, score, _)| *score > 0.0)
+            .filter(|(_, _, score, _)| *score > 0.0)
             .collect();
         scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
+            b.2.partial_cmp(&a.2)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
         });
-        Ok(scored
-            .into_iter()
-            .take(LEG_TAKE)
-            .map(|(uid, ..)| ItemKey::Fact(uid.clone()))
-            .collect())
+        // Diversity cap: at most MAX_FACTS_PER_ENTITY from any one entity.
+        // Without this the leg emits strict entity-rank order, so a near seed
+        // with many facts consumes the whole budget and an entity a few hops
+        // out — exactly what a multi-hop question is asking about — can never
+        // appear, however well the traversal ranked it. Capping trades a near
+        // entity's 3rd-best fact for a distant entity's best one, which is the
+        // trade multi-hop retrieval wants.
+        let mut per_entity: HashMap<i64, usize> = HashMap::new();
+        let mut out = Vec::with_capacity(LEG_TAKE);
+        for (uid, subject, ..) in scored {
+            let seen = per_entity.entry(subject).or_insert(0);
+            if *seen >= MAX_FACTS_PER_ENTITY {
+                continue;
+            }
+            *seen += 1;
+            out.push(ItemKey::Fact(uid.clone()));
+            if out.len() >= LEG_TAKE {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Resolve keys into Memory items with text + provenance.
