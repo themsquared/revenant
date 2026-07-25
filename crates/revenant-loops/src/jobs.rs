@@ -203,7 +203,11 @@ impl JobRunner {
 
         // Do the work. Capture the diff regardless of how it goes, then clean up.
         let coded = self.manager.runtime().code_once(&wt, &p.task, tier).await;
-        let diff = git(&wt, &["diff"]).unwrap_or_default();
+        // Stage everything first so brand-new untracked files the coder created
+        // are captured too — a plain `git diff` omits untracked files, which made
+        // real new files (e.g. Kalshi integration attempts) look like no-ops.
+        let _ = git(&wt, &["add", "-A"]);
+        let diff = git(&wt, &["diff", "--cached"]).unwrap_or_default();
         let _ = git(root, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
         let _ = git(root, &["branch", "-D", &branch]);
         let _ = std::fs::remove_dir_all(&wt); // belt-and-suspenders

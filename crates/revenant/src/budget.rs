@@ -73,6 +73,12 @@ async fn check_once(
         Unit::Usd => {
             let rows = store.spend_since(day_start).await?;
             rows.iter()
+                // Subscription-metered rows carry no marginal cost — the fee is
+                // flat and already paid — so pricing them would invent charges.
+                // Today no pricing key could match a `sub:` label anyway; this
+                // makes the exclusion an enforced invariant rather than an
+                // accident of naming that a stray [pricing] entry could undo.
+                .filter(|r| !revenant_core::subscription::is_subscription_label(&r.model))
                 .filter_map(|r| {
                     cfg.pricing.get(&r.model).map(|p| {
                         r.tokens_in as f64 / 1e6 * p.input_per_mtok
