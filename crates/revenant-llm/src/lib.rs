@@ -411,3 +411,114 @@ mod humanize_tests {
         assert!(humanize_gateway_error(500, "boom").contains("Provider error 500"));
     }
 }
+
+/// Why a provider request failed, when the status code alone is not enough.
+///
+/// Exists because of a real outage: credit exhaustion arrives as
+/// `HTTP 400 invalid_request_error` — the same status a malformed request
+/// returns. Verified against the live API:
+///
+/// ```text
+/// HTTP 400
+/// {"type":"error","error":{"type":"invalid_request_error",
+///  "message":"Your credit balance is too low to access the Anthropic API..."}}
+/// ```
+///
+/// The gateway cannot act on this. Its failover evicts a target by STATUS code,
+/// and adding 400 there would evict a healthy provider for 60s whenever we send a
+/// bad request — trading a narrow outage for a broad one. Only here, where the
+/// body is readable, can "out of money" be distinguished from "bad parameter".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFailure {
+    /// The account cannot pay: no credit, quota exhausted, billing suspended.
+    /// Retrying this provider is futile until a human acts; another provider may
+    /// well work.
+    ProviderExhausted,
+    /// Transient — worth retrying the same provider.
+    Transient,
+    /// Our fault: malformed request, bad model id, wrong parameters. Retrying
+    /// anywhere is futile and MUST NOT evict a provider.
+    OurRequest,
+    /// Unclassified.
+    Unknown,
+}
+
+/// Classify a failed provider response from its status and body.
+///
+/// Body first, status second — that ordering is the whole point, since the status
+/// is ambiguous for exactly the case that matters.
+pub fn classify_failure(status: u16, body: &str) -> RequestFailure {
+    let b = body.to_lowercase();
+    let mentions = |needles: &[&str]| needles.iter().any(|n| b.contains(n));
+
+    // Billing/quota language, whatever the status. Anthropic sends 400,
+    // Moonshot sends 429 with "insufficient balance", others use 402.
+    if mentions(&[
+        "credit balance is too low",
+        "insufficient balance",
+        "insufficient_quota",
+        "exceeded_current_quota",
+        "billing",
+        "plans & billing",
+        "payment required",
+        "purchase credits",
+        "out of credit",
+    ]) {
+        return RequestFailure::ProviderExhausted;
+    }
+    match status {
+        402 => RequestFailure::ProviderExhausted,
+        429 | 500..=599 => RequestFailure::Transient,
+        // A 400 that is NOT billing is our own bad request. Saying so keeps a
+        // healthy provider from being blamed for our bug.
+        400 | 422 => RequestFailure::OurRequest,
+        _ => RequestFailure::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    /// The outage that prompted this: a 400 whose BODY says the account is out of
+    /// money. Status alone would classify it as our bug and blame the wrong thing.
+    #[test]
+    fn a_billing_400_is_exhaustion_not_a_bad_request() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+        assert_eq!(classify_failure(400, body), RequestFailure::ProviderExhausted);
+    }
+
+    /// Moonshot signals the same condition as a 429 — which the status-only path
+    /// would call transient and retry forever against a dead account.
+    #[test]
+    fn moonshot_suspension_is_exhaustion_not_transient() {
+        let body = r#"{"error":{"message":"Your account org-x is suspended due to insufficient balance","type":"exceeded_current_quota_error"}}"#;
+        assert_eq!(classify_failure(429, body), RequestFailure::ProviderExhausted);
+    }
+
+    /// The distinction that protects healthy providers: a plain 400 is OUR bug,
+    /// and must never be read as the provider being broken.
+    #[test]
+    fn a_non_billing_400_is_our_fault_and_blames_nobody_else() {
+        for body in [
+            r#"{"error":{"message":"max_tokens: must be greater than 0"}}"#,
+            r#"{"error":{"message":"model: unknown model 'claude-nope'"}}"#,
+            "",
+        ] {
+            assert_eq!(
+                classify_failure(400, body),
+                RequestFailure::OurRequest,
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_transients_stay_retryable() {
+        assert_eq!(classify_failure(500, "internal error"), RequestFailure::Transient);
+        assert_eq!(classify_failure(529, "overloaded"), RequestFailure::Transient);
+        assert_eq!(classify_failure(429, "rate limit exceeded"), RequestFailure::Transient);
+        // 402 is unambiguous even with an empty body.
+        assert_eq!(classify_failure(402, ""), RequestFailure::ProviderExhausted);
+    }
+}

@@ -86,8 +86,23 @@ pub fn render_gateway_yaml(
                     model.as_object_mut().unwrap().insert(
                         "health".into(),
                         json!({
+                            // 402 = payment required, 529 = provider overloaded
+                            // (Anthropic's own code). Both mean "this target is
+                            // unusable right now", which is exactly what eviction
+                            // is for.
+                            //
+                            // 400 is deliberately ABSENT. Credit exhaustion
+                            // arrives as 400 invalid_request_error (verified
+                            // against the live API), so adding it here WOULD fix
+                            // billing failover — but 400 is also what a genuinely
+                            // malformed request returns, and evicting a healthy
+                            // provider for 60s because of our own bad request
+                            // trades a narrow outage for a broad one. That case is
+                            // classified agent-side instead, where the response
+                            // BODY is readable and "credit balance" can be told
+                            // apart from "bad parameter".
                             "unhealthyExpression":
-                                "response.code >= 500 || response.code == 429 || response.code == 401 || response.code == 403 || response.code == 404",
+                                "response.code >= 500 || response.code == 529 || response.code == 429 || response.code == 402 || response.code == 401 || response.code == 403 || response.code == 404",
                             "eviction": { "duration": "60s" },
                         }),
                     );
