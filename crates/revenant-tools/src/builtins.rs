@@ -361,6 +361,40 @@ struct ListDir {
     jail: Jail,
 }
 
+/// Kill an entire process group, TERM then KILL.
+///
+/// Signalling a negative pid targets the group, which is the only way to reach
+/// grandchildren a timed-out command left behind. Shelling out to `/bin/kill`
+/// rather than taking a libc dependency for two signals; a failure here is
+/// reported, never silent, because a leaked process tree that nobody mentions is
+/// exactly how this bug survived in the first place.
+#[cfg(unix)]
+fn reap_group(pgid: Option<u32>) -> bool {
+    let Some(pgid) = pgid else { return false };
+    let group = format!("-{pgid}");
+    // Politely first, so a process with a cleanup handler gets to run it.
+    let termed = std::process::Command::new("/bin/kill")
+        .args(["-TERM", "--", &group])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    std::thread::sleep(Duration::from_millis(250));
+    let killed = std::process::Command::new("/bin/kill")
+        .args(["-KILL", "--", &group])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !termed && !killed {
+        tracing::warn!("exec: could not reap process group {pgid} — may have leaked");
+    }
+    termed || killed
+}
+
+#[cfg(not(unix))]
+fn reap_group(_pgid: Option<u32>) -> bool {
+    false
+}
+
 #[async_trait::async_trait]
 impl Tool for ListDir {
     fn spec(&self) -> ToolSpec {
@@ -403,6 +437,7 @@ struct Exec {
 }
 
 #[async_trait::async_trait]
+
 impl Tool for Exec {
     fn spec(&self) -> ToolSpec {
         spec!(
@@ -427,8 +462,8 @@ impl Tool for Exec {
             Ok(c) => c,
             Err(e) => return e,
         };
-        let child = tokio::process::Command::new("/bin/sh")
-            .arg("-c")
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
             .arg(command)
             .current_dir(&self.workspace)
             .env_clear()
@@ -437,14 +472,36 @@ impl Tool for Exec {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
+            .kill_on_drop(true);
+        // Own process group, so a timeout can kill the whole TREE.
+        //
+        // `kill_on_drop` only reaps the direct child — here, `/bin/sh`. Anything
+        // the command spawned is reparented to init and keeps running. Measured:
+        // killing the shell of `sh -c '<thing that spawns>'` left 2 descendants
+        // alive. That is how orphaned `claude -p` processes survived a timed-out
+        // exec. With its own group (pgid == child pid) one signal reaches
+        // everything the command started.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let child = cmd.spawn();
         let child = match child {
             Ok(c) => c,
             Err(err) => return ToolOutput::err(format!("spawn failed: {err}")),
         };
-        match tokio::time::timeout(Duration::from_secs(60), child.wait_with_output()).await {
-            Err(_) => ToolOutput::err("command timed out after 60s (killed)".to_string()),
+        // Captured BEFORE the wait consumes the child; it is also the pgid.
+        let pgid = child.id();
+        let waited = {
+            let fut = child.wait_with_output();
+            tokio::time::timeout(Duration::from_secs(60), fut).await
+        };
+        match waited {
+            Err(_) => {
+                let reaped = reap_group(pgid);
+                ToolOutput::err(format!(
+                    "command timed out after 60s (killed{})",
+                    if reaped { " — process group reaped" } else { "" }
+                ))
+            }
             Ok(Err(err)) => ToolOutput::err(format!("exec error: {err}")),
             Ok(Ok(output)) => {
                 let mut text = String::new();
@@ -3092,5 +3149,76 @@ mod mtls_tests {
                 || format!("{err:?}").contains("does not match the pinned"),
             "wrong pin must fail closed at the handshake: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod reap_tests {
+    /// The bug, reproduced and then closed.
+    ///
+    /// `kill_on_drop` reaps only the direct child (`/bin/sh`). Anything the
+    /// command spawned is reparented and survives — measured at 2 stray
+    /// processes when killing the shell of `sh -c '<thing that spawns>'`, which
+    /// is how orphaned `claude -p` processes outlived a timed-out exec.
+    ///
+    /// This spawns the same shape the exec tool does, in its own process group,
+    /// times out, reaps the GROUP, and asserts the grandchild is gone.
+    #[tokio::test]
+    async fn a_timeout_reaps_the_whole_tree_not_just_the_shell() {
+        use std::time::Duration;
+        // Unique marker so we only ever count OUR processes.
+        let marker = format!("revenant-reap-probe-{}", std::process::id());
+        // The marker must appear in each descendant's OWN argv. A shell comment
+        // (`sleep 97 #marker`) does not survive into `sleep`'s command line, so
+        // the first version of this probe could not see its own children. Each
+        // descendant is therefore a `sh -c` whose script text carries the marker.
+        let script = format!(
+            "sh -c ': {marker}; sleep 97' & sh -c ': {marker}; sleep 97'"
+        );
+
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let child = cmd.spawn().expect("spawn probe");
+        let pgid = child.id();
+
+        // Let the tree come up, then confirm descendants really exist — if they
+        // do not, the test proves nothing and must fail loudly.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(count(&marker) >= 2, "probe did not create a descendant tree (saw {})", count(&marker));
+
+        // Time out exactly as the tool does, then reap the group.
+        let fut = child.wait_with_output();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), fut).await.is_err(),
+            "probe should outlive the timeout"
+        );
+        assert!(super::reap_group(pgid), "reap_group reported failure");
+
+        // Give the signals a moment to land.
+        for _ in 0..20 {
+            if count(&marker) == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let leaked = count(&marker);
+        // Best-effort cleanup so a failure does not leave litter behind.
+        let _ = std::process::Command::new("/usr/bin/pkill").args(["-9", "-f", &marker]).status();
+        panic!("{leaked} process(es) leaked after reaping the group");
+    }
+
+    fn count(marker: &str) -> usize {
+        let out = std::process::Command::new("/usr/bin/pgrep")
+            .args(["-f", marker])
+            .output()
+            .expect("pgrep");
+        String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count()
     }
 }
