@@ -161,7 +161,11 @@ deployed=0
 for i in $(seq 1 60); do live_healthy && { deployed=1; break; }; sleep 0.5; done
 
 if [ "$deployed" = "1" ]; then
-  echo "$tag" >"$RHOME/deployed-sha"
+  # FULL sha — the idempotence check above compares against `git rev-parse
+  # HEAD` (full). Writing the short sha here made that check never match, so
+  # every 5-minute timer tick redeployed and restarted the daemon, killing
+  # every in-flight turn longer than the window.
+  git rev-parse HEAD >"$RHOME/deployed-sha"
   say "=== rollout OK: live on $tag ==="
 else
   say "live restart did NOT become healthy — ROLLING BACK"
