@@ -405,6 +405,24 @@ impl Store {
     /// True if a session row exists. Used to reject messages to unknown
     /// sessions up front (else the append fails a FK constraint mid-turn,
     /// after the client already got a 202).
+    /// Sessions whose most-recent message is from the user — a turn was
+    /// accepted but never answered. After a daemon restart these are turns
+    /// that died with the old process (deploy/crash mid-turn): without a
+    /// sweep the silence is permanent. `since` (unix secs) bounds the look-back.
+    pub async fn sessions_with_dangling_turn(&self, since: i64) -> Result<Vec<i64>> {
+        self.with(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT s.id FROM sessions s
+                 WHERE s.archived = 0 AND s.last_active >= ?1
+                   AND (SELECT m.role FROM messages m WHERE m.session_id = s.id
+                        ORDER BY m.id DESC LIMIT 1) = 'user'",
+            )?;
+            let rows = stmt.query_map([since], |row| row.get(0))?;
+            rows.collect()
+        })
+        .await
+    }
+
     pub async fn session_exists(&self, session_id: i64) -> Result<bool> {
         self.with(move |conn| {
             use rusqlite::OptionalExtension;
@@ -1413,6 +1431,36 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The never-silent rule across restarts: a session whose last message is
+    // the user's is a turn the previous process accepted and never answered.
+    #[tokio::test]
+    async fn dangling_turns_are_found_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!("rev-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir.join("d.db")).unwrap();
+
+        let answered = s.ensure_session("api", "peer-a", "chat").await.unwrap();
+        s.append_message(answered, Role::User, &[ContentBlock::text("hi")], None).await.unwrap();
+        s.append_message(answered, Role::Assistant, &[ContentBlock::text("hello")], None)
+            .await
+            .unwrap();
+
+        let dangling = s.ensure_session("api", "peer-b", "chat").await.unwrap();
+        s.append_message(dangling, Role::User, &[ContentBlock::text("do the task")], None)
+            .await
+            .unwrap();
+
+        let found = s.sessions_with_dangling_turn(0).await.unwrap();
+        assert!(found.contains(&dangling), "unanswered turn must be found");
+        assert!(!found.contains(&answered), "answered session must not be flagged");
+        // The look-back bound is respected.
+        let future = s.sessions_with_dangling_turn(i64::MAX).await.unwrap();
+        assert!(future.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // The reliability contract for durable jobs: nothing is ever silently
     // dropped, retries respect backoff + a cap, scheduled jobs wait, and a

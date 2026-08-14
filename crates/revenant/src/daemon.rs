@@ -245,6 +245,42 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
     // half of loop engineering.
     ensure_reflection_loop(&manager.runtime().store).await;
 
+    // The never-silent rule survives restarts: a session whose last word is
+    // the owner's is a turn the previous process accepted and never answered
+    // (deploy or crash mid-turn). Collect them BEFORE anything can start new
+    // turns, then report once the channels are subscribed — otherwise that
+    // silence is permanent and the owner never learns the task died.
+    {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            - 48 * 3600;
+        match manager.runtime().store.sessions_with_dangling_turn(since).await {
+            Ok(dangling) if !dangling.is_empty() => {
+                let events = manager.runtime().events.clone();
+                tokio::spawn(async move {
+                    // Let telegram/control/TUI attach before the reports fire.
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    for session_id in dangling {
+                        tracing::warn!(
+                            session_id,
+                            "turn was in flight when the previous daemon stopped; reporting"
+                        );
+                        events.emit(revenant_core::Event::TurnFailed {
+                            session_id,
+                            error: "the daemon restarted while this turn was running — the task \
+did not complete. Resend your message to retry."
+                                .into(),
+                        });
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("dangling-turn sweep failed: {err:#}"),
+        }
+    }
+
     // Loop scheduler: fires due recurring jobs off the hot path.
     let default_tier = cfg
         .agent
