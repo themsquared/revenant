@@ -269,6 +269,15 @@ fn render_model(
     if internal {
         model.insert("visibility".into(), json!("internal"));
     }
+    // Reasoning-effort override, forced onto every request to this target via
+    // the gateway's request-body `overrides`. Exists for local reasoning
+    // models (e.g. Nemotron 3.5 via Ollama): "none" turns thinking off, which
+    // (a) unblocks forced tool_choice — Ollama 400s on tool_choice with
+    // thinking enabled, breaking every structured-output path — and (b) kills
+    // the minutes-long silent reasoning phases that read as a dead agent.
+    if let Some(effort) = &target.reasoning_effort {
+        model.insert("overrides".into(), json!({ "reasoning_effort": effort }));
+    }
     // Provider prompt caching: the gateway inserts cache markers on the
     // system prompt / tools / message prefix. The harness keeps its prompt
     // layers byte-stable in stability order precisely so these hit.
@@ -308,6 +317,7 @@ mod tests {
                     api_key_env: None,
                     base_url: None,
                     weight: None,
+            reasoning_effort: None,
                 }],
             });
             cfg.tiers = tiers;
@@ -387,6 +397,7 @@ mod tests {
                     api_key_env: None,
                     base_url: None,
                     weight: None,
+            reasoning_effort: None,
                 }],
                 strategy: revenant_core::config::RouteStrategy::Failover,
             },
@@ -394,6 +405,31 @@ mod tests {
         let yaml = render_gateway_yaml(&cfg, &env, None).unwrap();
         assert!(yaml.contains("name: local"));
         assert!(!yaml.contains("anthropic"));
+    }
+
+    #[test]
+    fn reasoning_effort_renders_as_override() {
+        use revenant_core::config::{Provider, RouteStrategy, TierConfig, TierTarget};
+        let env: HashSet<String> = HashSet::new();
+        let mut cfg = Config::default_config();
+        cfg.tiers.clear();
+        cfg.tiers.insert(
+            "local".into(),
+            TierConfig {
+                strategy: RouteStrategy::Failover,
+                targets: vec![TierTarget {
+                    provider: Provider::Ollama,
+                    model: "nemotron-3.5-lightning:latest".into(),
+                    api_key_env: None,
+                    base_url: None,
+                    weight: None,
+                    reasoning_effort: Some("none".into()),
+                }],
+            },
+        );
+        let yaml = render_gateway_yaml(&cfg, &env, None).unwrap();
+        assert!(yaml.contains("overrides:"), "missing overrides block:\n{yaml}");
+        assert!(yaml.contains("reasoning_effort: none"), "missing override value:\n{yaml}");
     }
 
     #[test]
@@ -413,6 +449,7 @@ mod tests {
                         api_key_env: Some("OPENAI_API_KEY".into()),
                         base_url: None,
                         weight: Some(70),
+                        reasoning_effort: None,
                     },
                     TierTarget {
                         provider: Provider::Anthropic,
@@ -420,6 +457,7 @@ mod tests {
                         api_key_env: Some("ANTHROPIC_API_KEY".into()),
                         base_url: None,
                         weight: Some(30),
+                        reasoning_effort: None,
                     },
                 ],
             },

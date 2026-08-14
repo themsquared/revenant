@@ -1596,6 +1596,7 @@ fn apply_provider(cfg: &mut Config, choice: &ProviderChoice, fallback: Option<&P
             api_key_env: None,
             base_url: None,
             weight: None,
+            reasoning_effort: None,
         }],
         strategy: RouteStrategy::Failover,
     });
