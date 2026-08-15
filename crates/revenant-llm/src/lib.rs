@@ -90,16 +90,62 @@ pub struct StreamOutcome {
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
+    /// Liveness deadlines (TTFB / idle gap / total attempt) — see the module
+    /// helpers for defaults and env overrides.
+    ttfb: Duration,
+    idle: Duration,
+    total: Duration,
+}
+
+/// Liveness deadlines for streaming calls (the hard rule: a turn NEVER hangs
+/// silently — a stalled stream must become an error the turn loop can report).
+/// Each is overridable by env for ops tuning without a rebuild.
+///
+/// - TTFB: how long to wait for response headers. Generous, because a local
+///   25GB model cold-loading legitimately takes minutes before first byte.
+/// - IDLE: max gap between SSE events once streaming. Providers ping and
+///   models emit deltas continuously, so a long dead gap means a wedged
+///   connection, not a thinking model.
+/// - TOTAL: absolute per-attempt ceiling, the backstop for everything else.
+fn env_secs(var: &str, default: u64) -> Duration {
+    let secs = std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+    Duration::from_secs(secs)
+}
+fn ttfb_deadline() -> Duration {
+    env_secs("REVENANT_LLM_TTFB_SECS", 300)
+}
+fn idle_deadline() -> Duration {
+    env_secs("REVENANT_LLM_IDLE_SECS", 120)
+}
+fn attempt_deadline() -> Duration {
+    env_secs("REVENANT_LLM_ATTEMPT_SECS", 900)
 }
 
 impl LlmClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
-            // No overall timeout: streaming responses can be long-lived.
+            // No client-wide timeout: streaming responses can be long-lived.
+            // Liveness is enforced per-call instead (TTFB / idle-gap / total
+            // deadlines in stream_message) so a stall errors instead of
+            // hanging a turn forever.
             .build()
             .expect("reqwest client");
-        LlmClient { http, base_url: base_url.into() }
+        LlmClient {
+            http,
+            base_url: base_url.into(),
+            ttfb: ttfb_deadline(),
+            idle: idle_deadline(),
+            total: attempt_deadline(),
+        }
+    }
+
+    /// Override the liveness deadlines (tests; unusual deployments).
+    pub fn with_deadlines(mut self, ttfb: Duration, idle: Duration, total: Duration) -> Self {
+        self.ttfb = ttfb;
+        self.idle = idle;
+        self.total = total;
+        self
     }
 
     /// Minimal liveness + credit check: a 1-token request against `model`.
@@ -113,6 +159,7 @@ impl LlmClient {
         });
         let resp = Self::headers(self.http.post(&url), None)
             .json(&req)
+            .timeout(Duration::from_secs(120))
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -145,11 +192,21 @@ impl LlmClient {
         mut on_delta: impl FnMut(&str),
     ) -> Result<StreamOutcome> {
         let url = format!("{}/v1/messages", self.base_url);
-        let resp = Self::headers(self.http.post(&url), req.identity.as_deref())
-            .json(req)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
+        let started = tokio::time::Instant::now();
+        // `send()` resolves at response headers; a provider that accepts the
+        // connection and then wedges would otherwise hang the turn forever.
+        let resp = tokio::time::timeout(
+            self.ttfb,
+            Self::headers(self.http.post(&url), req.identity.as_deref()).json(req).send(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "model stream stalled: no response headers after {}s (REVENANT_LLM_TTFB_SECS)",
+                self.ttfb.as_secs()
+            )
+        })?
+        .with_context(|| format!("POST {url}"))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -159,6 +216,8 @@ impl LlmClient {
 
         let mut outcome = StreamOutcome::default();
         let mut stream = resp.bytes_stream().eventsource();
+        let idle = self.idle;
+        let total = self.total;
 
         // In-progress content block accumulator.
         enum Pending {
@@ -167,7 +226,23 @@ impl LlmClient {
         }
         let mut pending: Option<Pending> = None;
 
-        while let Some(event) = stream.next().await {
+        loop {
+            // Any SSE event (pings included) proves the connection is alive
+            // and resets the idle clock; the total deadline is absolute.
+            if started.elapsed() >= total {
+                bail!(
+                    "model stream exceeded the {}s attempt deadline (REVENANT_LLM_ATTEMPT_SECS)",
+                    total.as_secs()
+                );
+            }
+            let event = match tokio::time::timeout(idle, stream.next()).await {
+                Err(_) => bail!(
+                    "model stream stalled: no events for {}s (REVENANT_LLM_IDLE_SECS)",
+                    idle.as_secs()
+                ),
+                Ok(None) => break,
+                Ok(Some(event)) => event,
+            };
             let event = event.context("reading SSE stream")?;
             let data: serde_json::Value = match serde_json::from_str(&event.data) {
                 Ok(v) => v,
@@ -283,7 +358,11 @@ impl LlmClient {
             "system": system,
             "messages": messages,
         });
-        let resp = Self::headers(self.http.post(&url), None).json(&body).send().await?;
+        let resp = Self::headers(self.http.post(&url), None)
+            .json(&body)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await?;
         if !resp.status().is_success() {
             bail!("count_tokens returned {}", resp.status());
         }
@@ -303,6 +382,7 @@ impl LlmClient {
         let url = format!("{}/v1/embeddings", self.base_url);
         let resp = Self::headers(self.http.post(&url), None)
             .json(&serde_json::json!({ "model": model, "input": inputs }))
+            .timeout(Duration::from_secs(120))
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
@@ -387,6 +467,129 @@ tier config (`revenant render` shows what's sent).".to_string();
     }
     // Unknown: keep it short and honest.
     format!("Provider error {status}: {}", truncate(body, 400))
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    //! The hard rule under test: a model stream can NEVER hang a turn. Every
+    //! failure mode (no headers, mid-stream stall, endless stream) must become
+    //! an error promptly, and a healthy-but-slow stream must NOT false-trip.
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    const SSE_HEADERS: &str =
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+
+    fn delta_event(text: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::json!({"delta": {"type": "text_delta", "text": text}})
+        )
+    }
+
+    /// One-shot HTTP server: accepts a single connection, reads the request
+    /// headers, then runs `respond` on the socket. Returns the base_url.
+    async fn one_shot_server<F, Fut>(respond: F) -> String
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain request headers so the client is not blocked on writes.
+            let mut buf = [0u8; 4096];
+            use tokio::io::AsyncReadExt;
+            let _ = sock.read(&mut buf).await;
+            respond(sock).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn request() -> MessagesRequest {
+        MessagesRequest {
+            model: "balanced".into(),
+            max_tokens: 64,
+            system: None,
+            messages: vec![WireMessage::new(Role::User, vec![ContentBlock::text("hi")])],
+            tools: vec![],
+            tool_choice: None,
+            stream: true,
+            identity: None,
+        }
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[tokio::test]
+    async fn no_headers_becomes_ttfb_error() {
+        // Server accepts and goes silent before sending response headers.
+        let url = one_shot_server(|sock| async move {
+            let _keep_open = sock; // hold the socket; close would error early
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        })
+        .await;
+        let client = LlmClient::new(url).with_deadlines(ms(300), ms(300), ms(2000));
+        let err = client.stream_message(&request(), |_| {}).await.unwrap_err();
+        assert!(err.to_string().contains("no response headers"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn mid_stream_stall_becomes_idle_error() {
+        // Server streams one delta, then holds the connection open silently.
+        let url = one_shot_server(|mut sock| async move {
+            sock.write_all(SSE_HEADERS.as_bytes()).await.unwrap();
+            sock.write_all(delta_event("part").as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        })
+        .await;
+        let client = LlmClient::new(url).with_deadlines(ms(2000), ms(300), ms(10_000));
+        let mut streamed = String::new();
+        let err =
+            client.stream_message(&request(), |d| streamed.push_str(d)).await.unwrap_err();
+        assert!(err.to_string().contains("no events for"), "got: {err:#}");
+        assert_eq!(streamed, "part", "the delta before the stall still streamed");
+    }
+
+    #[tokio::test]
+    async fn slow_but_alive_stream_does_not_false_trip() {
+        // Deltas arrive well within the idle window, just slowly overall.
+        let url = one_shot_server(|mut sock| async move {
+            sock.write_all(SSE_HEADERS.as_bytes()).await.unwrap();
+            for part in ["a", "b", "c", "d"] {
+                sock.write_all(delta_event(part).as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+                tokio::time::sleep(ms(100)).await;
+            }
+        })
+        .await;
+        let client = LlmClient::new(url).with_deadlines(ms(2000), ms(1000), ms(10_000));
+        let outcome = client.stream_message(&request(), |_| {}).await.unwrap();
+        assert_eq!(outcome.text, "abcd");
+    }
+
+    #[tokio::test]
+    async fn endless_stream_hits_attempt_deadline() {
+        // Server streams forever; the total ceiling must end the attempt.
+        let url = one_shot_server(|mut sock| async move {
+            sock.write_all(SSE_HEADERS.as_bytes()).await.unwrap();
+            loop {
+                if sock.write_all(delta_event("x").as_bytes()).await.is_err() {
+                    break;
+                }
+                let _ = sock.flush().await;
+                tokio::time::sleep(ms(50)).await;
+            }
+        })
+        .await;
+        let client = LlmClient::new(url).with_deadlines(ms(2000), ms(1000), ms(600));
+        let err = client.stream_message(&request(), |_| {}).await.unwrap_err();
+        assert!(err.to_string().contains("attempt deadline"), "got: {err:#}");
+    }
 }
 
 #[cfg(test)]

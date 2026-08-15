@@ -2344,6 +2344,73 @@ impl SessionManager {
     }
 }
 
+/// Absolute wall-clock ceiling for one top-level turn. Generous by default —
+/// per-step liveness (LLM stream deadlines, exec/MCP timeouts) already bounds
+/// every iteration, so this only catches a turn that is wedged in a way
+/// nothing else caught. The point is the hard rule: a turn ALWAYS ends.
+fn turn_deadline() -> std::time::Duration {
+    let secs = std::env::var("REVENANT_TURN_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Race a turn against the liveness deadline. On expiry `on_deadline` fires
+/// (the caller cancels the turn there), the turn gets `grace` to unwind at
+/// its next cancellation point, and the result is an error either way — a
+/// deadline overrun is reported honestly even if the turn then unwound
+/// cleanly. Extracted from [`run_reported_turn`] so the invariant is testable
+/// without a full runtime.
+async fn watchdog_turn<T>(
+    turn: impl std::future::Future<Output = Result<T>>,
+    deadline: std::time::Duration,
+    grace: std::time::Duration,
+    on_deadline: impl FnOnce(),
+) -> Result<T> {
+    tokio::pin!(turn);
+    tokio::select! {
+        r = &mut turn => r,
+        _ = tokio::time::sleep(deadline) => {
+            on_deadline();
+            // If it stays wedged through the grace period, fall through —
+            // dropping the future is safe (ActiveGuard unwinds active/cancel
+            // state on drop) and reporting must not wait on it.
+            let _ = tokio::time::timeout(grace, &mut turn).await;
+            Err(anyhow::anyhow!(
+                "turn exceeded the {}s liveness deadline (REVENANT_TURN_DEADLINE_SECS) and was \
+stopped; the task did not complete",
+                deadline.as_secs()
+            ))
+        }
+    }
+}
+
+/// Run one top-level turn under the liveness watchdog, and ALWAYS report the
+/// outcome: any error becomes a TurnFailed event, which every channel renders
+/// to the user. A silent turn is a bug, full stop.
+async fn run_reported_turn(
+    runtime: &Arc<AgentRuntime>,
+    session_id: i64,
+    tier: Tier,
+    content: Vec<ContentBlock>,
+) {
+    let result = watchdog_turn(
+        runtime.run_turn(session_id, tier, content),
+        turn_deadline(),
+        std::time::Duration::from_secs(60),
+        || {
+            tracing::error!(session_id, "turn exceeded the liveness deadline; cancelling");
+            runtime.cancel(session_id);
+        },
+    )
+    .await;
+    if let Err(err) = result {
+        tracing::error!(session_id, "turn failed: {err:#}");
+        runtime.events.emit(Event::TurnFailed { session_id, error: format!("{err:#}") });
+    }
+}
+
 async fn session_actor(
     runtime: Arc<AgentRuntime>,
     session_id: i64,
@@ -2359,13 +2426,7 @@ async fn session_actor(
         match msg {
             SessionMsg::UserInput { content, tier } => {
                 let user_content = vec![ContentBlock::text(content)];
-                if let Err(err) = runtime.run_turn(session_id, tier, user_content).await {
-                    tracing::error!(session_id, "turn failed: {err:#}");
-                    runtime.events.emit(Event::TurnFailed {
-                        session_id,
-                        error: format!("{err:#}"),
-                    });
-                }
+                run_reported_turn(&runtime, session_id, tier, user_content).await;
                 // Drain anything queued during the turn: new tasks triaged aside,
                 // plus interjections that landed after the last mid-turn drain.
                 // Run them in order as their own turns; a follow-up turn may
@@ -2379,20 +2440,74 @@ async fn session_actor(
                         break;
                     }
                     for itj in next {
-                        if let Err(err) = runtime
-                            .run_turn(session_id, itj.tier, vec![ContentBlock::text(itj.text)])
-                            .await
-                        {
-                            tracing::error!(session_id, "queued turn failed: {err:#}");
-                            runtime.events.emit(Event::TurnFailed {
-                                session_id,
-                                error: format!("{err:#}"),
-                            });
-                        }
+                        run_reported_turn(
+                            &runtime,
+                            session_id,
+                            itj.tier,
+                            vec![ContentBlock::text(itj.text)],
+                        )
+                        .await;
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    //! The hard rule under test: a turn ALWAYS ends in a reportable outcome.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    #[tokio::test]
+    async fn healthy_turn_passes_through() {
+        let cancelled = AtomicBool::new(false);
+        let r = watchdog_turn(async { Ok(42) }, ms(5000), ms(100), || {
+            cancelled.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(r.unwrap(), 42);
+        assert!(!cancelled.load(Ordering::SeqCst), "deadline must not fire on a healthy turn");
+    }
+
+    #[tokio::test]
+    async fn wedged_turn_is_cancelled_then_reported() {
+        // A turn that hangs forever and ignores cancellation: the watchdog
+        // must fire the cancel hook, wait out the grace period, and still
+        // return an error — never hang with it.
+        let cancelled = AtomicBool::new(false);
+        let r: Result<()> =
+            watchdog_turn(std::future::pending(), ms(100), ms(100), || {
+                cancelled.store(true, Ordering::SeqCst);
+            })
+            .await;
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("liveness deadline"), "got: {err}");
+        assert!(cancelled.load(Ordering::SeqCst), "cancel hook must fire at the deadline");
+    }
+
+    #[tokio::test]
+    async fn overrun_is_reported_even_if_turn_unwinds_in_grace() {
+        // The turn honors cancellation and unwinds during the grace period —
+        // the overrun must STILL surface as a failure (the user was promised
+        // an outcome for the original task, and it did not complete).
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut tx = Some(tx);
+        let turn = async move {
+            let _ = rx.await; // "cancellation point": resolves when cancel fires
+            Ok(())
+        };
+        let r: Result<()> = watchdog_turn(turn, ms(100), ms(5000), move || {
+            let _ = tx.take().unwrap().send(());
+        })
+        .await;
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("liveness deadline"), "got: {err}");
     }
 }
 

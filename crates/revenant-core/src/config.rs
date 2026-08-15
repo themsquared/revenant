@@ -934,6 +934,13 @@ pub struct TierTarget {
     /// target order is priority order). Defaults to 1 when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
+    /// Reasoning-effort override forced onto every request to this target
+    /// (rendered as a gateway request-body override). Set `"none"` for local
+    /// reasoning models like Nemotron 3.5: with thinking on, Ollama rejects
+    /// forced tool_choice (400) and reasoning phases stream nothing for
+    /// minutes, both of which read as the agent going silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Providers we render into agentgateway config. Serialized here in
@@ -1040,6 +1047,7 @@ impl Config {
             api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
             base_url: None,
             weight: None,
+            reasoning_effort: None,
         };
         let mut tiers = BTreeMap::new();
         tiers.insert(

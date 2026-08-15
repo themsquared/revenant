@@ -139,6 +139,7 @@ impl ProviderChoice {
             api_key_env: self.key_env.map(|s| s.to_string()),
             base_url: self.base_url.map(|s| s.to_string()),
             weight: None,
+            reasoning_effort: None,
         }
     }
 
