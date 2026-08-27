@@ -1459,6 +1459,20 @@ mod tests {
         let future = s.sessions_with_dangling_turn(i64::MAX).await.unwrap();
         assert!(future.is_empty());
 
+        // Report-once: persisting the restart notice as the turn's answer
+        // takes the session out of the dangling set, so the NEXT boot's sweep
+        // does not re-notify the owner about the same dead turn.
+        s.append_message(
+            dangling,
+            Role::Assistant,
+            &[ContentBlock::text("⚠️ the daemon restarted while this turn was running")],
+            None,
+        )
+        .await
+        .unwrap();
+        let after = s.sessions_with_dangling_turn(0).await.unwrap();
+        assert!(!after.contains(&dangling), "reported turn must not be re-flagged");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

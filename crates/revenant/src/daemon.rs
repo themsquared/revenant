@@ -259,19 +259,38 @@ pub async fn build(home: &Home, cfg: &Config) -> Result<Daemon> {
         match manager.runtime().store.sessions_with_dangling_turn(since).await {
             Ok(dangling) if !dangling.is_empty() => {
                 let events = manager.runtime().events.clone();
+                let store = manager.runtime().store.clone();
                 tokio::spawn(async move {
                     // Let telegram/control/TUI attach before the reports fire.
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    const NOTICE: &str = "the daemon restarted while this turn was running — \
+the task did not complete. Resend your message to retry.";
                     for session_id in dangling {
                         tracing::warn!(
                             session_id,
                             "turn was in flight when the previous daemon stopped; reporting"
                         );
+                        // Persist the notice as the turn's answer FIRST: the
+                        // session's last message is then no longer a dangling
+                        // user message, so the next boot does not re-report it
+                        // (each restart used to re-notify the owner about the
+                        // same dead turn), and the transcript records where
+                        // the turn was cut. Report on failure anyway — repeat
+                        // noise beats permanent silence.
+                        if let Err(err) = store
+                            .append_message(
+                                session_id,
+                                revenant_core::Role::Assistant,
+                                &[revenant_core::ContentBlock::text(format!("⚠️ {NOTICE}"))],
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!(session_id, "could not persist restart notice: {err:#}");
+                        }
                         events.emit(revenant_core::Event::TurnFailed {
                             session_id,
-                            error: "the daemon restarted while this turn was running — the task \
-did not complete. Resend your message to retry."
-                                .into(),
+                            error: NOTICE.into(),
                         });
                     }
                 });
