@@ -3,6 +3,8 @@
 **The agent that comes back.** A lean, security-first personal AI agent + harness in Rust,
 built natively on [agentgateway](https://agentgateway.dev) OSS.
 
+> 📖 **Read the write-up:** [Revenant: A Gateway-Native, Always-On Agent Runtime](https://webofmike.com/revenant-agent-runtime/)
+
 > They killed the always-on agent a hundred ways. Leaked keys. Runaway spend. Code you
 > couldn't trust. They buried the dream and called it a lesson. **It came back.**
 >
