@@ -24,14 +24,40 @@ pub async fn ensure_binary(home: &Home, cfg: &Config) -> Result<PathBuf> {
         }
         return Ok(path.clone());
     }
-    let version = &cfg.gateway.version;
+    let version = cfg.gateway.resolved_version();
     let bin_dir = home.gateway_bin_dir();
     let target = bin_dir.join(format!("agentgateway-v{version}"));
     if target.exists() {
         return Ok(target);
     }
 
-    std::fs::create_dir_all(&bin_dir)?;
+    // A revenant upgrade lands here on the first restart: the new binary
+    // resolves a newer gateway version, which doesn't exist locally yet. If
+    // the download fails (network, GitHub outage), fall back to the newest
+    // gateway already on disk — an upgrade must never take the daemon down.
+    match download_binary(&bin_dir, &target, version).await {
+        Ok(()) => Ok(target),
+        Err(err) => match newest_installed(&bin_dir) {
+            Some(existing) => {
+                tracing::warn!(
+                    "downloading agentgateway v{version} failed ({err:#}); \
+                     falling back to already-installed {} — will retry the \
+                     download on next restart",
+                    existing.display()
+                );
+                Ok(existing)
+            }
+            None => Err(err),
+        },
+    }
+}
+
+async fn download_binary(
+    bin_dir: &std::path::Path,
+    target: &std::path::Path,
+    version: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(bin_dir)?;
     let (os, arch) = release_platform()?;
     let base = format!(
         "https://github.com/agentgateway/agentgateway/releases/download/v{version}/agentgateway-{os}-{arch}"
@@ -73,9 +99,31 @@ pub async fn ensure_binary(home: &Home, cfg: &Config) -> Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::fs::rename(&tmp, &target)?;
+    std::fs::rename(&tmp, target)?;
     tracing::info!("agentgateway v{version} installed at {}", target.display());
-    Ok(target)
+    Ok(())
+}
+
+/// Newest `agentgateway-v*` already present in `bin_dir`, by semver-ish
+/// component order (1.10 > 1.9, which plain string order gets wrong).
+fn newest_installed(bin_dir: &std::path::Path) -> Option<PathBuf> {
+    let key = |p: &PathBuf| -> Vec<u32> {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("agentgateway-v"))
+            .map(|v| v.split(['.', '-']).map_while(|c| c.parse().ok()).collect())
+            .unwrap_or_default()
+    };
+    std::fs::read_dir(bin_dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("agentgateway-v"))
+                && p.is_file()
+        })
+        .max_by_key(key)
 }
 
 fn release_platform() -> Result<(&'static str, &'static str)> {
