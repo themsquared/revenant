@@ -226,7 +226,10 @@ pub fn render_gateway_yaml(
         let mut backend = Map::new();
         backend.insert("host".into(), json!(host));
         if scheme == "https" {
-            backend.insert("backendTLS".into(), json!({}));
+            // TLS lives under backend-level `policies` — required since v1.4
+            // (top-level `backendTLS` was rejected by v1.5.0 --validate-only),
+            // and accepted by v1.3.1 too.
+            backend.insert("policies".into(), json!({ "backendTLS": {} }));
         }
         binds.push(json!({
             "port": cfg.gateway.a2a_egress_base + idx as u16,

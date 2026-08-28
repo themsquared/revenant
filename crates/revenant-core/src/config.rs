@@ -781,12 +781,29 @@ fn default_retrieval_limit() -> usize {
     12
 }
 
+/// The agentgateway release this build of revenant ships with. Upgrading
+/// revenant (rollout, `revenant update`, auto-update) carries the gateway
+/// forward automatically: any install whose config doesn't explicitly pin a
+/// version resolves to this at startup, downloads the new gateway binary, and
+/// re-renders + validates the config — see `GatewayConfig::resolved_version`.
+pub const DEFAULT_GATEWAY_VERSION: &str = "1.5.0";
+
+/// Gateway versions that `revenant init` wrote into config.toml as literal
+/// pins before the pin became optional. A config carrying one of these was
+/// authored by us, not chosen by the owner — resolve it to the current
+/// default so upgrades don't strand old installs on a stale gateway.
+const FORMER_DEFAULT_GATEWAY_VERSIONS: &[&str] = &["1.3.1"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default)]
     pub mode: GatewayMode,
-    /// Pinned agentgateway release version (without the `v` prefix).
-    pub version: String,
+    /// Explicit agentgateway version pin (without the `v` prefix). Leave unset
+    /// to track the version bundled with each revenant release (recommended) —
+    /// set it only to hold the gateway back, and note that values matching a
+    /// former init-written default are treated as unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(default = "default_llm_port")]
     pub llm_port: u16,
     #[serde(default = "default_readiness_port")]
@@ -830,6 +847,19 @@ pub struct GatewayConfig {
     /// is attribution, not authentication.
     #[serde(default = "default_true")]
     pub identity_attribution: bool,
+}
+
+impl GatewayConfig {
+    /// The agentgateway version this install should actually run: an explicit
+    /// owner pin wins; no pin (or a pin equal to a former init-written
+    /// default) tracks [`DEFAULT_GATEWAY_VERSION`], so the gateway upgrades in
+    /// lockstep with every revenant upgrade.
+    pub fn resolved_version(&self) -> &str {
+        match self.version.as_deref() {
+            Some(v) if !FORMER_DEFAULT_GATEWAY_VERSIONS.contains(&v) => v,
+            _ => DEFAULT_GATEWAY_VERSION,
+        }
+    }
 }
 
 /// Header the harness stamps with the calling agent's identity; the gateway's
@@ -910,7 +940,7 @@ pub struct ModelPrice {
 }
 
 /// Multi-target routing strategy, matching agentgateway's `virtualModels`
-/// routing enum (verified against v1.3.1: `failover` | `weighted`).
+/// routing enum (verified against v1.5.0: `failover` | `weighted`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteStrategy {
@@ -1077,7 +1107,7 @@ impl Config {
         Config {
             gateway: GatewayConfig {
                 mode: GatewayMode::Bundled,
-                version: "1.3.1".to_string(),
+                version: None,
                 llm_port: default_llm_port(),
                 readiness_port: default_readiness_port(),
                 stats_port: default_stats_port(),
@@ -1106,5 +1136,45 @@ impl Config {
             a2a_agents: Vec::new(),
             tiers,
         }
+    }
+}
+
+#[cfg(test)]
+mod gateway_version_tests {
+    use super::*;
+
+    // The gateway must upgrade in lockstep with revenant: no pin (and any
+    // former init-written default) resolves to the bundled version, while a
+    // deliberate owner pin is respected. This is what makes `revenant update`
+    // / the rollout carry agentgateway along instead of stranding installs on
+    // whatever version init wrote the day they were born.
+    #[test]
+    fn unpinned_tracks_bundled_default() {
+        let cfg = Config::default_config();
+        assert_eq!(cfg.gateway.version, None, "init must not write a literal pin");
+        assert_eq!(cfg.gateway.resolved_version(), DEFAULT_GATEWAY_VERSION);
+    }
+
+    #[test]
+    fn former_default_pin_migrates_forward() {
+        let mut cfg = Config::default_config();
+        cfg.gateway.version = Some("1.3.1".to_string());
+        assert_eq!(cfg.gateway.resolved_version(), DEFAULT_GATEWAY_VERSION);
+    }
+
+    #[test]
+    fn explicit_pin_wins() {
+        let mut cfg = Config::default_config();
+        cfg.gateway.version = Some("9.9.9".to_string());
+        assert_eq!(cfg.gateway.resolved_version(), "9.9.9");
+    }
+
+    #[test]
+    fn config_without_version_line_parses_and_roundtrips_unpinned() {
+        // Old configs carry `version = "1.3.1"`; new ones omit the line.
+        let toml = Config::default_config().to_toml();
+        assert!(!toml.contains("version ="), "default config must omit the pin:\n{toml}");
+        let cfg = Config::from_toml(&toml).expect("parses without a version line");
+        assert_eq!(cfg.gateway.resolved_version(), DEFAULT_GATEWAY_VERSION);
     }
 }

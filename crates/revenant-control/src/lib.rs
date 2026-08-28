@@ -1113,7 +1113,7 @@ async fn config_get(State(state): State<AppState>) -> Result<Json<serde_json::Va
     Ok(Json(json!({
         "gateway": {
             "mode": format!("{:?}", cfg.gateway.mode).to_lowercase(),
-            "version": cfg.gateway.version,
+            "version": cfg.gateway.resolved_version(),
             "llm_port": cfg.gateway.llm_port,
             "endpoint": cfg.gateway.endpoint,
         },
